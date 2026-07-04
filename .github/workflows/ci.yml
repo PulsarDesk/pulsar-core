@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Headless core tests on every target OS + arch (incl. ARM Linux for OrangePi /
+  # Raspberry Pi). pulsar-proto/-relay come from git; vigem-client (Windows) via patch.
+  rust:
+    name: Rust · ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     name: linux-x64 }
+          - { os: ubuntu-22.04-arm, name: linux-arm64 }
+          - { os: windows-latest,   name: windows-x64 }
+          - { os: macos-latest,     name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux deps (gilrs → libudev)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev build-essential
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: rustfmt (advisory)
+        if: matrix.name == 'linux-x64'
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: clippy (advisory)
+        if: matrix.name == 'linux-x64'
+        continue-on-error: true
+        run: cargo clippy -p pulsar-core --all-targets --locked
+      - name: Test
+        run: cargo test --locked

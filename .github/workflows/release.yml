@@ -1,0 +1,44 @@
+name: Release
+
+# Cut from `main`. semantic-release computes the next version from Conventional
+# Commits and creates a git TAG + GitHub Release only — never a commit back to the
+# repo. pulsar-core is a library, so there are no build artifacts to attach.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: semantic-release (tag + GitHub release)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Linux deps (gilrs → libudev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev build-essential
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test gate
+        run: cargo test --locked
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@^9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
