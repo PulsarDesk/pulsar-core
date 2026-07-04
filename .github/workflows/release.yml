@@ -4,6 +4,7 @@ name: Release
 # Commits and creates a git TAG + GitHub Release only — never a commit back to the
 # repo. pulsar-core is a library, so there are no build artifacts to attach.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
 
