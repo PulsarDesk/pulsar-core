@@ -97,7 +97,36 @@ impl Drop for SessionCloseGuard {
 /// gst caps. Shows the compositor's share dialog the first time; pass a stored
 /// `restore_token` to skip it on later calls. Returns the running capture and a
 /// (possibly new) restore token to persist.
+///
+/// Retries a few times on startup failure: a re-stream can race the compositor's
+/// teardown of a just-closed cast, so the first `pipewiresrc` fails READY→PAUSED;
+/// a short backoff lets KWin settle and the token-restored retry succeeds without a
+/// dialog. Callers therefore get a live capture or a hard error — never a dead child.
 pub async fn start(
+	ip: &str,
+	port: u16,
+	encoder_fragment: &str,
+	restore_token: Option<String>,
+) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	let mut last_err: Option<anyhow::Error> = None;
+	for attempt in 0u32..3 {
+		if attempt > 0 {
+			tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+		}
+		match start_once(ip, port, encoder_fragment, restore_token.clone()).await {
+			Ok(ok) => return Ok(ok),
+			Err(e) => {
+				tracing::warn!(attempt, "wayland capture start failed, retrying: {e}");
+				last_err = Some(e);
+			}
+		}
+	}
+	Err(last_err.unwrap_or_else(|| anyhow::anyhow!("wayland capture start failed")))
+}
+
+/// One capture attempt: open a fresh portal session + PipeWire fd, spawn gst-launch,
+/// and confirm the pipeline reached PAUSED. See [`start`] for the retry wrapper.
+async fn start_once(
 	ip: &str,
 	port: u16,
 	encoder_fragment: &str,
@@ -168,9 +197,27 @@ pub async fn start(
 				Ok(())
 			});
 		}
-		let child = cmd.spawn().map_err(|e| {
+		let mut child = cmd.spawn().map_err(|e| {
 			anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}")
 		})?;
+		// Spawn success is NOT stream success: gst-launch prints "Failed to set pipeline to
+		// PAUSED." and exits immediately when `pipewiresrc` can't open the portal node — e.g. a
+		// restart racing the compositor's teardown of the previous cast. Poll briefly so an
+		// early death surfaces as an Err (the SessionCloseGuard then closes the portal session)
+		// instead of the caller storing a dead child + reporting success (permanently black
+		// video). gst streams during this window, so it adds no first-frame latency.
+		for _ in 0..14 {
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+			match child.try_wait() {
+				Ok(Some(status)) => {
+					return Err(anyhow::anyhow!(
+						"gst-launch exited at startup (status {status}) — pipeline failed to reach PAUSED (pipewire/portal node not ready?)"
+					));
+				}
+				Ok(None) => {}
+				Err(e) => return Err(anyhow::anyhow!("gst-launch wait failed: {e}")),
+			}
+		}
 		Ok::<_, anyhow::Error>((child, pw_fd, token))
 	}
 	.await;
