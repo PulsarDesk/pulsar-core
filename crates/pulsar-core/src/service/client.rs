@@ -134,6 +134,15 @@ pub async fn send_bye(session: &mut Session) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Bye)).await
 }
 
+/// Like [`send_bye`] but via a cloned [`crate::SessionSender`], so a peer that only
+/// holds the send half can say goodbye — specifically the HOST kicking a client (its
+/// `Session` read side is owned by `serve_with`). The client's hold loop tears down
+/// the instant this arrives instead of waiting out its host-silence watchdog (over a
+/// relay `recv` never returns `None` when the peer vanishes).
+pub async fn send_bye_via(sender: &crate::SessionSender) -> Result<(), ConnError> {
+	sender.send(&enc(&Msg::Bye)).await
+}
+
 /// Either peer: send one side-channel data message (clipboard/chat/file/audio).
 pub async fn send_data(session: &Session, msg: &DataMsg) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Data(msg.clone()))).await
@@ -151,6 +160,14 @@ pub async fn send_data_via(sender: &crate::SessionSender, msg: &DataMsg) -> Resu
 /// without depending on the private `Msg` enum).
 pub fn is_pong(bytes: &[u8]) -> bool {
 	matches!(dec(bytes), Some(Msg::Pong))
+}
+
+/// True if `bytes` is a peer's `Bye`. Lets the client's hold loop end the instant the
+/// host disconnects (the host now sends this on kick / go-offline), without depending
+/// on the private `Msg` enum — over a relay `recv` never returns `None` when the peer
+/// vanishes, so this is the only prompt host-gone signal.
+pub fn is_bye(bytes: &[u8]) -> bool {
+	matches!(dec(bytes), Some(Msg::Bye))
 }
 
 /// Decode a received frame as a side-channel [`DataMsg`], if it is one. Lets a
