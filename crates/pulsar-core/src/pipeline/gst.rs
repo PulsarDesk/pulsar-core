@@ -135,6 +135,13 @@ pub fn encoder_fragment(
 /// NVENC/VAAPI link fail and the host silently fell back to **software x264**. `x264enc`
 /// accepts NV12 too (verified), so NV12 works for every gst encoder on this path.
 pub fn wayland_pipeline(fd: i32, node_id: u32, fragment: &str, ip: &str, port: u16) -> String {
+	// NB: keep autoconnect at its default (true). It sets PW_STREAM_FLAG_AUTOCONNECT, which is
+	// what actually LINKS pipewiresrc to the `path` node — with autoconnect=false the stream
+	// connects to PipeWire but never links to node `path`, so it sits SUSPENDED and no frames
+	// flow (black screen). The webcam-grab-on-teardown that autoconnect can cause (once the
+	// ScreenCast node dies PipeWire re-links a *lingering* src to the default video source =
+	// v4l2 webcam) is prevented at the source instead: `WaylandCapture::{stop,drop}` kill the
+	// gst child BEFORE closing the portal session, so no src outlives its node to be re-linked.
 	format!(
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \

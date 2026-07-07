@@ -36,7 +36,9 @@ pub fn is_wayland() -> bool {
 /// or the compositor keeps showing "your screen is being shared" forever.
 pub struct WaylandCapture {
 	child: Child,
-	session: Session<'static, Screencast<'static>>,
+	// `Option` so both `stop()` and the `Drop` safety-net can move the session out to
+	// `close()` it (Drop only has `&mut self`).
+	session: Option<Session<'static, Screencast<'static>>>,
 	_pw_fd: OwnedFd,
 }
 
@@ -50,7 +52,32 @@ impl WaylandCapture {
 		// <defunct> zombie until the whole app exits.  wait() on an already-dead
 		// process returns immediately (the kernel already holds the exit status).
 		let _ = self.child.wait();
-		let _ = self.session.close().await;
+		if let Some(session) = self.session.take() {
+			let _ = session.close().await;
+		}
+	}
+}
+
+impl Drop for WaylandCapture {
+	/// Safety net for the callers that REPLACE a capture without awaiting `stop()`
+	/// (a restream — codec/bitrate/monitor change — or a reconnect spawns a fresh
+	/// capture and drops the old `WaylandCapture`). `std::process::Child`'s own drop
+	/// does NOT kill the process, so without this the old `gst-launch` lingers; worse,
+	/// once its ScreenCast node dies PipeWire re-links the (autoconnect) `pipewiresrc`
+	/// to the webcam, lighting the camera indicator. Kill + reap the child (sync) and
+	/// fire-and-forget the portal-session close so neither the process nor the
+	/// "screen is being shared" indicator leaks. `stop()` already took the session on
+	/// the graceful path, so this only closes it when `stop()` was skipped.
+	fn drop(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+		if let Some(session) = self.session.take() {
+			if let Ok(handle) = tokio::runtime::Handle::try_current() {
+				handle.spawn(async move {
+					let _ = session.close().await;
+				});
+			}
+		}
 	}
 }
 
@@ -108,30 +135,54 @@ pub async fn start(
 	encoder_fragment: &str,
 	restore_token: Option<String>,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	// Open the portal ONCE. `select_sources`/`start` is what shows the compositor's
+	// picker, so it must happen a single time — the previous design retried the WHOLE
+	// attempt (portal + gst) and, because the fresh restore-token from a gst-failed
+	// attempt was discarded, the retry re-prompted: the user saw TWO pickers. The only
+	// thing that actually needs retrying is the gst startup race (a re-stream racing the
+	// compositor's teardown of a just-closed cast → first `pipewiresrc` fails
+	// READY→PAUSED), which we now retry on the SAME portal node below.
+	let (mut guard, node_id, pw_fd, token) = open_portal(restore_token).await?;
+
 	let mut last_err: Option<anyhow::Error> = None;
 	for attempt in 0u32..3 {
 		if attempt > 0 {
+			// Backoff lets KWin finish tearing down the prior cast before we re-arm gst
+			// on the same (already-picked) node — no second dialog.
 			tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
 		}
-		match start_once(ip, port, encoder_fragment, restore_token.clone()).await {
-			Ok(ok) => return Ok(ok),
+		match spawn_gst_verified(pw_fd.as_raw_fd(), node_id, encoder_fragment, ip, port).await {
+			Ok(child) => {
+				// Success: defuse the guard — ownership of the session passes to
+				// WaylandCapture (its stop()/Drop closes it on teardown).
+				let session = guard.0.take().expect("session present on success");
+				return Ok((
+					WaylandCapture {
+						child,
+						session: Some(session),
+						_pw_fd: pw_fd,
+					},
+					token,
+				));
+			}
 			Err(e) => {
-				tracing::warn!(attempt, "wayland capture start failed, retrying: {e}");
+				tracing::warn!(attempt, "gst pipeline start failed, retrying: {e}");
 				last_err = Some(e);
 			}
 		}
 	}
+	// Every gst attempt failed — the guard closes the portal session on drop.
 	Err(last_err.unwrap_or_else(|| anyhow::anyhow!("wayland capture start failed")))
 }
 
-/// One capture attempt: open a fresh portal session + PipeWire fd, spawn gst-launch,
-/// and confirm the pipeline reached PAUSED. See [`start`] for the retry wrapper.
-async fn start_once(
-	ip: &str,
-	port: u16,
-	encoder_fragment: &str,
+/// Open the portal ScreenCast session: pick sources (shows the compositor's picker the
+/// first time; a stored `restore_token` skips it), start the cast, and open the
+/// PipeWire remote fd. Returns the still-open session — wrapped in a [`SessionCloseGuard`]
+/// so it's closed on any early return — plus the node id, the fd, and a restore token to
+/// persist. The caller defuses the guard once it owns a live capture.
+async fn open_portal(
 	restore_token: Option<String>,
-) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+) -> anyhow::Result<(SessionCloseGuard, u32, OwnedFd, Option<String>)> {
 	let proxy: Screencast<'static> = Screencast::new().await?;
 	let session: Session<'static, Screencast<'static>> = proxy.create_session().await?;
 	// Everything past `create_session` can fail with the portal cast already live
@@ -141,7 +192,7 @@ async fn start_once(
 	// state up with no stream behind it. The guard closes the session on every exit
 	// except success, where it's defused and ownership passes to `WaylandCapture`.
 	let mut guard = SessionCloseGuard(Some(session));
-	let res = async {
+	let (node_id, pw_fd, token) = async {
 		let session = guard.0.as_ref().expect("session present");
 		proxy
 			.select_sources(
@@ -166,77 +217,67 @@ async fn start_once(
 
 		let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(session).await?;
 		clear_cloexec(pw_fd.as_raw_fd())?;
+		Ok::<_, anyhow::Error>((node_id, pw_fd, token))
+	}
+	.await?;
+	Ok((guard, node_id, pw_fd, token))
+}
 
-		// Latency: the builder's `leaky=downstream` queue drops stale frames if the
-		// encoder can't keep up with the monitor's refresh, so end-to-end lag stays
-		// bounded (effective fps drops instead of latency growing).
-		let pipeline = crate::pipeline::gst::wayland_pipeline(
-			pw_fd.as_raw_fd(),
-			node_id,
-			encoder_fragment,
-			ip,
-			port,
-		);
-		let mut cmd = std::process::Command::new("gst-launch-1.0");
-		cmd.arg("-q").args(pipeline.split_whitespace());
-		// Die if our process dies, so an orphaned gst-launch never keeps the screen
-		// "being shared" (KDE tray) after the app/session goes away.
-		unsafe {
-			cmd.pre_exec(|| {
-				// SAFETY: async-signal-safe libc calls only.
-				libc::prctl(
-					libc::PR_SET_PDEATHSIG,
-					libc::SIGKILL as libc::c_ulong,
-					0,
-					0,
-					0,
-				);
-				if libc::getppid() == 1 {
-					libc::_exit(0); // parent already gone between fork and here
-				}
-				Ok(())
-			});
-		}
-		let mut child = cmd.spawn().map_err(|e| {
-			anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}")
-		})?;
-		// Spawn success is NOT stream success: gst-launch prints "Failed to set pipeline to
-		// PAUSED." and exits immediately when `pipewiresrc` can't open the portal node — e.g. a
-		// restart racing the compositor's teardown of the previous cast. Poll briefly so an
-		// early death surfaces as an Err (the SessionCloseGuard then closes the portal session)
-		// instead of the caller storing a dead child + reporting success (permanently black
-		// video). gst streams during this window, so it adds no first-frame latency.
-		for _ in 0..14 {
-			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-			match child.try_wait() {
-				Ok(Some(status)) => {
-					return Err(anyhow::anyhow!(
-						"gst-launch exited at startup (status {status}) — pipeline failed to reach PAUSED (pipewire/portal node not ready?)"
-					));
-				}
-				Ok(None) => {}
-				Err(e) => return Err(anyhow::anyhow!("gst-launch wait failed: {e}")),
+/// Spawn `gst-launch` for a portal node + fd and confirm the pipeline reached PAUSED.
+/// Returns the live child, or an Err if gst died at startup — the caller retries on the
+/// SAME node (the failure is the compositor still tearing down a prior cast, not a bad
+/// pick), so retrying never re-opens the picker.
+async fn spawn_gst_verified(
+	fd: i32,
+	node_id: u32,
+	encoder_fragment: &str,
+	ip: &str,
+	port: u16,
+) -> anyhow::Result<Child> {
+	// Latency: the builder's `leaky=downstream` queue drops stale frames if the encoder
+	// can't keep up with the monitor's refresh, so end-to-end lag stays bounded
+	// (effective fps drops instead of latency growing).
+	let pipeline = crate::pipeline::gst::wayland_pipeline(fd, node_id, encoder_fragment, ip, port);
+	let mut cmd = std::process::Command::new("gst-launch-1.0");
+	cmd.arg("-q").args(pipeline.split_whitespace());
+	// Die if our process dies, so an orphaned gst-launch never keeps the screen
+	// "being shared" (KDE tray) after the app/session goes away.
+	unsafe {
+		cmd.pre_exec(|| {
+			// SAFETY: async-signal-safe libc calls only.
+			libc::prctl(
+				libc::PR_SET_PDEATHSIG,
+				libc::SIGKILL as libc::c_ulong,
+				0,
+				0,
+				0,
+			);
+			if libc::getppid() == 1 {
+				libc::_exit(0); // parent already gone between fork and here
 			}
-		}
-		Ok::<_, anyhow::Error>((child, pw_fd, token))
+			Ok(())
+		});
 	}
-	.await;
-
-	match res {
-		Ok((child, pw_fd, token)) => {
-			// Success: defuse the guard — ownership of the session passes to
-			// WaylandCapture (its stop()/Drop closes it on teardown).
-			let session = guard.0.take().expect("session present on success");
-			Ok((
-				WaylandCapture {
-					child,
-					session,
-					_pw_fd: pw_fd,
-				},
-				token,
-			))
+	let mut child = cmd.spawn().map_err(|e| {
+		anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}")
+	})?;
+	// Spawn success is NOT stream success: gst-launch prints "Failed to set pipeline to
+	// PAUSED." and exits immediately when `pipewiresrc` can't open the portal node — e.g. a
+	// restart racing the compositor's teardown of the previous cast. Poll briefly so an
+	// early death surfaces as an Err (the caller retries / the guard closes the session)
+	// instead of storing a dead child + reporting success (permanently black video). gst
+	// streams during this window, so it adds no first-frame latency.
+	for _ in 0..14 {
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		match child.try_wait() {
+			Ok(Some(status)) => {
+				return Err(anyhow::anyhow!(
+					"gst-launch exited at startup (status {status}) — pipeline failed to reach PAUSED (pipewire/portal node not ready?)"
+				));
+			}
+			Ok(None) => {}
+			Err(e) => return Err(anyhow::anyhow!("gst-launch wait failed: {e}")),
 		}
-		// On error (or if this fn is dropped mid-picker) the guard closes the session.
-		Err(e) => Err(e),
 	}
+	Ok(child)
 }
