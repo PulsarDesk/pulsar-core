@@ -196,13 +196,27 @@ impl Discovery {
 			.store(paused, std::sync::atomic::Ordering::Relaxed);
 	}
 
-	/// The non-stale peers seen so far (excluding ourselves), sorted by name.
+	/// The non-stale peers seen so far (excluding ourselves), one row PER DEVICE, sorted
+	/// by name. The map is keyed by per-process `nonce`, so ONE device seen under several
+	/// nonces (it restarted / reconnected, minting a fresh nonce each time, while the
+	/// stale beacons have not yet TTL'd out) would otherwise appear as multiple rows that
+	/// share one identity. Collapse by the stable identity `pubkey`, keeping the freshest
+	/// beacon per device.
 	pub async fn peers(&self) -> Vec<DiscoveredPeer> {
 		let now = Instant::now();
 		let mut g = self.inner.lock().await;
 		g.peers
 			.retain(|_, p| now.duration_since(p.last_seen) < PEER_TTL);
-		let mut v: Vec<DiscoveredPeer> = g.peers.values().cloned().collect();
+		let mut by_id: HashMap<[u8; 32], DiscoveredPeer> = HashMap::new();
+		for p in g.peers.values() {
+			match by_id.get(&p.pubkey) {
+				Some(kept) if kept.last_seen >= p.last_seen => {}
+				_ => {
+					by_id.insert(p.pubkey, p.clone());
+				}
+			}
+		}
+		let mut v: Vec<DiscoveredPeer> = by_id.into_values().collect();
 		v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 		v
 	}
@@ -243,9 +257,17 @@ impl Discovery {
 		if a.name.len() > MAX_NAME_LEN {
 			return;
 		}
-		// Ignore our own multicast echo.
-		if a.nonce == self.inner.lock().await.announce.nonce {
-			return;
+		// Ignore our own beacon. The per-process `nonce` catches the same-process echo,
+		// but a NEW `go_online` starts a fresh Discovery with a fresh nonce while a prior
+		// session's beacon may still be announcing for a moment before it unwinds — that
+		// stale echo has a different nonce but OUR identity, so it would list us as a
+		// peer. The identity `pubkey` is stable across those instances, so also skip any
+		// beacon carrying it.
+		{
+			let self_ann = &self.inner.lock().await.announce;
+			if a.nonce == self_ann.nonce || a.pubkey == self_ann.pubkey {
+				return;
+			}
 		}
 		// SECURITY: a beacon is unauthenticated, so EVERYTHING below is an attacker-
 		// controllable hint, not a trusted fact. We keep it ONLY for the on-screen
