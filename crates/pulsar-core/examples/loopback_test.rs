@@ -20,9 +20,10 @@ fn main() {
 			eprintln!("run_loopback_capture returned: {r:?}");
 		});
 		std::thread::sleep(std::time::Duration::from_secs(6));
-		let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+		let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 		eprintln!(
-			"captured {len} bytes to {path} (6s @ {} Hz {}ch f32 = ~{} bytes expected)",
+			"captured {len} bytes to {} (6s @ {} Hz {}ch f32 = ~{} bytes expected)",
+			path.display(),
 			fmt.rate,
 			fmt.channels,
 			fmt.rate as u64 * fmt.channels as u64 * 4 * 6
