@@ -34,7 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x25519-dalek = "2"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
-gilrs = "0.10"
 # Shared crates, now external repos (git dependencies).
 pulsar-proto = { git = "https://github.com/PulsarDesk/pulsar-proto" }
 pulsar-relay = { git = "https://github.com/PulsarDesk/relay" }

@@ -13,8 +13,8 @@ fn main() {
 			fmt.channels,
 			fmt.ffmpeg_sample_fmt()
 		);
-		let path = r"C:\Users\ahmet\loopback_out.raw";
-		let f = std::fs::File::create(path).expect("create file");
+		let path = std::env::temp_dir().join("loopback_out.raw");
+		let f = std::fs::File::create(&path).expect("create file");
 		std::thread::spawn(move || {
 			let r = pulsar_core::audio::run_loopback_capture(f);
 			eprintln!("run_loopback_capture returned: {r:?}");

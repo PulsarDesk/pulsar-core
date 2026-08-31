@@ -37,7 +37,7 @@ const PEER_TTL: Duration = Duration::from_secs(8);
 const MAGIC: u32 = 0x5055_4c53; // "PULS"
 const ANNOUNCE_VERSION: u16 = 1;
 
-/// A human label for this machine's current OS user (e.g. "Ahmet Enes Duruer"),
+/// A human label for this machine's current OS user (e.g. "Jane Doe"),
 /// used as the device's identity — especially relay-less, where there's no id to
 /// show. Falls back to the login name, then a generic label.
 pub fn os_display_name() -> String {

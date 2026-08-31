@@ -1,10 +1,11 @@
 //! Game controller support.
 //!
-//! Pulsar reads physical controllers on the **client** with `gilrs` (which wraps
-//! XInput/DInput on Windows, IOKit on macOS, and evdev on Linux), normalizes
-//! them into a transport-friendly [`GamepadState`], and replays them on the
-//! **host** through a [`VirtualGamepad`] backend (ViGEm on Windows, uinput on
-//! Linux, a driver on macOS).
+//! Physical controllers are read on the **client** by the desktop app via SDL3
+//! (`gilrs` was removed; this crate only holds the shared types/normalization
+//! and the virtual-pad backends). The app normalizes them into a
+//! transport-friendly [`GamepadState`], and the **host** replays them through a
+//! [`VirtualGamepad`] backend (ViGEm on Windows, uinput on Linux, a no-op stub
+//! on macOS).
 //!
 //! DualShock 3/4, DualSense, Xbox and generic pads are all supported; the
 //! controller *kind* is detected from its USB vendor/product id so the host can

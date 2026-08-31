@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Linux deps (gilrs → libudev)
+      - name: Install Linux deps (libudev for uinput/evdev)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
@@ -52,3 +52,12 @@ jobs:
         run: cargo clippy -p pulsar-core --all-targets --locked
       - name: Test
         run: cargo test --locked
+
+  audit:
+    name: Security audit (RustSec)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

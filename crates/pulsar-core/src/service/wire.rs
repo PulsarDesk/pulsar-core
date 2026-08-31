@@ -714,7 +714,7 @@ mod tests {
 	#[test]
 	fn peer_name_roundtrip() {
 		// The pushed display name (Unicode-safe) survives the JSON roundtrip.
-		let m = DataMsg::PeerName("Ahmet Enes Dürüer".into());
+		let m = DataMsg::PeerName("Jane Döe".into());
 		let json = serde_json::to_string(&m).unwrap();
 		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
 	}
@@ -920,7 +920,7 @@ mod tests {
 				entries: vec![FsEntry { name: "a.txt".into(), dir: false, size: 42, sentinel: false }],
 			},
 			DataMsg::FsGet { path: "Belgeler/a.txt".into() },
-			DataMsg::PeerName("Ahmet".into()),
+			DataMsg::PeerName("Jane".into()),
 			DataMsg::PeerId("641 724 395".into()),
 			DataMsg::CursorPos { x: 0.5, y: 0.25 },
 			DataMsg::CursorShape {
