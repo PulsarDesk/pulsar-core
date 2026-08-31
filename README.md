@@ -32,8 +32,11 @@ vigem-client = { git = "https://github.com/PulsarDesk/pulsar-core" }
 ## Build & test
 
 ```bash
-cargo test          # headless suite (needs libudev on Linux for gilrs)
+cargo test          # headless suite
 ```
+
+(Controller *reading* lives in the apps via SDL3 — gilrs was removed from this
+crate; here are the types/normalization + virtual-pad backends.)
 
 Depends on [`pulsar-proto`](https://github.com/PulsarDesk/pulsar-proto) and
 [`relay`](https://github.com/PulsarDesk/relay) (git dependencies).
