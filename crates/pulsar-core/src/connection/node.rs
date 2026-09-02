@@ -44,6 +44,31 @@ pub struct Node {
 	pub(super) incoming_rx: Mutex<mpsc::UnboundedReceiver<Session>>,
 	/// Signalled by `Drop` so `recv_loop` exits immediately (see below).
 	pub(super) shutdown: Arc<Notify>,
+	/// Credentials for a relay with an auth policy (v4). Empty for the public/open relay.
+	/// Consulted only when the relay answers a registration with `AuthRequired`; the raw
+	/// password is turned into a nonce-bound proof (never sent as-is), and the TOTP code is
+	/// one-shot (the app supplies a fresh one per `go_online`). Behind a `std::sync::Mutex`
+	/// so the app can update it (e.g. after prompting for a password/2FA) and re-register on
+	/// the SAME node without rebinding the socket.
+	pub(super) relay_creds: std::sync::Mutex<RelayCreds>,
+}
+
+/// Credentials a node offers to a relay that requires authentication (v4). Both optional;
+/// a plain open relay uses [`RelayCreds::none`].
+#[derive(Clone, Default)]
+pub struct RelayCreds {
+	/// The relay password, if the operator set one. Used to build the nonce-bound proof.
+	pub password: Option<String>,
+	/// A current TOTP (2FA) code, if the operator requires 2FA. One-shot: the app reads it
+	/// from the user and passes a fresh code on each registration attempt.
+	pub totp: Option<String>,
+}
+
+impl RelayCreds {
+	/// No credentials — the default for the public/open relay.
+	pub fn none() -> Self {
+		Self::default()
+	}
 }
 
 impl Drop for Node {
@@ -93,6 +118,19 @@ impl Node {
 		name: String,
 		identity: Identity,
 	) -> std::io::Result<Arc<Self>> {
+		Self::bind_with_identity_creds(local, relay, mode, name, identity, RelayCreds::none()).await
+	}
+
+	/// Like [`Self::bind_with_identity`] but with credentials for a relay that requires
+	/// authentication (v4). Pass [`RelayCreds::none`] for the public/open relay.
+	pub async fn bind_with_identity_creds(
+		local: SocketAddr,
+		relay: SocketAddr,
+		mode: NetworkMode,
+		name: String,
+		identity: Identity,
+		creds: RelayCreds,
+	) -> std::io::Result<Arc<Self>> {
 		// Media-over-session rides THIS one socket: a 15 Mbit stream's IDR bursts
 		// overflow the kernel-default ~208 KiB rcvbuf (UdpRcvbufErrors → silent
 		// packet loss → broken reference chains / mosaic under motion). Ask for
@@ -136,10 +174,23 @@ impl Node {
 			incoming_tx,
 			incoming_rx: Mutex::new(incoming_rx),
 			shutdown: Arc::new(Notify::new()),
+			relay_creds: std::sync::Mutex::new(creds),
 		});
 		let weak = Arc::downgrade(&node);
 		tokio::spawn(recv_loop(weak));
 		Ok(node)
+	}
+
+	/// Replace the relay credentials (e.g. after the app prompted for a password / 2FA code
+	/// following a [`ConnError::RelayAuthRequired`]). The next `register()` uses them.
+	pub fn set_relay_creds(&self, creds: RelayCreds) {
+		*self.relay_creds.lock().unwrap() = creds;
+	}
+
+	/// Whether the relay advertised end-to-end-encryption as required (learned at
+	/// registration). Pulsar sessions are always E2E, so this is a policy/UI signal.
+	pub async fn relay_e2e_required(&self) -> bool {
+		self.inner.lock().await.e2e_required
 	}
 
 	pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -205,44 +256,114 @@ impl Node {
 	/// outage): the relay maps pubkey → id, so re-sending this reissues the
 	/// SAME 9-digit ID.
 	pub(super) fn register_msg(&self) -> ClientMsg {
+		self.register_msg_with(None)
+	}
+
+	/// The registration message, optionally carrying an [`AuthProof`] answer to a relay's
+	/// `AuthRequired` challenge (v4). `auth` is `None` on the first attempt and on open relays.
+	pub(super) fn register_msg_with(&self, auth: Option<pulsar_proto::AuthProof>) -> ClientMsg {
 		ClientMsg::Register {
 			version: PROTOCOL_VERSION,
 			pubkey: self.identity.public_bytes(),
 			name: Some(self.name.clone()),
+			auth,
+		}
+	}
+
+	/// Build the [`AuthProof`] for a challenge `nonce` from our stored credentials. Returns
+	/// `None` for a factor we don't have — the caller then reports `RelayAuthRequired`.
+	pub(super) fn build_auth_proof(&self, nonce: [u8; 16]) -> pulsar_proto::AuthProof {
+		let creds = self.relay_creds.lock().unwrap();
+		pulsar_proto::AuthProof {
+			nonce,
+			password: creds
+				.password
+				.as_deref()
+				.map(|pw| pulsar_proto::password_proof(&nonce, pw)),
+			totp: creds.totp.clone(),
 		}
 	}
 
 	/// Register with the relay and obtain a [`DeviceId`]. Errors if the relay is
 	/// unreachable (e.g. taken down) — without it there is no ID.
 	pub async fn register(self: &Arc<Self>) -> Result<DeviceId, ConnError> {
-		self.sock
-			.send_to(&encode(&self.register_msg()), self.relay)
-			.await?;
-		timeout(REGISTER_TIMEOUT, self.registered.notified())
-			.await
-			.map_err(|_| ConnError::RelayTimeout)?;
-		let id = {
-			let g = self.inner.lock().await;
-			match g.self_id {
-				Some(id) => id,
-				// The notify fired with no id: the relay refused our registration. A
-				// version mismatch maps to a clear `IncompatibleVersion`; anything else
-				// (or no recorded code) falls back to a timeout-style error.
-				None => {
-					return Err(match g.register_error {
-						// The relay sends `ErrCode::Protocol` (not `IncompatibleVersion`)
-						// for version-mismatch replies so that old builds that predate the
-						// `IncompatibleVersion` variant can decode the error. During initial
-						// registration both codes mean "update required" (no other relay
-						// Protocol error is sent at this stage). Map both so the UI shows
-						// the clear message instead of a generic relay-timeout / retry loop.
-						Some(ErrCode::IncompatibleVersion) | Some(ErrCode::Protocol) => {
-							ConnError::IncompatibleVersion
-						}
-						_ => ConnError::RelayTimeout,
-					})
+		// The first attempt carries no auth proof. On an OPEN relay the relay replies
+		// `Registered` and we're done in one round trip. On a relay with an auth policy it
+		// replies `AuthRequired` with a challenge nonce; we build a proof from our stored
+		// credentials and send a second Register. The loop caps the rounds so a
+		// misbehaving/looping relay can't spin us forever (one initial + a few re-tries
+		// covers: challenge → proof, and a stale-nonce re-challenge).
+		let mut proof: Option<pulsar_proto::AuthProof> = None;
+		let mut attempts = 0;
+		let id = loop {
+			attempts += 1;
+			self.sock
+				.send_to(&encode(&self.register_msg_with(proof.take())), self.relay)
+				.await?;
+			// Wait for a DEFINITIVE registration outcome, tolerating spurious wakeups. The
+			// relay's `Registered`/`Error` handlers double-notify (`notify_waiters` +
+			// `notify_one`) so a signal is never lost, which can leave a stale permit that
+			// wakes the next `notified()` early — before the reply to THIS Register has
+			// arrived. Re-wait on any wake that finds no outcome set, bounded by the overall
+			// deadline, so a stale permit can't be misread as a `RelayTimeout`.
+			let deadline = tokio::time::Instant::now() + REGISTER_TIMEOUT;
+			loop {
+				let g = self.inner.lock().await;
+				if g.self_id.is_some() || g.auth_required.is_some() || g.register_error.is_some() {
+					break;
+				}
+				drop(g);
+				let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+				if remaining.is_zero() {
+					return Err(ConnError::RelayTimeout);
+				}
+				if timeout(remaining, self.registered.notified()).await.is_err() {
+					return Err(ConnError::RelayTimeout);
 				}
 			}
+
+			let mut g = self.inner.lock().await;
+			if let Some(id) = g.self_id {
+				break id;
+			}
+			// No id yet: either an auth challenge, an auth failure, or a fatal refusal.
+			if let Some((need_pw, need_totp, nonce)) = g.auth_required.take() {
+				// Do we hold every factor the relay asked for? If not, surface exactly the
+				// MISSING factors so the app prompts for just those and retries.
+				let creds = self.relay_creds.lock().unwrap();
+				let have_pw = creds.password.is_some();
+				let have_totp = creds.totp.is_some();
+				drop(creds);
+				let missing_pw = need_pw && !have_pw;
+				let missing_totp = need_totp && !have_totp;
+				if missing_pw || missing_totp {
+					return Err(ConnError::RelayAuthRequired {
+						password: missing_pw,
+						totp: missing_totp,
+					});
+				}
+				if attempts >= 4 {
+					// We keep getting re-challenged despite supplying credentials (clock skew
+					// on the nonce window, or a wrong-but-present credential the relay treats
+					// as a stale nonce). Give up rather than loop.
+					return Err(ConnError::RelayAuthFailed);
+				}
+				proof = Some(self.build_auth_proof(nonce));
+				g.register_error = None;
+				drop(g);
+				continue;
+			}
+			// A recorded error refusal (no challenge). Map it to a specific ConnError.
+			return Err(match g.register_error {
+				Some(ErrCode::BadAuth) => ConnError::RelayAuthFailed,
+				// The relay sends `ErrCode::Protocol` (not `IncompatibleVersion`) for a
+				// version mismatch so pre-`IncompatibleVersion` builds can decode it. Both
+				// mean "update required" during initial registration.
+				Some(ErrCode::IncompatibleVersion) | Some(ErrCode::Protocol) => {
+					ConnError::IncompatibleVersion
+				}
+				_ => ConnError::RelayTimeout,
+			});
 		};
 		// Keep the registration alive: the relay drops devices that go silent for
 		// `DEVICE_TTL`, after which `connect()` would fail with `BadToken`.

@@ -26,6 +26,67 @@ async fn start_relay() -> (SocketAddr, JoinHandle<std::io::Result<()>>) {
 const LOCAL: &str = "127.0.0.1:0";
 
 #[tokio::test]
+async fn relay_password_auth_gates_registration() {
+	use pulsar_core::{Identity, RelayCreds};
+	use pulsar_relay::{Relay, RelayAuth};
+
+	// A relay that requires the password "s3cret".
+	let relay = Relay::bind("127.0.0.1:0".parse().unwrap())
+		.await
+		.unwrap()
+		.with_auth(RelayAuth {
+			password: Some("s3cret".into()),
+			totp_secret: None,
+			require_e2e: true,
+		});
+	let addr = relay.local_addr().unwrap();
+	let _h = tokio::spawn(relay.run());
+
+	// No credentials → the relay challenges, the node lacks a password → RelayAuthRequired.
+	let none = Node::bind(LOCAL.parse().unwrap(), addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	match none.register().await {
+		Err(ConnError::RelayAuthRequired { password, totp }) => {
+			assert!(password, "password factor should be reported missing");
+			assert!(!totp, "no TOTP factor configured");
+		}
+		other => panic!("expected RelayAuthRequired, got {other:?}"),
+	}
+
+	// Wrong password → RelayAuthFailed.
+	let wrong = Node::bind_with_identity_creds(
+		LOCAL.parse().unwrap(),
+		addr,
+		NetworkMode::Auto,
+		"n".into(),
+		Identity::generate(),
+		RelayCreds { password: Some("nope".into()), totp: None },
+	)
+	.await
+	.unwrap();
+	assert!(
+		matches!(wrong.register().await, Err(ConnError::RelayAuthFailed)),
+		"a wrong password must fail auth"
+	);
+
+	// Correct password → registered, and the relay's E2E policy is learned.
+	let ok = Node::bind_with_identity_creds(
+		LOCAL.parse().unwrap(),
+		addr,
+		NetworkMode::Auto,
+		"n".into(),
+		Identity::generate(),
+		RelayCreds { password: Some("s3cret".into()), totp: None },
+	)
+	.await
+	.unwrap();
+	ok.register().await.expect("correct password registers");
+	assert!(ok.self_id().await.is_some(), "registered id present");
+	assert!(ok.relay_e2e_required().await, "relay advertised require_e2e");
+}
+
+#[tokio::test]
 async fn registering_without_a_relay_yields_no_id() {
 	// Point at a port with nothing listening.
 	let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -292,6 +353,7 @@ async fn post_registration_protocol_error_fires_version_error() {
 		let registered = proto::encode(&proto::RelayMsg::Registered {
 			id: DeviceId::new(100_000_001).unwrap(),
 			token: Token([0x42; 16]),
+			e2e_required: false,
 		});
 		fake.send_to(&registered, from).await.unwrap();
 
@@ -361,6 +423,7 @@ async fn post_registration_benign_protocol_error_does_not_fire_version_error() {
 		let registered = proto::encode(&proto::RelayMsg::Registered {
 			id: DeviceId::new(100_000_002).unwrap(),
 			token: Token([0x43; 16]),
+			e2e_required: false,
 		});
 		fake.send_to(&registered, from).await.unwrap();
 

@@ -33,7 +33,7 @@ mod node;
 mod session;
 mod types;
 
-pub use node::Node;
+pub use node::{Node, RelayCreds};
 pub use session::{Session, SessionSender};
 
 use types::{Inner, SessionState};
@@ -65,6 +65,15 @@ pub enum ConnError {
 	/// accepts, call `forget_peer` to clear the pin and retry.
 	#[error("identity behind {0} changed — the pinned key no longer matches")]
 	IdentityChanged(DeviceId),
+	/// The relay requires authentication and this node has no (or not enough) credentials
+	/// to satisfy it. The booleans say which factors are still MISSING, so the app can
+	/// prompt for exactly those and retry registration with them. Not fatal — supply the
+	/// credentials (a stored password and/or a fresh TOTP code) and re-register.
+	#[error("relay requires authentication (password: {password}, 2FA: {totp})")]
+	RelayAuthRequired { password: bool, totp: bool },
+	/// A credential was supplied but the relay rejected it (wrong password or wrong TOTP).
+	#[error("relay authentication failed — wrong password or 2FA code")]
+	RelayAuthFailed,
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
 }

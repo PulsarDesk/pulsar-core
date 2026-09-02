@@ -58,4 +58,11 @@ pub(super) struct Inner {
 	/// after its rendezvous timeout so it can return `IdentityChanged` instead of the
 	/// generic `TargetUnreachable` when the peer DID answer but with a rotated key.
 	pub(super) identity_mismatch: HashMap<SessionId, Arc<std::sync::atomic::AtomicBool>>,
+	/// Set by the `AuthRequired` handler when the relay challenges our registration (v4):
+	/// `(password_needed, totp_needed, challenge_nonce)`. `register()` reads it to build the
+	/// proof (or to fail with `RelayAuthRequired` when we lack the credential), then clears it.
+	pub(super) auth_required: Option<(bool, bool, [u8; 16])>,
+	/// The relay's advertised E2E policy, learned from `Registered` (v4). Pulsar always
+	/// encrypts, so this is a policy/UI signal, surfaced via `Node::relay_e2e_required`.
+	pub(super) e2e_required: bool,
 }

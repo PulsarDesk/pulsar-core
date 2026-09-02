@@ -80,7 +80,11 @@ impl Node {
 
 	async fn handle_relay(self: &Arc<Self>, msg: RelayMsg) {
 		match msg {
-			RelayMsg::Registered { id, token } => {
+			RelayMsg::Registered {
+				id,
+				token,
+				e2e_required,
+			} => {
 				let mut g = self.inner.lock().await;
 				// A re-register (NotRegistered → register_msg) after a relay restart
 				// that lost `by_pubkey` mints a DIFFERENT id. Detect that rotation so
@@ -89,6 +93,9 @@ impl Node {
 				let rotated = matches!(g.self_id, Some(prev) if prev != id);
 				g.self_id = Some(id);
 				g.token = Some(token);
+				g.e2e_required = e2e_required;
+				// A successful registration clears any pending auth challenge.
+				g.auth_required = None;
 				// Clear any stale register error: we're registered now.
 				g.register_error = None;
 				drop(g);
@@ -183,6 +190,44 @@ impl Node {
 				// Move the decoded payload into `deliver` so it can decrypt in place.
 				if let Ok(PeerMsg::Data { seq, payload, .. }) = decode::<PeerMsg>(&payload) {
 					self.deliver(session, seq, payload).await;
+				}
+			}
+			RelayMsg::AuthRequired {
+				password,
+				totp,
+				nonce,
+			} => {
+				// v4: the relay has an auth policy and wants a credential. Two cases:
+				let g = self.inner.lock().await;
+				if g.self_id.is_none() {
+					// Initial registration in flight — hand the challenge to `register()`,
+					// which builds the proof from our credentials (or fails with
+					// `RelayAuthRequired` so the app can prompt for exactly what's missing).
+					let mut g = g;
+					g.auth_required = Some((password, totp, nonce));
+					drop(g);
+					self.registered.notify_waiters();
+					self.registered.notify_one();
+				} else {
+					// A heartbeat-driven recovery re-register (the relay dropped us, e.g. a
+					// restart) got challenged. Auto-answer with a proof when we can — i.e. the
+					// password factor is satisfiable and no fresh TOTP is demanded (TOTP is
+					// one-shot; a relay requiring it per re-register is re-authenticated by
+					// the app on its next go_online, not here).
+					drop(g);
+					let can_answer = {
+						let creds = self.relay_creds.lock().unwrap();
+						!totp && (!password || creds.password.is_some())
+					};
+					if can_answer {
+						let proof = self.build_auth_proof(nonce);
+						let _ = self
+							.sock
+							.send_to(&encode(&self.register_msg_with(Some(proof))), self.relay)
+							.await;
+					} else {
+						tracing::warn!("relay re-auth needed but no usable credentials — awaiting app re-login");
+					}
 				}
 			}
 			RelayMsg::Error { code, message } => {

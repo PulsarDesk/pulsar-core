@@ -39,6 +39,13 @@ pub enum Language {
 pub struct Config {
 	/// `host:port` of the relay / rendezvous server. Changeable by the user.
 	pub relay: String,
+	/// Password for a relay that requires one (v4 relay auth). Stored so reconnects to a
+	/// password-protected relay don't re-prompt; empty for the public/open relay. Never
+	/// travels the wire as-is — the client sends a nonce-bound SHA-256 proof. 2FA/TOTP is
+	/// NOT stored (it's a one-time code prompted per connect). `#[serde(default)]` so
+	/// configs written before this field still load.
+	#[serde(default)]
+	pub relay_password: String,
 	/// Connection strategy.
 	pub network_mode: NetworkMode,
 	/// Friendly name advertised to peers.
@@ -118,6 +125,7 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			relay: DEFAULT_RELAY.to_string(),
+			relay_password: String::new(),
 			network_mode: NetworkMode::Auto,
 			device_name: default_device_name(),
 			language: Language::Tr,
