@@ -61,7 +61,10 @@ async fn relay_password_auth_gates_registration() {
 		NetworkMode::Auto,
 		"n".into(),
 		Identity::generate(),
-		RelayCreds { password: Some("nope".into()), totp: None },
+		RelayCreds {
+			password: Some("nope".into()),
+			totp: None,
+		},
 	)
 	.await
 	.unwrap();
@@ -77,13 +80,19 @@ async fn relay_password_auth_gates_registration() {
 		NetworkMode::Auto,
 		"n".into(),
 		Identity::generate(),
-		RelayCreds { password: Some("s3cret".into()), totp: None },
+		RelayCreds {
+			password: Some("s3cret".into()),
+			totp: None,
+		},
 	)
 	.await
 	.unwrap();
 	ok.register().await.expect("correct password registers");
 	assert!(ok.self_id().await.is_some(), "registered id present");
-	assert!(ok.relay_e2e_required().await, "relay advertised require_e2e");
+	assert!(
+		ok.relay_e2e_required().await,
+		"relay advertised require_e2e"
+	);
 }
 
 #[tokio::test]
@@ -307,7 +316,10 @@ async fn version_mismatch_register_returns_incompatible_version() {
 		// Handle exactly one Register then stop — that's all the test needs.
 		let (n, from) = fake.recv_from(&mut buf).await.unwrap();
 		let msg: proto::ClientMsg = proto::decode(&buf[..n]).expect("decodable ClientMsg");
-		assert!(matches!(msg, proto::ClientMsg::Register { .. }), "expected Register");
+		assert!(
+			matches!(msg, proto::ClientMsg::Register { .. }),
+			"expected Register"
+		);
 		let reply = proto::encode(&proto::RelayMsg::Error {
 			code: proto::ErrCode::Protocol,
 			message: "incompatible protocol version".into(),
@@ -384,8 +396,13 @@ async fn post_registration_protocol_error_fires_version_error() {
 		.unwrap();
 	// Grab the version-error handle before registering so a fast signal isn't missed.
 	let ver_signal = node.version_error_handle();
-	node.register().await.expect("initial register must succeed");
-	assert!(node.self_id().await.is_some(), "should have an id after register");
+	node.register()
+		.await
+		.expect("initial register must succeed");
+	assert!(
+		node.self_id().await.is_some(),
+		"should have an id after register"
+	);
 
 	// The whole NotRegistered → re-Register → Protocol cycle is purely network-driven
 	// with no sleep; it should complete well within 2 s on loopback.
@@ -444,8 +461,13 @@ async fn post_registration_benign_protocol_error_does_not_fire_version_error() {
 		.await
 		.unwrap();
 	let ver_signal = node.version_error_handle();
-	node.register().await.expect("initial register must succeed");
-	assert!(node.self_id().await.is_some(), "should have an id after register");
+	node.register()
+		.await
+		.expect("initial register must succeed");
+	assert!(
+		node.self_id().await.is_some(),
+		"should have an id after register"
+	);
 
 	// version_error must NOT be notified — the benign Protocol error (wrong message)
 	// should fall through without triggering the version-mismatch path.

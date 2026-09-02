@@ -246,8 +246,7 @@ impl Node {
 						self.registered.notify_waiters();
 						self.registered.notify_one();
 					} else if code == ErrCode::IncompatibleVersion
-						|| (code == ErrCode::Protocol
-							&& message == "incompatible protocol version")
+						|| (code == ErrCode::Protocol && message == "incompatible protocol version")
 					{
 						// Already registered but the relay now rejects a re-Register with a
 						// version-mismatch error (relay was redeployed with a newer

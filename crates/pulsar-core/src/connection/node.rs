@@ -317,7 +317,10 @@ impl Node {
 				if remaining.is_zero() {
 					return Err(ConnError::RelayTimeout);
 				}
-				if timeout(remaining, self.registered.notified()).await.is_err() {
+				if timeout(remaining, self.registered.notified())
+					.await
+					.is_err()
+				{
 					return Err(ConnError::RelayTimeout);
 				}
 			}
