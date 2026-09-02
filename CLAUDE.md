@@ -20,8 +20,8 @@ product; `README.md` here for the consumer snippet.
   hole-punch → relay fallback; encrypted `Session`.
 - `crypto.rs` — X25519 identity + ChaCha20-Poly1305; per-session salt +
   session_id in the KDF, direction byte in the nonce.
-- `config.rs` — persisted JSON config; `DEFAULT_RELAY = "127.0.0.1:21116"`
-  (localhost dev default, NOT a public endpoint); `NetworkMode`.
+- `config.rs` — persisted JSON config; `DEFAULT_RELAY = "relay.pulsardesk.com:21116"`
+  (official public relay; users can point at a self-hosted/local one); `NetworkMode`.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
   ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
   (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*

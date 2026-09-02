@@ -7,10 +7,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Default relay endpoint. Points at a local relay so the app works out of the
-/// box with `cargo run -p pulsar-relay`; users override it in Settings → Ağ to
-/// point at a public / self-hosted relay.
-pub const DEFAULT_RELAY: &str = "127.0.0.1:21116";
+/// Default relay endpoint — the official public Pulsar relay, so the app works
+/// out of the box. Users override it in Settings → Ağ to point at a self-hosted
+/// or local relay (e.g. `127.0.0.1:21116` with `cargo run -p pulsar-relay`).
+pub const DEFAULT_RELAY: &str = "relay.pulsardesk.com:21116";
 
 /// How Pulsar establishes a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -271,6 +271,8 @@ mod tests {
 		c.relay = "host:notaport".into();
 		assert!(!c.relay_is_valid());
 		c.relay = "127.0.0.1:21116".into();
+		assert!(c.relay_is_valid());
+		c.relay = DEFAULT_RELAY.into();
 		assert!(c.relay_is_valid());
 	}
 
