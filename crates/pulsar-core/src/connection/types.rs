@@ -65,4 +65,7 @@ pub(super) struct Inner {
 	/// The relay's advertised E2E policy, learned from `Registered` (v4). Pulsar always
 	/// encrypts, so this is a policy/UI signal, surfaced via `Node::relay_e2e_required`.
 	pub(super) e2e_required: bool,
+	/// An access key the relay issued on a successful registration (v5), for the app to
+	/// persist. Surfaced via `Node::issued_relay_key`.
+	pub(super) issued_key: Option<String>,
 }

@@ -7,10 +7,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Default relay endpoint — the official public Pulsar relay, so the app works
-/// out of the box. Users override it in Settings → Ağ to point at a self-hosted
-/// or local relay (e.g. `127.0.0.1:21116` with `cargo run -p pulsar-relay`).
-pub const DEFAULT_RELAY: &str = "relay.pulsardesk.com:21116";
+/// Default relay endpoint — the official public Pulsar relay, so the app works out of
+/// the box. Written WITHOUT a port: [`crate::proto::DEFAULT_RELAY_PORT`] is implied and
+/// filled in when the address is resolved, so the common case shows a clean hostname.
+/// A port is only ever written when the operator actually runs on a different one
+/// (`my-relay.example.com:9000`). Users override it in Settings → Ağ to point at a
+/// self-hosted or local relay.
+pub const DEFAULT_RELAY: &str = "relay.pulsardesk.com";
 
 /// How Pulsar establishes a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -39,13 +42,22 @@ pub enum Language {
 pub struct Config {
 	/// `host:port` of the relay / rendezvous server. Changeable by the user.
 	pub relay: String,
-	/// Password for a relay that requires one (v4 relay auth). Stored so reconnects to a
-	/// password-protected relay don't re-prompt; empty for the public/open relay. Never
-	/// travels the wire as-is — the client sends a nonce-bound SHA-256 proof. 2FA/TOTP is
-	/// NOT stored (it's a one-time code prompted per connect). `#[serde(default)]` so
-	/// configs written before this field still load.
+	/// Durable ACCESS KEYS for relays that require authentication (v5), keyed by the relay
+	/// address they were issued by. The relay hands one back the first time a device
+	/// satisfies its password/2FA prompt; every later registration presents the key
+	/// instead, so the user is asked once per device and not again — until the operator
+	/// changes the relay's credentials, which invalidates it and re-triggers the prompt.
+	///
+	/// Deliberately NOT the password: the password is entered in a prompt and never
+	/// persisted, and a key is useless on any other device (the relay binds it to this
+	/// device's public key). `#[serde(default)]` so older configs still load.
 	#[serde(default)]
-	pub relay_password: String,
+	pub relay_keys: std::collections::HashMap<String, String>,
+	/// Run a relay INSIDE this app and register against it instead of a remote one
+	/// (Settings → Ağ toggle). While set, `relay` is ignored: the address is by definition
+	/// local, so there is nothing for the user to type. `#[serde(default)]` = off.
+	#[serde(default)]
+	pub use_local_relay: bool,
 	/// Connection strategy.
 	pub network_mode: NetworkMode,
 	/// Friendly name advertised to peers.
@@ -125,7 +137,8 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			relay: DEFAULT_RELAY.to_string(),
-			relay_password: String::new(),
+			relay_keys: std::collections::HashMap::new(),
+			use_local_relay: false,
 			network_mode: NetworkMode::Auto,
 			device_name: default_device_name(),
 			language: Language::Tr,
@@ -147,10 +160,31 @@ impl Default for Config {
 impl Config {
 	/// Load from a JSON file, or return defaults if it doesn't exist / is invalid.
 	pub fn load(path: impl AsRef<Path>) -> Self {
-		std::fs::read_to_string(path)
+		let mut cfg: Self = std::fs::read_to_string(path)
 			.ok()
 			.and_then(|s| serde_json::from_str(&s).ok())
-			.unwrap_or_default()
+			.unwrap_or_default();
+		cfg.normalise_relay();
+		cfg
+	}
+
+	/// Drop a redundant `:21116` from the stored relay address.
+	///
+	/// The default port is implied everywhere it matters (resolution fills it in), so
+	/// carrying it in the value only shows the user a port they never chose — including on
+	/// installs written before the address became port-optional. A NON-default port is left
+	/// exactly as typed, because there it is the whole point.
+	fn normalise_relay(&mut self) {
+		let trimmed = self.relay.trim();
+		if let Some((host, port)) = split_relay_port(trimmed) {
+			if !host.is_empty() && port == crate::proto::DEFAULT_RELAY_PORT.to_string() {
+				self.relay = host.to_string();
+				return;
+			}
+		}
+		if trimmed.len() != self.relay.len() {
+			self.relay = trimmed.to_string();
+		}
 	}
 
 	/// Persist to a JSON file (creating parent dirs).
@@ -225,12 +259,62 @@ impl Config {
 	}
 
 	/// Returns true if the relay endpoint looks like a usable `host:port`.
-	pub fn relay_is_valid(&self) -> bool {
-		match self.relay.rsplit_once(':') {
-			Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
-			None => false,
+	/// The stored access key for a relay address (normalised the same way the pins are:
+	/// trimmed + lowercased), if this device has already authenticated there.
+	pub fn relay_key_for(&self, relay: &str) -> Option<&str> {
+		self.relay_keys
+			.get(&relay.trim().to_ascii_lowercase())
+			.map(String::as_str)
+	}
+
+	/// Remember the access key a relay just issued (or, with `None`, forget it — e.g. the
+	/// operator rotated the credentials and the key stopped working).
+	pub fn set_relay_key(&mut self, relay: &str, key: Option<String>) {
+		let k = relay.trim().to_ascii_lowercase();
+		match key {
+			Some(v) => {
+				self.relay_keys.insert(k, v);
+			}
+			None => {
+				self.relay_keys.remove(&k);
+			}
 		}
 	}
+
+	/// Is the configured relay address usable? A bare host (`relay.pulsardesk.com`,
+	/// `192.168.1.5`) is valid on its own — the default relay port is implied. An explicit
+	/// port is validated when one is given. IPv6 literals must be bracketed to carry a port
+	/// (`[::1]:21116`); a bare `::1` is treated as a host, which is what a user means.
+	pub fn relay_is_valid(&self) -> bool {
+		let s = self.relay.trim();
+		if s.is_empty() {
+			return false;
+		}
+		match split_relay_port(s) {
+			Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
+			None => true, // bare host — the default port applies
+		}
+	}
+}
+
+/// Split `host:port` when the address really carries a port. Returns `None` for a bare
+/// host, including an unbracketed IPv6 literal (whose colons are part of the address).
+/// `[v6]:port` is split at the bracket.
+pub fn split_relay_port(s: &str) -> Option<(&str, &str)> {
+	let s = s.trim();
+	if let Some(rest) = s.strip_prefix('[') {
+		// Bracketed IPv6: `[::1]:21116` → ("[::1]", "21116"); `[::1]` → None.
+		let (host, tail) = rest.split_once(']')?;
+		let port = tail.strip_prefix(':')?;
+		let _ = host;
+		return Some((&s[..host.len() + 2], port));
+	}
+	let (host, port) = s.rsplit_once(':')?;
+	// More than one colon and no brackets → a bare IPv6 literal, not host:port.
+	if host.contains(':') {
+		return None;
+	}
+	Some((host, port))
 }
 
 fn default_device_name() -> String {
@@ -274,14 +358,64 @@ mod tests {
 	#[test]
 	fn relay_validation_catches_garbage() {
 		let mut c = Config::default();
+		// A bare host is VALID: the default relay port is implied, so the address a user
+		// sees and types is just the hostname.
 		c.relay = "no-port".into();
-		assert!(!c.relay_is_valid());
+		assert!(c.relay_is_valid());
+		c.relay = DEFAULT_RELAY.into();
+		assert!(c.relay_is_valid(), "the shipped default carries no port");
+		c.relay = "192.168.1.5".into();
+		assert!(c.relay_is_valid());
+		// An explicit port is still validated.
 		c.relay = "host:notaport".into();
+		assert!(!c.relay_is_valid());
+		c.relay = "host:99999".into();
 		assert!(!c.relay_is_valid());
 		c.relay = "127.0.0.1:21116".into();
 		assert!(c.relay_is_valid());
-		c.relay = DEFAULT_RELAY.into();
-		assert!(c.relay_is_valid());
+		// Empty is never valid.
+		c.relay = "  ".into();
+		assert!(!c.relay_is_valid());
+	}
+
+	#[test]
+	fn loading_drops_a_redundant_default_port_but_keeps_a_real_one() {
+		let dir = std::env::temp_dir().join(format!("pulsar-relay-norm-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("config.json");
+
+		// An install written before the address became port-optional.
+		let mut c = Config::default();
+		c.relay = "relay.pulsardesk.com:21116".into();
+		c.save(&path).unwrap();
+		assert_eq!(
+			Config::load(&path).relay,
+			"relay.pulsardesk.com",
+			"the implied default port should not be shown back to the user"
+		);
+
+		// A deliberately non-default port is preserved verbatim.
+		c.relay = "my-relay.example.com:9000".into();
+		c.save(&path).unwrap();
+		assert_eq!(Config::load(&path).relay, "my-relay.example.com:9000");
+
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn relay_port_split_handles_ipv6_and_bare_hosts() {
+		// Bare hosts (v4, v6, dns) carry no port.
+		assert_eq!(split_relay_port("relay.pulsardesk.com"), None);
+		assert_eq!(split_relay_port("192.168.1.5"), None);
+		assert_eq!(
+			split_relay_port("::1"),
+			None,
+			"unbracketed IPv6 is a host, not host:port"
+		);
+		// Explicit ports split.
+		assert_eq!(split_relay_port("host:9000"), Some(("host", "9000")));
+		assert_eq!(split_relay_port("[::1]:21116"), Some(("[::1]", "21116")));
+		assert_eq!(split_relay_port("[::1]"), None);
 	}
 
 	#[test]
@@ -330,7 +464,9 @@ mod tests {
 		let dir = std::env::temp_dir().join(format!("pulsar-cfg-test-{}", std::process::id()));
 		let path = dir.join("config.json");
 		let mut cfg = Config::default();
-		cfg.relay = "127.0.0.1:21116".into();
+		// A NON-default port, so the value survives load unchanged — `:21116` is stripped on
+		// load by design (see `loading_drops_a_redundant_default_port_but_keeps_a_real_one`).
+		cfg.relay = "127.0.0.1:9000".into();
 		cfg.network_mode = NetworkMode::RelayOnly;
 		cfg.device_name = "Ev PC’si".into();
 		cfg.save(&path).unwrap();

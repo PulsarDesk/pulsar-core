@@ -84,6 +84,7 @@ impl Node {
 				id,
 				token,
 				e2e_required,
+				auth_key,
 			} => {
 				let mut g = self.inner.lock().await;
 				// A re-register (NotRegistered → register_msg) after a relay restart
@@ -94,6 +95,12 @@ impl Node {
 				g.self_id = Some(id);
 				g.token = Some(token);
 				g.e2e_required = e2e_required;
+				// The relay issues a key only on the registration that just passed the
+				// interactive factors; a key-authenticated one carries None and must NOT
+				// clear the key we already hold.
+				if auth_key.is_some() {
+					g.issued_key = auth_key;
+				}
 				// A successful registration clears any pending auth challenge.
 				g.auth_required = None;
 				// Clear any stale register error: we're registered now.

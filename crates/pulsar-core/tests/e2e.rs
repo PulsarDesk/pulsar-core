@@ -62,6 +62,7 @@ async fn relay_password_auth_gates_registration() {
 		"n".into(),
 		Identity::generate(),
 		RelayCreds {
+			key: None,
 			password: Some("nope".into()),
 			totp: None,
 		},
@@ -81,6 +82,7 @@ async fn relay_password_auth_gates_registration() {
 		"n".into(),
 		Identity::generate(),
 		RelayCreds {
+			key: None,
 			password: Some("s3cret".into()),
 			totp: None,
 		},
@@ -366,6 +368,7 @@ async fn post_registration_protocol_error_fires_version_error() {
 			id: DeviceId::new(100_000_001).unwrap(),
 			token: Token([0x42; 16]),
 			e2e_required: false,
+			auth_key: None,
 		});
 		fake.send_to(&registered, from).await.unwrap();
 
@@ -441,6 +444,7 @@ async fn post_registration_benign_protocol_error_does_not_fire_version_error() {
 			id: DeviceId::new(100_000_002).unwrap(),
 			token: Token([0x43; 16]),
 			e2e_required: false,
+			auth_key: None,
 		});
 		fake.send_to(&registered, from).await.unwrap();
 

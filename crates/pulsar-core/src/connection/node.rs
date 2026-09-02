@@ -57,7 +57,13 @@ pub struct Node {
 /// a plain open relay uses [`RelayCreds::none`].
 #[derive(Clone, Default)]
 pub struct RelayCreds {
+	/// A previously issued ACCESS KEY for this relay. Tried first on every registration,
+	/// so a device that authenticated once is never prompted again. The app persists
+	/// whatever `Node::issued_relay_key()` reports after a successful registration.
+	pub key: Option<String>,
 	/// The relay password, if the operator set one. Used to build the nonce-bound proof.
+	/// Only needed for the FIRST registration from this device (or after the operator
+	/// rotates the relay's credentials) — the app should NOT store it.
 	pub password: Option<String>,
 	/// A current TOTP (2FA) code, if the operator requires 2FA. One-shot: the app reads it
 	/// from the user and passes a fresh code on each registration attempt.
@@ -181,6 +187,26 @@ impl Node {
 		Ok(node)
 	}
 
+	/// A key-only [`AuthProof`] for the OPENING registration: a device that already holds
+	/// an access key presents it up front, so an authenticated relay lets it in without
+	/// ever issuing a challenge (no prompt). `None` when we hold no key.
+	fn key_only_proof(&self) -> Option<pulsar_proto::AuthProof> {
+		let key = self.relay_creds.lock().unwrap().key.clone()?;
+		Some(pulsar_proto::AuthProof {
+			nonce: [0u8; 16],
+			password: None,
+			totp: None,
+			key: Some(key),
+		})
+	}
+
+	/// The access key the relay issued on the last successful registration, if it handed
+	/// one out. The app persists this and passes it back in [`RelayCreds::key`] next time,
+	/// which is what makes the password/2FA prompt a once-per-device event.
+	pub async fn issued_relay_key(&self) -> Option<String> {
+		self.inner.lock().await.issued_key.clone()
+	}
+
 	/// Replace the relay credentials (e.g. after the app prompted for a password / 2FA code
 	/// following a [`ConnError::RelayAuthRequired`]). The next `register()` uses them.
 	pub fn set_relay_creds(&self, creds: RelayCreds) {
@@ -281,6 +307,7 @@ impl Node {
 				.as_deref()
 				.map(|pw| pulsar_proto::password_proof(&nonce, pw)),
 			totp: creds.totp.clone(),
+			key: creds.key.clone(),
 		}
 	}
 
@@ -293,7 +320,10 @@ impl Node {
 		// credentials and send a second Register. The loop caps the rounds so a
 		// misbehaving/looping relay can't spin us forever (one initial + a few re-tries
 		// covers: challenge → proof, and a stale-nonce re-challenge).
-		let mut proof: Option<pulsar_proto::AuthProof> = None;
+		// Open with the stored access key when we have one: an authenticated relay accepts
+		// it outright, so a returning device never sees a prompt. Without a key the first
+		// Register carries no auth and the relay challenges as usual.
+		let mut proof: Option<pulsar_proto::AuthProof> = self.key_only_proof();
 		let mut attempts = 0;
 		let id = loop {
 			attempts += 1;
