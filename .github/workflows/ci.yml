@@ -35,6 +35,9 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
+          # GitHub's ubuntu-22.04 image ships libunwind-14-dev, which conflicts with the
+          # libunwind-dev that libgstreamer1.0-dev depends on ("held broken packages").
+          sudo apt-get remove -y libunwind-14-dev || true
           sudo apt-get install -y libudev-dev build-essential libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
