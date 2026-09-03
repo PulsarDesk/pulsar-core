@@ -313,6 +313,11 @@ pub struct StreamReq {
 	/// is clean. `#[serde(default)]` (false): old clients never get parity, old hosts ignore it.
 	#[serde(default)]
 	pub fec: bool,
+	/// The client also decodes **Reed-Solomon** parity (`media::TAG_FEC_RS`: per video frame,
+	/// `m` parity packets rebuild up to `m` losses — the Sunshine/Moonlight/Parsec model). A
+	/// host that has it prefers it over the single-loss XOR parity. `#[serde(default)]`.
+	#[serde(default)]
+	pub fec_rs: bool,
 }
 
 /// Client → host feedback the adaptive controller sends every window as

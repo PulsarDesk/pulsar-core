@@ -31,7 +31,7 @@ jobs:
       - name: Install Linux deps (gilrs → libudev)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev build-essential
+          sudo apt-get install -y libudev-dev build-essential libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test gate

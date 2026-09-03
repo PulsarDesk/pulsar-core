@@ -120,23 +120,25 @@ pub fn encoder_fragment_with(
 	} else {
 		""
 	};
+	// `name=venc`: the in-process Wayland capture (`capture.rs`) finds the encoder by this
+	// name to change its bitrate live and force key units on request.
 	let enc_props = match enc {
 		// MPP wants absolute bits/s; gop=-1 means "fps", but pin it to the key interval.
 		// Verified live on an Orange Pi 5 (gst 1.20): bps / gop / header-mode all apply.
 		GstEncoder::Mpp => format!(
-			"{element} bps={bps} gop={key_int} header-mode=each-idr",
+			"{element} name=venc bps={bps} gop={key_int} header-mode=each-idr",
 			bps = (bitrate_kbps.max(1) as u64 * 1000).min(u32::MAX as u64) as u32
 		),
 		// vaapih26Xenc: bitrate in kbit/s; CBR; keyframe-period analog of key-int.
 		GstEncoder::Vaapi => format!(
-			"{element} rate-control=cbr bitrate={bitrate_kbps} keyframe-period={key_int}"
+			"{element} name=venc rate-control=cbr bitrate={bitrate_kbps} keyframe-period={key_int}"
 		),
 		// nvh26Xenc: bitrate in kbit/s; zerolatency preset + CBR; gop-size.
 		GstEncoder::Nv => format!(
-			"{element} preset=low-latency-hq rc-mode=cbr bitrate={bitrate_kbps} gop-size={key_int} zerolatency=true"
+			"{element} name=venc preset=low-latency-hq rc-mode=cbr bitrate={bitrate_kbps} gop-size={key_int} zerolatency=true"
 		),
 		GstEncoder::X264 => format!(
-			"{element} tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} bframes=0{x264_refresh}"
+			"{element} name=venc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} bframes=0{x264_refresh}"
 		),
 	};
 	let (parse, pay) = match codec {

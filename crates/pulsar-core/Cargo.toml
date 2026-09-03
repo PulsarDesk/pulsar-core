@@ -26,6 +26,10 @@ x25519-dalek = { workspace = true, features = ["static_secrets"] }
 chacha20poly1305.workspace = true
 sha2.workspace = true
 # gilrs removed: controller reading + rumble are via SDL3 (sdl3-sys) in the app crate.
+# Reed-Solomon erasure coding for the media FEC parity (adaptive streaming Phase 2.1):
+# per video frame, `m` parity packets let the client rebuild up to `m` lost packets with
+# zero round-trips (the Sunshine/Moonlight/Parsec approach). Pure Rust, every target.
+reed-solomon-erasure = { version = "6", default-features = false, features = ["std"] }
 
 # Host-side virtual gamepad injection on Linux (uinput) + Wayland screen capture
 # via the XDG ScreenCast desktop portal (x11grab can't see a Wayland desktop).
@@ -33,6 +37,12 @@ sha2.workspace = true
 evdev = "0.12"
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 libc = "0.2"
+# In-process GStreamer for the Wayland (portal → PipeWire) host capture: the pipeline
+# runs inside the app so the encoder's bitrate changes live and keyframes can be forced
+# on request — no `gst-launch` child, no restart (which re-opened the portal and used to
+# leave a black screen). Needs libgstreamer1.0-dev + gstreamer-plugins-base at build time.
+gstreamer = "0.25"
+gstreamer-video = "0.25"
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:

@@ -161,6 +161,48 @@ Acceptance for the phase: 1080p HEVC **and** H.264, `netem loss 3% delay 120ms`,
 
 ### Implementation status
 
+**2026-09-03, second pass (after the maintainer's decisions on the open questions).** All
+of it is in the three repos; the rate/recovery/FEC logic is unit- and simulation-tested,
+the host-side engines compile and the libav engine has a headless end-to-end test — the
+real-session matrix is the maintainer's.
+
+**Maintainer's decisions (supersede the ones below in the first-pass table):**
+
+1. **ffmpeg-path hosts → the ffmpeg libraries in-process** (`pulsar-desktop/src-tauri/src/host/libav.rs`,
+   Linux): x11grab → libavfilter scale/format → libavcodec (libx264/x265/SVT-AV1, NVENC) →
+   libavformat RTP, on a thread inside the app. Bitrate changes live (`bit_rate` reconfig in
+   libx264/NVENC), a keyframe request sends the next frame as a forced IDR, the recovery
+   modes force a keyframe every 0.5 s. Falls back to the CLI when the engine cannot start
+   (device/encoder/output), or for VA-API/Vulkan/HDR/4:4:4. `PULSAR_LIBAV_HOST=0` disables it.
+   Windows/macOS keep the CLI until the ffmpeg *libraries* are bundled for them (fetch script
+   + release workflow work) — the engine itself is portable.
+2. **FEC = Reed-Solomon per video frame** (`media::TAG_FEC_RS`, `RsFecEncoder`/`RsFecDecoder`,
+   `reed-solomon-erasure`): `m = ceil(k × ratio)` parity packets per frame rebuild ANY `≤ m`
+   lost packets of that frame — the Sunshine/Moonlight/Parsec model. The ratio follows the
+   client's reported loss (`fec_policy::parity_ratio`: ≈2.5× loss + 5 %, 10–30 %, off after
+   a clean stretch). Old XOR-only clients (v0.11.0) still get XOR groups; both apps' hosts
+   and clients speak RS (`StreamReq::fec_rs`).
+3. **Resolution and fps never change automatically.** They are fixed at session start
+   (settings / what the display takes); the controller adapts the **bitrate** within them
+   (plus FEC / recovery). `adapt::Config::ladder` is `false` in both apps; the ladder code
+   stays available for a future opt-in.
+
+| Area | What landed (second pass) | Where |
+| --- | --- | --- |
+| Wayland host | The portal → PipeWire → GStreamer pipeline runs **in-process** (`gstreamer-rs`): `set_bitrate` (x264enc/vaapi/nv `bitrate`, mpp `bps`), `request_keyframe` (force-key-unit event), `set_short_gop` (key unit every 500 ms). Bitrate and recovery re-requests are applied live; keyframe requests too. No more `gst-launch`, no portal restart. Build needs `libgstreamer1.0-dev` + `plugins-base` (CI updated) | core `capture.rs`, `pipeline/gst.rs` (`name=venc`), desktop `host/handlers.rs`, `host.rs` |
+| NVENC native (Windows) | `CaptureConfig::intra_refresh` → periodic intra refresh (`enableIntraRefresh` + infinite GOP, one wave per second) when the client asked for it; the on-demand IDR stays. **Not compiled or run here** (Windows-only crate). LTR still deferred | `pulsar-capture` `lib.rs`, `encode.rs`, `encode/{nvenc,new}.rs`; `handlers.rs` |
+| Mobile host | Reed-Solomon / XOR parity behind the video (ratio from client stats), `fec` / `fec_rs` features; `loss_recovery` plumbed to MediaCodec at encoder creation (`KEY_I_FRAME_INTERVAL` 0.5 s / `KEY_INTRA_REFRESH_PERIOD`) — a running encoder keeps its GOP (IDR-on-request covers it). Kotlin not built here | mobile `host.rs`, plugin `mobile.rs`/`desktop.rs`, `PulsarVideoPlugin.kt`, `HostEncoder.kt` |
+| Mobile client | RS parity decode, `fec_rs`, per-peer last-good memory (`adapt-memory.json`, 60 % start) | mobile `client.rs`, `adapt_memory.rs` |
+| Desktop | RS decode + XOR fallback, `fec_rs`; host sizes RS/XOR parity from stats; libav engine + live fast path + teardown + keyframe; `intra_refresh` to the native path | `play/hold.rs`, `play.rs`, `host.rs`, `host/handlers.rs`, `host/libav.rs` |
+
+Still manual / not verifiable here: Windows (NVENC intra refresh, the reorder buffer),
+macOS, the Android APK (Rust compiled + tested, Kotlin edited blind), and every real
+session. The libav engine is exercised headless (`cargo test -p pulsar-tauri --lib libav`:
+testsrc → libx264 → RTP, live bitrate, forced IDR, short-GOP cadence).
+
+#### First pass (2026-09-03, earlier the same day)
+
+
 All four phases were implemented on 2026-09-03 in the local checkouts (`pulsar-core`,
 `pulsar-desktop`, `pulsar-mobile`), unit- and simulation-tested, **not pushed** (rule: no
 behaviour change before the maintainer tested it). Push order once approved: core → `cargo

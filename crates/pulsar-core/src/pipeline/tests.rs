@@ -519,7 +519,7 @@ fn decode_command_is_low_latency_ffplay() {
 fn gst_fragment_mpp_h265_matches_verified_pi_pipeline() {
 	// Property names verified live on an Orange Pi 5 (gst 1.20 rockchipmpp plugin).
 	let f = gst::encoder_fragment(gst::GstEncoder::Mpp, VCodec::H265, 8000, 60).unwrap();
-	assert!(f.contains("mpph265enc bps=8000000 gop=60 header-mode=each-idr"));
+	assert!(f.contains("mpph265enc name=venc bps=8000000 gop=60 header-mode=each-idr"));
 	assert!(f.contains("h265parse"));
 	assert!(f.contains("rtph265pay config-interval=1 pt=96 mtu=1200"));
 }
@@ -537,7 +537,7 @@ fn gst_pipelines_embed_fragment_and_low_latency_queue() {
 	let w = gst::wayland_pipeline(7, 42, &f, "10.0.0.2", 9000);
 	assert!(w.contains("pipewiresrc fd=7 path=42"));
 	assert!(w.contains("queue leaky=downstream"));
-	assert!(w.contains("x264enc tune=zerolatency"));
+	assert!(w.contains("x264enc name=venc tune=zerolatency"));
 	assert!(w.contains("udpsink host=10.0.0.2 port=9000 sync=false"));
 	let x = gst::x11_pipeline(":0", 60, &f, "10.0.0.2", 9000, false, None);
 	assert!(x.contains("ximagesrc display-name=:0 use-damage=0"));

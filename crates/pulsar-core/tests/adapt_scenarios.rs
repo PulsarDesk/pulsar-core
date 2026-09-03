@@ -39,14 +39,15 @@ struct Path {
 	p: Profile,
 	queue_bits: f64,
 	queue_max_bits: f64,
-	fec_n: u8,
+	/// Reed-Solomon parity ratio the host currently sends (0 = off).
+	fec_ratio: f32,
 	clean_windows: u32,
 }
 
 impl Path {
 	fn new(p: Profile) -> Self {
 		let queue_max_bits = p.capacity_kbps as f64 * 1000.0 * 0.25; // 250 ms of buffering
-		Self { p, queue_bits: 0.0, queue_max_bits, fec_n: 0, clean_windows: 0 }
+		Self { p, queue_bits: 0.0, queue_max_bits, fec_ratio: 0.0, clean_windows: 0 }
 	}
 
 	/// Run one 2 s window at `send_kbps` (encoder + parity). Returns the sample the
@@ -81,11 +82,11 @@ impl Path {
 		let pkts = (total_bits / 8.0 / 1100.0).max(1.0);
 		let overflow = if total_bits > 0.0 { lost_bits / total_bits } else { 0.0 };
 		let raw_loss = (overflow + self.p.loss as f64).min(0.95);
-		// FEC repairs a share of RANDOM loss when parity is on (one loss per group).
-		let repaired = if self.fec_n > 0 && self.p.loss > 0.0 {
-			let group_loss = self.p.loss as f64 * self.fec_n as f64;
-			let single = if group_loss < 1.0 { 1.0 - group_loss / 2.0 } else { 0.3 };
-			self.p.loss as f64 * single
+		// Reed-Solomon parity repairs RANDOM loss up to `m` per frame: nearly all of it when
+		// the ratio covers the loss, a shrinking share when the loss exceeds the ratio.
+		let repaired = if self.fec_ratio > 0.0 && self.p.loss > 0.0 {
+			let cover = if self.p.loss <= self.fec_ratio { 0.95 } else { 0.5 * self.fec_ratio / self.p.loss };
+			self.p.loss as f64 * cover as f64
 		} else {
 			0.0
 		};
@@ -104,8 +105,8 @@ impl Path {
 		} else {
 			self.clean_windows = 0;
 		}
-		self.fec_n = fec_policy::group_size(loss as f32, self.fec_n, self.clean_windows);
-		ctl.set_fec_n(self.fec_n);
+		self.fec_ratio = fec_policy::parity_ratio(loss as f32, self.fec_ratio, self.clean_windows);
+		ctl.set_fec_overhead(self.fec_ratio);
 		s
 	}
 }
@@ -124,6 +125,7 @@ fn run(profile: Profile, codec: VCodec, cap_kbps: u32, windows: u32) -> Run {
 	let mut cfg = Config::new(codec, cap_kbps);
 	cfg.native = (1920, 1080, 60);
 	cfg.ir_capable = true;
+	cfg.ladder = true; // the matrix exercises the ladder (off by default in the apps)
 	let mut ctl = Controller::new(cfg);
 	let mut path = Path::new(profile);
 	let mut r = Run {
@@ -137,10 +139,9 @@ fn run(profile: Profile, codec: VCodec, cap_kbps: u32, windows: u32) -> Run {
 	};
 	let settle = windows / 3;
 	for w in 0..windows {
-		let share = fec_policy::encoder_share(path.fec_n);
+		let share = fec_policy::encoder_share_ratio(path.fec_ratio);
 		let wire = (ctl.encoder_kbps() as f32 / share) as u32;
-		let overhead = if path.fec_n > 0 { 1.0 / path.fec_n as f32 } else { 0.0 };
-		r.max_fec_overhead = r.max_fec_overhead.max(overhead);
+		r.max_fec_overhead = r.max_fec_overhead.max(path.fec_ratio);
 		let s = path.window(&mut ctl, wire, w as f64 * 2000.0);
 		if s.lost > 0 && r.first_loss_at.is_none() {
 			r.first_loss_at = Some(w);
@@ -224,7 +225,7 @@ fn matrix_settles_under_capacity_on_a_clean_point_without_oscillation() {
 				}
 			}
 			// FEC never exceeds the overhead ceiling.
-			assert!(r.max_fec_overhead <= fec_policy::MAX_OVERHEAD + 1e-6, "{tag}: fec overhead {}", r.max_fec_overhead);
+			assert!(r.max_fec_overhead <= fec_policy::RS_MAX_RATIO + 1e-6, "{tag}: fec overhead {}", r.max_fec_overhead);
 		}
 	}
 }
@@ -235,6 +236,7 @@ fn forced_20mbit_reaches_1080p60_within_30s_and_forced_2mbit_a_low_rung_within_1
 	let mut cfg = Config::new(VCodec::H264, 20_000);
 	cfg.native = (1920, 1080, 60);
 	cfg.start_kbps = 3000;
+	cfg.ladder = true;
 	let mut ctl = Controller::new(cfg);
 	let mut path = Path::new(PROFILES[0]);
 	let mut reached = None;
@@ -252,6 +254,7 @@ fn forced_20mbit_reaches_1080p60_within_30s_and_forced_2mbit_a_low_rung_within_1
 	// 2 Mbit from the default top: a rung that is clean at ≤ 2 Mbit within 10 s.
 	let mut cfg = Config::new(VCodec::H264, 20_000);
 	cfg.native = (1920, 1080, 60);
+	cfg.ladder = true;
 	let mut ctl = Controller::new(cfg);
 	let mut path = Path::new(PROFILES[2]);
 	for w in 0..5 {
@@ -295,7 +298,7 @@ fn random_loss_softens_via_recovery_and_fec_without_collapsing_the_rate() {
 	let r = run(PROFILES[6], VCodec::H264, 20_000, 200); // 2 Mbit, 3 % loss, 120 ms
 	assert_eq!(r.recovery_at.map(|w| w <= 2), Some(true), "recovery flip: {:?}", r.recovery_at);
 	assert!(r.target_last >= 1000, "rate collapsed to {}", r.target_last);
-	assert!(r.max_fec_overhead > 0.0 && r.max_fec_overhead <= fec_policy::MAX_OVERHEAD, "fec {}", r.max_fec_overhead);
+	assert!(r.max_fec_overhead > 0.0 && r.max_fec_overhead <= fec_policy::RS_MAX_RATIO, "fec {}", r.max_fec_overhead);
 	let _ = adapt::FLOOR_KBPS;
 }
 
@@ -308,17 +311,18 @@ fn trace_2mbit_3pct() {
 	let mut cfg = Config::new(VCodec::H264, 20_000);
 	cfg.native = (1920, 1080, 60);
 	cfg.ir_capable = true;
+	cfg.ladder = true;
 	let mut ctl = Controller::new(cfg);
 	let mut path = Path::new(profile);
 	for w in 0..60 {
-		let share = fec_policy::encoder_share(path.fec_n);
+		let share = fec_policy::encoder_share_ratio(path.fec_ratio);
 		let wire = (ctl.encoder_kbps() as f32 / share) as u32;
 		let s = path.window(&mut ctl, wire, w as f64 * 2000.0);
 		let d = ctl.tick(&s);
 		let sig = ctl.last();
 		println!(
-			"w{w:3} wire={wire:5} loss={:5.1}% eff={:5.1}% rtt={:5.0} exc={:5.0} delay={:?} fec={} -> target={} enc={} point={} ceil={} {}",
-			sig.loss * 100.0, sig.eff_loss * 100.0, sig.rtt_ms, sig.excess_ms, sig.delay, path.fec_n,
+			"w{w:3} wire={wire:5} loss={:5.1}% eff={:5.1}% rtt={:5.0} exc={:5.0} delay={:?} fec={:.2} -> target={} enc={} point={} ceil={} {}",
+			sig.loss * 100.0, sig.eff_loss * 100.0, sig.rtt_ms, sig.excess_ms, sig.delay, path.fec_ratio,
 			ctl.target_kbps(), ctl.encoder_kbps(), ctl.point().label(), ctl.ceiling(), d.reason
 		);
 	}

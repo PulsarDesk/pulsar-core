@@ -45,6 +45,39 @@ pub fn encoder_share(n: u8) -> f32 {
 	}
 }
 
+/// Encoder share for a parity *overhead ratio* (parity bytes / media bytes): `1/(1+r)`.
+pub fn encoder_share_ratio(overhead: f32) -> f32 {
+	1.0 / (1.0 + overhead.max(0.0))
+}
+
+// ── Reed-Solomon parity (the gold-standard model: Sunshine/Moonlight, Parsec) ──────────
+//
+// Per video frame the host appends `m = ceil(k × ratio)` parity packets to the frame's `k`
+// packets; the client rebuilds ANY `≤ m` lost packets of that frame with zero round-trips.
+// Sunshine ships a fixed 20 % by default; here the ratio follows the measured loss so a
+// clean path pays nothing and a bad one gets up to 30 %.
+
+/// Lowest ratio once FEC is on (below this a single parity per frame is all it buys).
+pub const RS_MIN_RATIO: f32 = 0.10;
+/// Ceiling — the overhead the maintainer accepts on a very lossy path.
+pub const RS_MAX_RATIO: f32 = 0.30;
+/// Ratio changes smaller than this are ignored (no chatter).
+pub const RS_HYSTERESIS: f32 = 0.05;
+
+/// Parity ratio for the next frames: `0.0` = FEC off. Sized at ~2.5× the measured loss
+/// (+5 % base) so a frame survives a burst, clamped to `[RS_MIN_RATIO, RS_MAX_RATIO]`; same
+/// on/off hysteresis as [`group_size`].
+pub fn parity_ratio(loss: f32, prev: f32, clean_windows: u32) -> f32 {
+	if loss < OFF_BELOW {
+		return if prev <= 0.0 || clean_windows >= OFF_AFTER_CLEAN { 0.0 } else { prev };
+	}
+	let want = (loss * 2.5 + 0.05).clamp(RS_MIN_RATIO, RS_MAX_RATIO);
+	if prev > 0.0 && (want - prev).abs() < RS_HYSTERESIS {
+		return prev;
+	}
+	want
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -64,6 +97,20 @@ mod tests {
 		assert_eq!(group_size(0.08, 17, 0), 6, "big change moves");
 		assert_eq!(group_size(0.0, 17, 2), 17, "still on while the clean stretch is short");
 		assert_eq!(group_size(0.0, 17, OFF_AFTER_CLEAN), 0, "off after the clean stretch");
+	}
+
+	#[test]
+	fn rs_parity_ratio_follows_loss_within_bounds_with_hysteresis() {
+		assert_eq!(parity_ratio(0.004, 0.0, 0), 0.0, "clean: off");
+		assert!((parity_ratio(0.03, 0.0, 0) - 0.125).abs() < 1e-6, "3 % → 12.5 %");
+		assert_eq!(parity_ratio(0.10, 0.0, 0), RS_MAX_RATIO, "10 % → ceiling");
+		assert_eq!(parity_ratio(0.01, 0.0, 0), RS_MIN_RATIO, "1 % → floor");
+		assert!((parity_ratio(0.04, 0.125, 0) - 0.125).abs() < 1e-6, "small change keeps");
+		assert!(parity_ratio(0.08, 0.125, 0) > 0.2, "big change moves");
+		assert!((parity_ratio(0.0, 0.125, 2) - 0.125).abs() < 1e-6, "short clean stretch keeps");
+		assert_eq!(parity_ratio(0.0, 0.125, OFF_AFTER_CLEAN), 0.0, "off after the clean stretch");
+		assert!((encoder_share_ratio(0.25) - 0.8).abs() < 1e-6);
+		assert_eq!(encoder_share_ratio(0.0), 1.0);
 	}
 
 	#[test]

@@ -139,7 +139,9 @@ pub struct Config {
 	pub start_kbps: u32,
 	/// Whether this client can resume on a partially intra-refreshed picture.
 	pub ir_capable: bool,
-	/// Run the resolution/fps ladder (false = bitrate only, e.g. a user-pinned size).
+	/// Run the resolution/fps ladder. **Off by default** (maintainer decision, 2026-09-03):
+	/// the resolution and fps are fixed at session start (settings / what the display can
+	/// take) and only the bitrate adapts within them. `true` = the automatic ladder.
 	pub ladder: bool,
 	/// Windows of aggressive startup probing.
 	pub startup_windows: u32,
@@ -153,7 +155,7 @@ impl Config {
 			cap_kbps,
 			start_kbps: 0,
 			ir_capable: false,
-			ladder: true,
+			ladder: false,
 			startup_windows: 5,
 		}
 	}
@@ -174,9 +176,9 @@ struct ProbeDown {
 	pre_loss: f32,
 	windows: u32,
 	loss_acc: f32,
-	/// FEC group size when the probe started: parity switching on/up mid-probe lowers the
+	/// FEC overhead when the probe started: parity switching on/up mid-probe lowers the
 	/// measured loss by itself, so the judgement is only valid when it stayed the same.
-	fec_n: u8,
+	fec_overhead: f32,
 }
 
 /// The controller state, carried across windows.
@@ -213,7 +215,8 @@ pub struct Controller {
 	manual_point: bool,
 	/// The encoder bitrate last decided (net of FEC).
 	encoder_kbps: u32,
-	fec_n: u8,
+	/// FEC parity overhead currently observed on the wire (parity bytes / media bytes).
+	fec_overhead: f32,
 	// Delay estimator + fast reflex.
 	delay: Trendline,
 	last_fast_cut_ms: f64,
@@ -255,7 +258,7 @@ impl Controller {
 			clean_at_point: 0,
 			manual_point: !cfg.ladder,
 			encoder_kbps: 0,
-			fec_n: 0,
+			fec_overhead: 0.0,
 			delay: Trendline::new(),
 			last_fast_cut_ms: -1.0e9,
 			clean_at_target: 0,
@@ -299,8 +302,9 @@ impl Controller {
 	pub fn last(&self) -> Signals {
 		self.last
 	}
-	pub fn fec_n(&self) -> u8 {
-		self.fec_n
+	/// The FEC overhead the encoder rate is currently net of (0 = no parity).
+	pub fn fec_overhead(&self) -> f32 {
+		self.fec_overhead
 	}
 	/// The most recent rate that stayed clean for `LAST_GOOD_WINDOWS` (0 = none yet). The
 	/// app persists it per peer and seeds the next session with 60 % of it.
@@ -324,10 +328,16 @@ impl Controller {
 		self.delay.on_frame(send_ts_90k, arrival_ms);
 	}
 
-	/// The host's current FEC group size as observed from parity packets (0 = none): the
-	/// encoder gets `n/(n+1)` of the target so the wire rate stays at the target.
+	/// The parity overhead observed on the wire (Reed-Solomon `m/k`, or `1/n` for the XOR
+	/// groups): the encoder gets `1/(1+overhead)` of the target so the wire rate stays at
+	/// the target.
+	pub fn set_fec_overhead(&mut self, overhead: f32) {
+		self.fec_overhead = overhead.max(0.0);
+	}
+
+	/// XOR-group form of [`set_fec_overhead`](Self::set_fec_overhead) (`n` = 0 → off).
 	pub fn set_fec_n(&mut self, n: u8) {
-		self.fec_n = n;
+		self.set_fec_overhead(if n == 0 { 0.0 } else { 1.0 / n as f32 });
 	}
 
 	/// The user pinned (or unpinned) the bitrate: resync the target without punishment.
@@ -421,7 +431,7 @@ impl Controller {
 				return self.finish(out);
 			}
 			let after = pd.loss_acc / pd.windows as f32;
-			if pd.fec_n != self.fec_n {
+			if (pd.fec_overhead - self.fec_overhead).abs() > 1e-6 {
 				// FEC changed under the probe: inconclusive — restore, judge again later.
 				self.apply_rate(pd.from, &mut out);
 				out.reason = "probe down inconclusive (fec changed) — restored";
@@ -486,7 +496,7 @@ impl Controller {
 					out.reason = "sustained loss with a queued link → ×0.7";
 				} else {
 					self.over = 0;
-					self.probe_down = Some(ProbeDown { from: before, pre_loss: loss, windows: 0, loss_acc: 0.0, fec_n: self.fec_n });
+					self.probe_down = Some(ProbeDown { from: before, pre_loss: loss, windows: 0, loss_acc: 0.0, fec_overhead: self.fec_overhead });
 					self.apply_rate(before * 4 / 5, &mut out);
 					out.reason = "sustained loss, flat link → probe down";
 				}
@@ -569,7 +579,8 @@ impl Controller {
 	}
 
 	fn encoder_rate(&self) -> u32 {
-		((self.target as f32 * fec_policy::encoder_share(self.fec_n)) as u32).max(FLOOR_KBPS.min(self.target))
+		((self.target as f32 * fec_policy::encoder_share_ratio(self.fec_overhead)) as u32)
+			.max(FLOOR_KBPS.min(self.target))
 	}
 
 	fn update_rtt(&mut self, samples: &[f32]) -> (f32, f32, f32) {
@@ -687,9 +698,11 @@ impl Controller {
 mod tests {
 	use super::*;
 
+	/// Test config with the ladder ON (these tests exercise it; the app default is off).
 	fn cfg(cap: u32, ir: bool) -> Config {
 		let mut c = Config::new(VCodec::H264, cap);
 		c.ir_capable = ir;
+		c.ladder = true;
 		c
 	}
 
@@ -760,6 +773,7 @@ mod tests {
 	fn forced_20mbit_reaches_the_top_rung_within_30s_from_a_low_start() {
 		let mut c = Config::new(VCodec::H264, 20_000);
 		c.start_kbps = 3000;
+		c.ladder = true;
 		let mut c = Controller::new(c);
 		assert_eq!(c.point().label(), "720p30");
 		let mut top_at = None;
@@ -835,6 +849,18 @@ mod tests {
 		let d = c.tick(&win(1000, 0, 20.0));
 		assert_eq!(d.bitrate, Some(7529), "8000 × 16/17: {d:?}");
 		assert_eq!(c.target_kbps(), 8000, "the wire target is unchanged");
+		c.set_fec_overhead(0.25);
+		let d = c.tick(&win(1000, 0, 20.0));
+		assert_eq!(d.bitrate, Some(6400), "8000 / 1.25: {d:?}");
+	}
+
+	#[test]
+	fn ladder_is_off_by_default_and_the_point_is_the_native_size() {
+		let c = Controller::new(Config::new(VCodec::H264, 8000));
+		assert_eq!(c.point().label(), "1080p60");
+		let mut c = c;
+		let d = c.tick(&win(800, 200, 20.0));
+		assert!(d.bitrate.is_some() && d.point.is_none(), "{d:?}");
 	}
 
 	#[test]

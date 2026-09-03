@@ -39,7 +39,9 @@ product; `README.md` here for the consumer snippet.
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`
   detect/resolve. No process spawning here (that's the Tauri layer).
 - `capture.rs` — **Linux-only** (`cfg`): Wayland XDG ScreenCast portal →
-  PipeWire → GStreamer; `is_wayland()`. This one DOES spawn processes.
+  PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
+  `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev
+  headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks.
