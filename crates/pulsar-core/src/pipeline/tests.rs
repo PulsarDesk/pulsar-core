@@ -17,6 +17,7 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		output_idx: 0,
 		hdr: false,
 		yuv444: false,
+		loss_recovery: crate::service::LossRecovery::Normal,
 	}
 }
 
@@ -594,4 +595,28 @@ fn rkmpp_encoder_is_detected_and_resolves_before_software() {
 		HwEncoder::Rkmpp.available_codecs(out),
 		vec![VCodec::H264, VCodec::H265]
 	);
+}
+
+/// Phase 0 (loss recovery) on the gst fragments: `ShortGop` halves the key interval,
+/// `IntraRefresh` enables x264enc's rolling refresh (other elements → short GOP), and the
+/// plain `encoder_fragment` is byte-identical to the `Normal` mode (no regression).
+#[test]
+fn gst_fragment_loss_recovery_modes() {
+	use crate::service::LossRecovery;
+	use gst::{encoder_fragment, encoder_fragment_with, GstEncoder};
+	let normal = encoder_fragment(GstEncoder::X264, VCodec::H264, 4000, 60).unwrap();
+	assert_eq!(
+		normal,
+		encoder_fragment_with(GstEncoder::X264, VCodec::H264, 4000, 60, LossRecovery::Normal).unwrap()
+	);
+	assert!(normal.contains("key-int-max=60") && !normal.contains("intra-refresh"), "{normal}");
+	let short = encoder_fragment_with(GstEncoder::X264, VCodec::H264, 4000, 60, LossRecovery::ShortGop).unwrap();
+	assert!(short.contains("key-int-max=30") && !short.contains("intra-refresh"), "{short}");
+	let ir = encoder_fragment_with(GstEncoder::X264, VCodec::H264, 4000, 60, LossRecovery::IntraRefresh).unwrap();
+	assert!(ir.contains("key-int-max=30") && ir.contains("intra-refresh=true"), "{ir}");
+	// Elements without a refresh knob: IntraRefresh degrades to the short key interval.
+	let nv = encoder_fragment_with(GstEncoder::Nv, VCodec::H265, 4000, 60, LossRecovery::IntraRefresh).unwrap();
+	assert!(nv.contains("gop-size=30") && !nv.contains("intra-refresh"), "{nv}");
+	let mpp = encoder_fragment_with(GstEncoder::Mpp, VCodec::H264, 4000, 30, LossRecovery::IntraRefresh).unwrap();
+	assert!(mpp.contains("gop=15") && !mpp.contains("intra-refresh"), "{mpp}");
 }

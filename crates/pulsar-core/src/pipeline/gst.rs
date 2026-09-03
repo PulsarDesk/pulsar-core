@@ -12,6 +12,7 @@
 //! --exists` + a one-frame `gst-launch` validation — see `process::validated_gst_encoders`).
 
 use super::types::VCodec;
+use crate::service::LossRecovery;
 
 /// A GStreamer encoder element family. Priority-ordered hardware first; X264 is the
 /// software terminal fallback (H.264 only — realtime software HEVC stays off, same
@@ -96,8 +97,29 @@ pub fn encoder_fragment(
 	bitrate_kbps: u32,
 	fps: u32,
 ) -> Option<String> {
+	encoder_fragment_with(enc, codec, bitrate_kbps, fps, LossRecovery::Normal)
+}
+
+/// [`encoder_fragment`] with the client's loss-recovery mode (Phase 0): `ShortGop` halves the
+/// key interval to ~0.5 s on every element; `IntraRefresh` turns on x264enc's rolling
+/// `intra-refresh` with that period (the other gst encoders have no refresh knob → short GOP).
+pub fn encoder_fragment_with(
+	enc: GstEncoder,
+	codec: VCodec,
+	bitrate_kbps: u32,
+	fps: u32,
+	recovery: LossRecovery,
+) -> Option<String> {
 	let element = enc.element(codec)?;
-	let key_int = fps.max(1);
+	let key_int = match recovery {
+		LossRecovery::Normal => fps.max(1),
+		LossRecovery::ShortGop | LossRecovery::IntraRefresh => (fps / 2).max(1),
+	};
+	let x264_refresh = if recovery == LossRecovery::IntraRefresh {
+		" intra-refresh=true"
+	} else {
+		""
+	};
 	let enc_props = match enc {
 		// MPP wants absolute bits/s; gop=-1 means "fps", but pin it to the key interval.
 		// Verified live on an Orange Pi 5 (gst 1.20): bps / gop / header-mode all apply.
@@ -114,7 +136,7 @@ pub fn encoder_fragment(
 			"{element} preset=low-latency-hq rc-mode=cbr bitrate={bitrate_kbps} gop-size={key_int} zerolatency=true"
 		),
 		GstEncoder::X264 => format!(
-			"{element} tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} bframes=0"
+			"{element} tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} bframes=0{x264_refresh}"
 		),
 	};
 	let (parse, pay) = match codec {

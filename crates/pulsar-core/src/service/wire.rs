@@ -89,6 +89,36 @@ pub enum QualityPref {
 	Quality,
 }
 
+/// How the host should encode for the **loss the client is measuring** on this path
+/// (adaptive-streaming Phase 0, `docs/adaptive-streaming.md`). The client's controller
+/// flips this once it sees sustained loss; the host maps it onto what its encoder can do.
+///
+/// Appended to [`StreamReq`] with a serde default of `Normal`, so an older client (omits
+/// it) keeps today's long GOP and an older host ignores it — fully additive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LossRecovery {
+	/// Long GOP (remote ≈ 2 s), IDR only on request — the pre-Phase-0 behaviour.
+	#[default]
+	Normal,
+	/// Keyframe every ≤ 0.5 s so a lost reference heals at the next IDR. Universal:
+	/// every encoder and every client decoder handles it.
+	ShortGop,
+	/// Periodic intra refresh (x264 / NVENC / QSV / AMF) — a rolling intra wave instead
+	/// of IDRs: loss heals within the refresh period with no bitrate spike. Only a client
+	/// that can *resume on a partially-refreshed picture* asks for this (the Linux libav
+	/// renderer); a host whose encoder lacks it silently falls back to `ShortGop`.
+	IntraRefresh,
+}
+
+impl LossRecovery {
+	/// `true` for any mode that shortens recovery below the normal GOP — the host's
+	/// keyframe-request path then no longer needs to restart capture (Phase 0.4).
+	pub fn is_active(self) -> bool {
+		!matches!(self, Self::Normal)
+	}
+}
+
 /// What a host can actually stream — the `QueryStreamCaps` reply. Both lists are
 /// validated (one-frame probe) and preference-ordered; vocabularies match the UI/wire
 /// strings (`h265`/`h264`/`av1`; `nvenc`/`qsv`/`vaapi`/`videotoolbox`/`amf`/
@@ -270,6 +300,81 @@ pub struct StreamReq {
 	/// older client that omits it negotiates stereo, the universally-decodable default.
 	#[serde(default)]
 	pub audio_layout: ChannelLayout,
+	/// Loss-recovery encode mode the client's adaptive controller asks for (see
+	/// [`LossRecovery`]). `#[serde(default)]` (`Normal`) keeps the long-GOP behaviour for
+	/// old clients; old hosts ignore the field. Changing it restarts capture on the ffmpeg
+	/// / gst paths (like any other encode-parameter change) — the client flips it once per
+	/// session, on the first sustained loss, and never back.
+	#[serde(default)]
+	pub loss_recovery: LossRecovery,
+	/// The client understands XOR parity frames (`media::TAG_FEC`) on the media-over-session
+	/// path and asks the host to send them (adaptive streaming Phase 2.1). The host sizes the
+	/// parity from the loss the client reports (`ClientStats`) and sends none while the path
+	/// is clean. `#[serde(default)]` (false): old clients never get parity, old hosts ignore it.
+	#[serde(default)]
+	pub fec: bool,
+}
+
+/// Client → host feedback the adaptive controller sends every window as
+/// [`DataMsg::Stats`] JSON (Phase 0.3 / 2.4 of `docs/adaptive-streaming.md`): what the
+/// client measured on the path plus the operating point it settled on. A host may act on it
+/// (a host-side controller) or just log it next to its own encode stats.
+///
+/// Wire: the same `DataMsg::Stats(String)` variant the host already uses host→client for
+/// its free-form encode label — the client's payload is a JSON object (`{…}`), the host's
+/// label never is, so [`ClientStats::parse`] tells them apart and an old host (which
+/// ignores inbound `Stats`) is unaffected. Every field carries `#[serde(default)]` so
+/// either side can append fields later.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct ClientStats {
+	/// Payload version (1).
+	#[serde(default)]
+	pub v: u32,
+	/// Video RTP loss ratio over the window (0..1), after NACK repairs.
+	#[serde(default)]
+	pub loss: f32,
+	/// Latest keepalive round-trip (ms); 0 = no sample.
+	#[serde(default)]
+	pub rtt_ms: f32,
+	/// RTT jitter over the window (mean |Δrtt|, ms).
+	#[serde(default)]
+	pub jitter_ms: f32,
+	/// Bitrate the client is currently asking for (kbit/s).
+	#[serde(default)]
+	pub kbps: u32,
+	/// Loss-recovery mode the client currently requests.
+	#[serde(default)]
+	pub recovery: LossRecovery,
+	/// NACKs sent / NACKs answered in time over the window.
+	#[serde(default)]
+	pub nack_sent: u32,
+	#[serde(default)]
+	pub nack_ok: u32,
+	/// Packets rebuilt from FEC parity over the window.
+	#[serde(default)]
+	pub fec_ok: u32,
+	/// Operating point the client settled on (`"720p30"`), empty when the ladder is off.
+	#[serde(default)]
+	pub point: String,
+}
+
+impl ClientStats {
+	pub const VERSION: u32 = 1;
+
+	/// Parse a [`DataMsg::Stats`] payload as client feedback. `None` for anything that isn't
+	/// a JSON object (the host→client encode label, or a future unknown shape).
+	pub fn parse(payload: &str) -> Option<Self> {
+		let t = payload.trim_start();
+		if !t.starts_with('{') {
+			return None;
+		}
+		serde_json::from_str(t).ok()
+	}
+
+	/// Serialize for the wire (`DataMsg::Stats`).
+	pub fn to_json(&self) -> String {
+		serde_json::to_string(self).expect("ClientStats serializes")
+	}
 }
 
 fn default_true() -> bool {
@@ -599,6 +704,45 @@ impl<'de> Deserialize<'de> for DataMsg {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn streamreq_missing_loss_recovery_defaults_to_normal() {
+		// Phase 0 appended `loss_recovery`; an old client omits it → Normal (long GOP).
+		let json = r#"{"port":5000,"codec":"h264","encoder":"auto","width":0,"height":0}"#;
+		let req: StreamReq = serde_json::from_str(json).expect("old StreamReq must deserialize");
+		assert_eq!(req.loss_recovery, LossRecovery::Normal);
+		assert!(!req.loss_recovery.is_active());
+		// And the wire spelling is snake_case, stable across versions.
+		let s = serde_json::to_string(&LossRecovery::IntraRefresh).unwrap();
+		assert_eq!(s, "\"intra_refresh\"");
+		let s = serde_json::to_string(&LossRecovery::ShortGop).unwrap();
+		assert_eq!(s, "\"short_gop\"");
+	}
+
+	#[test]
+	fn client_stats_roundtrip_and_label_rejection() {
+		let cs = ClientStats {
+			v: ClientStats::VERSION,
+			loss: 0.031,
+			rtt_ms: 121.5,
+			jitter_ms: 8.25,
+			kbps: 2000,
+			recovery: LossRecovery::IntraRefresh,
+			nack_sent: 12,
+			nack_ok: 9,
+			fec_ok: 3,
+			point: "720p30".into(),
+		};
+		let back = ClientStats::parse(&cs.to_json()).expect("json parses");
+		assert_eq!(back, cs);
+		// The host's own encode label must never parse as client feedback.
+		assert!(ClientStats::parse("NVENC · 1080p · 60fps").is_none());
+		assert!(ClientStats::parse("!encoder failed").is_none());
+		// Unknown/extra fields and missing fields are tolerated (additive).
+		let old = ClientStats::parse(r#"{"v":1,"loss":0.5,"future_field":true}"#).unwrap();
+		assert_eq!(old.loss, 0.5);
+		assert_eq!(old.recovery, LossRecovery::Normal);
+	}
 
 	#[test]
 	fn streamreq_missing_bitrate_and_quality_defaults() {

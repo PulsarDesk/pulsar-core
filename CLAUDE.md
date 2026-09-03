@@ -16,6 +16,11 @@ product; `README.md` here for the consumer snippet.
 
 ## Modules (`crates/pulsar-core/src/`)
 
+- `adapt/` — **adaptive streaming controller** shared by both apps (pure, no I/O):
+  `Controller` (2 s windows → target rate, operating point, encoder bitrate net of FEC,
+  loss-recovery mode), `ladder` (resolution × fps rungs per codec), `delay` (trendline
+  delay-gradient estimator), `fec_policy` (parity group size from loss). Simulation matrix
+  in `tests/adapt_scenarios.rs`; design in `docs/adaptive-streaming.md`.
 - `connection/` — `Node`: register → relay-assigned stable 9-digit ID → P2P
   hole-punch → relay fallback; encrypted `Session`.
 - `crypto.rs` — X25519 identity + ChaCha20-Poly1305; per-session salt +
@@ -40,8 +45,9 @@ product; `README.md` here for the consumer snippet.
   force-mutes the captured endpoint), endpoint redirect sinks.
 - `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC.
 - `service/` — the app protocol over the encrypted session: OTP auth,
-  keepalive `Ping`/`Pong`/`Bye`, media framing + NACK, and **`DataMsg` side
-  channels** (clipboard/chat/file/mic-audio/avatar/fs-browse/…) in `wire.rs`.
+  keepalive `Ping`/`Pong`/`Bye`, media framing + NACK + **XOR FEC parity**
+  (`media.rs`), and **`DataMsg` side channels** (clipboard/chat/file/mic-audio/
+  avatar/fs-browse/client `Stats` JSON/…) in `wire.rs`.
   **`DataMsg` lives HERE, not in pulsar-proto** — proto only covers the
   relay/transport layer.
 

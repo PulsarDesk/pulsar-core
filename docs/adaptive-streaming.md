@@ -1,6 +1,7 @@
 # Adaptive streaming — design and plan
 
-**Status:** approved design, not started. Next major task (see `AGENTS.md`).
+**Status:** approved design. **Phases 0–4 implemented locally on 2026-09-03 — NOT pushed,
+awaiting the maintainer's real-session test** (see [Implementation status](#implementation-status)).
 **Owner:** maintainer. **Written:** 2026-09-03, from a live diagnosis (below).
 
 ## Goal (the maintainer's words, paraphrased)
@@ -157,6 +158,52 @@ can act on the same numbers.
 
 Acceptance for the phase: 1080p HEVC **and** H.264, `netem loss 3% delay 120ms`,
 5 minutes: no freeze > 300 ms; latency HUD stays sane; picture visibly softer, never stuck.
+
+### Implementation status
+
+All four phases were implemented on 2026-09-03 in the local checkouts (`pulsar-core`,
+`pulsar-desktop`, `pulsar-mobile`), unit- and simulation-tested, **not pushed** (rule: no
+behaviour change before the maintainer tested it). Push order once approved: core → `cargo
+update -p pulsar-core` in desktop and mobile (delete each app's local `.cargo/config.toml`
+path patch + `git checkout Cargo.lock` first) → desktop → mobile.
+
+| Phase | What landed | Where |
+| --- | --- | --- |
+| **0** stop freezes | 500 ms pings, 100 ms NACK sweep + one re-NACK, repair window `1.5×RTT+100` (100–500 ms) mirrored live to the renderer's RTP `max_delay` (stdin `maxdelay`); renderer **holds** the last good frame ≤ 300 ms after an unrepaired loss (stdin `hold`, ends early on a keyframe; reported as `vidsink-hold` → `renderer loss hold` in the log); Windows/macOS depacketizer got a **reorder buffer** (retransmits used to be dropped as stale); `StreamReq.loss_recovery` (`short_gop` / `intra_refresh`) → `encode_command` emits `-intra-refresh 1` (x264, NVENC), `-int_ref_*` (QSV), `-intra_refresh_mb` (AMF H.264), else GOP ≤ 0.5 s; gst x11 `x264enc intra-refresh=true`; ffmpeg-path keyframe request no longer restarts capture once recovery is on; client→host `ClientStats` JSON in `DataMsg::Stats` (`on_stats` handler) | core `service/{wire,host,media}.rs`, `pipeline/*`; desktop `play/hold.rs`, `host.rs`, `host/handlers.rs`, `render_stats.rs`; `pulsar-render/src/{video,linux,desktop}.rs`, `win/mod.rs`, `stream/rtp.rs`; mobile `rtp.rs` (reorder window) |
+| **1** ladder, one controller | **`pulsar_core::adapt`**: `Controller` (pure, 2 s windows) → target wire rate, operating point from a per-codec **ladder** (`adapt::ladder`, native-bounded, HEVC/AV1 ×0.7/×0.65), encoder bitrate net of FEC, recovery flip. Rate rules: delay first (Overuse ×0.85, RTT excess ≥35 ms ×0.7 / ≥90 ms halve, no climb while queued or draining), raw loss >15 % halve, sustained loss >3 % ×0.7 only with a queued link — with a flat link a single probe-down decides whether the loss follows the rate, otherwise it is learned as the path's **noise floor** (also: steady mild loss on a flat link is learned after 10 s); punished ceiling ×0.85, probes past it after 60 s clean, failed probes double the wait (≤16 min), surviving probes halve it; startup ×1.5 per clean window for 5 windows; ladder down at once when `target < point.min` (debounced 2 windows unless severe), up after 20 s clean at the point to the best rung under `target/1.2`; floor 300 kbit/s (360p30). **Desktop and mobile both call it** — `play/abr.rs` and mobile's `abr_decide`/panic reflex are gone. **Per-peer memory**: desktop remembers the last rate that stayed clean 30 s (`adapt-memory.json`) and starts the next session at 60 % of it. **Manual pins** (decision 3): an explicit session-menu resolution or fps pins the ladder (bitrate still adapts), "Otomatik" (0) hands it back; a manual bitrate pins the rate as before | core `src/adapt/{controller,ladder,delay,fec_policy}.rs`; desktop `play.rs`, `play/hold.rs`, `adapt_memory.rs`; mobile `client.rs` |
+| **2** resilience | **2.1 FEC**: XOR parity over the media-over-session video flow (`media::TAG_FEC`, `FecEncoder`/`FecDecoder`, `parity_frame`/`recover`), one parity per `n` packets; the **host sizes `n` from the client's reported loss** (`adapt::fec_policy`: ≈2× the loss, **≤ 20 % overhead** (decision 2), covers keyframes too, off after 5 clean windows), only for clients that asked (`StreamReq.fec`); the client rebuilds a group's single missing packet with zero round-trips and deducts the parity share from the encoder rate. **2.3 live bitrate**: NVENC native and the Android MediaCodec host already reconfigure live; the ffmpeg/gst CLI paths cannot (decision 1: no in-process libav rewrite in this pass — they restart on a step, which the hysteresis keeps rare). **2.4** host-side `Stats` consumption = the FEC sizing + logging. **2.2 LTR deferred** (Windows-only NVENC code that cannot be built/tested here; MediaCodec has no public LTR API) | core `service/media.rs`, `adapt/fec_policy.rs`; desktop `host.rs` (`on_stats`), `host/handlers.rs` (forwarder), `play/hold.rs`; mobile `client.rs` |
+| **3** delay gradient | `adapt::delay::Trendline` — WebRTC-style trendline estimator + over-use detector on per-frame RTP-timestamp vs arrival deltas (both apps feed it from their media path); `Overuse` cuts ×0.85 in the window and, via `Controller::poll_fast`, **between windows** after 500 ms of sustained overuse (≤1 cut / 1.5 s); `Underuse` (draining) blocks cuts and climbs | core `adapt/delay.rs`; desktop `hold.rs` (repair tick); mobile `client.rs` |
+| **4** validation | **Simulated matrix** `pulsar-core/tests/adapt_scenarios.rs`: 8 netem-like profiles (20/5/2/1 Mbit × 2–250 ms × 0/1/3/10 % loss) × H.264/HEVC against a path model (capacity, bounded queue, random loss, FEC repair) — asserts settle-under-capacity, clean rung for the budget, ≤2 point changes after settling, recovery flip within 2 windows of loss, FEC ≤ 20 %; plus 20 Mbit→1080p60 ≤ 30 s, 2 Mbit→≤720p ≤ 10 s, delay-cut-before-loss. **Real-session half**: `pulsar-desktop/scripts/netem.sh` (tc, both directions) + `scripts/validate-log.mjs` (parses the daily log: holds > 300 ms, stalls, late down-steps/point changes, recovery flip latency, summaries; exit 1 on failure). The hardware matrix (AMF/NVENC/MediaFoundation × Windows/Pi decoders) stays manual — run the netem profiles and the script on each | core `tests/adapt_scenarios.rs`; desktop `scripts/` |
+
+Decisions taken for the open questions (the maintainer may overrule):
+
+1. **ffmpeg-path hosts** keep the CLI: intra-refresh/short-GOP recovery + FEC + NACK; no
+   in-process libav rewrite (a separate, large project — the CLI paths only restart on a
+   rate/point step, which the hysteresis makes rare).
+2. **FEC**: ≤ 20 % overhead, sized ≈ 2× the measured loss, parity over every packet
+   (keyframes included), off on a clean path.
+3. **Manual pin**: the existing session-menu pickers pin a dimension; "Otomatik" unpins.
+   The host's encode label (`hostenc …`) already shows the live point, so no new HUD strings.
+
+Known limits of this pass:
+
+- **Wayland hosts absorb** recovery/point changes like bitrate (a gst restart there is the
+  black-video hazard in `handlers.rs`): no loss recovery or resolution ladder on Wayland;
+  bitrate stays as before (also absorbed).
+- **NVENC native** (`pulsar-capture`) is untouched: IDR-on-request works; intra-refresh/LTR
+  need a Windows build + hardware (`TODO(A8)`).
+- **Mobile host** keeps its 5 s GOP + `requestSyncFrame` on demand; `loss_recovery` is not
+  plumbed into MediaCodec (a GOP change would need the encoder restart the plugin avoids).
+- **Mobile client** asks for the short GOP (its depacketizer waits for an IDR); it does use
+  FEC and the delay estimator; its ladder's top rung is the phone's requested size.
+
+Test procedure (maintainer): `cargo build -p pulsar-render` first (`tauri dev` never rebuilds
+the sidecar); `sudo pulsar-desktop/scripts/netem.sh up --loss 3% --delay 60ms` (both
+directions → RTT ≈ 120 ms; `--rate 2mbit` for the cap check; `-i lo` for a self-connect on one
+machine); run 5–10 minutes; then `bun scripts/validate-log.mjs <daily log>` (Settings →
+General → Open log folder). Log lines to read: client `adaptive controller seeded`, `abr
+step` / `abr fast step` / `abr window` (debug), `renderer loss hold`; host `client stats`,
+`fec parity group size`. Env pins: `PULSAR_MAXDELAY` (µs) disables the live reorder wait.
 
 ### Phase 1 — the operating-point ladder (the heart of "cam gibi minimum")
 

@@ -1,6 +1,79 @@
 //! ffmpeg/ffplay command builders for the host encode + client decode paths.
 
 use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec};
+use crate::service::LossRecovery;
+
+/// Refresh period (frames) of the loss-recovery modes: after a loss the picture is whole
+/// again within ~0.5 s — an IDR (`ShortGop`) or one full intra-refresh wave
+/// (`IntraRefresh`). Game mode's normal 0.25 s GOP is already shorter and is kept.
+fn refresh_period(fps: u32) -> u32 {
+	(fps / 2).max(1)
+}
+
+/// Whether `enc` × `codec` exposes a periodic-intra-refresh knob in the bundled ffmpeg
+/// (checked against `ffmpeg -h encoder=…`, FFmpeg 8, 2026-09): libx264, NVENC (H.264 /
+/// HEVC / AV1), QSV (H.264 / HEVC), AMF (H.264 only — `hevc_amf`/`av1_amf` have none).
+/// VA-API, VideoToolbox, Media Foundation, Vulkan, rkmpp, libx265 and SVT-AV1 have no such
+/// option → those fall back to the short GOP.
+pub fn supports_intra_refresh(enc: HwEncoder, codec: VCodec) -> bool {
+	matches!(
+		(enc, codec),
+		(HwEncoder::Software, VCodec::H264)
+			| (HwEncoder::Nvenc, _)
+			| (HwEncoder::Qsv, VCodec::H264)
+			| (HwEncoder::Qsv, VCodec::H265)
+			| (HwEncoder::Amf, VCodec::H264)
+	)
+}
+
+/// The GOP (`-g`) plus the encoder-specific intra-refresh arguments for the plan's
+/// [`LossRecovery`] mode. Returns `(gop, extra_args)`.
+///
+/// * `Normal` — game ≈ 0.25 s, remote ≈ 2 s (unchanged pre-Phase-0 behaviour).
+/// * `ShortGop` — `min(normal, fps/2)`: an IDR at least every ~0.5 s.
+/// * `IntraRefresh` — where the encoder has it, a rolling intra wave with the refresh
+///   period as the cycle; x264/NVENC take the period via `-g` (no IDRs in steady state),
+///   QSV/AMF keep the normal GOP and add their cycle option. Without support → `ShortGop`.
+fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
+	let normal = if plan.low_latency {
+		(plan.fps / 4).max(1)
+	} else {
+		(plan.fps * 2).max(1)
+	};
+	let period = refresh_period(plan.fps);
+	let short = normal.min(period);
+	let s = |x: &str| x.to_string();
+	match plan.loss_recovery {
+		LossRecovery::Normal => (normal, Vec::new()),
+		LossRecovery::ShortGop => (short, Vec::new()),
+		LossRecovery::IntraRefresh => match (plan.encoder, plan.codec) {
+			(HwEncoder::Software, VCodec::H264) | (HwEncoder::Nvenc, _) => {
+				// `-g` is the refresh period here: x264/NVENC replace IDRs by the wave.
+				(period, vec![s("-intra-refresh"), s("1")])
+			}
+			(HwEncoder::Qsv, VCodec::H264) | (HwEncoder::Qsv, VCodec::H265) => (
+				normal,
+				vec![
+					s("-int_ref_type"),
+					s("1"), // vertical (column) refresh
+					s("-int_ref_cycle_size"),
+					period.to_string(),
+				],
+			),
+			(HwEncoder::Amf, VCodec::H264) => {
+				// AMF counts macroblocks per slot: refresh the whole frame within `period`.
+				let (w, h) = if plan.width == 0 || plan.height == 0 {
+					(1920, 1080)
+				} else {
+					(plan.width, plan.height)
+				};
+				let mbs = w.div_ceil(16) * h.div_ceil(16);
+				(normal, vec![s("-intra_refresh_mb"), mbs.div_ceil(period).max(1).to_string()])
+			}
+			_ => (short, Vec::new()),
+		},
+	}
+}
 
 /// Build the host capture+encode command: `(program, args)`. Program is always
 /// `ffmpeg` (the bundled binary is substituted by the caller); the encoder is
@@ -62,12 +135,9 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	// GOP: game mode uses a short GOP (~0.25 s) so the picture self-heals fast after
 	// loss (the UDP relay has no retransmit); desktop/quality mode uses a longer GOP
 	// (~2 s) — desktop is low-motion, so fewer keyframes spends the bitrate on a
-	// sharper picture instead.
-	let gop = if plan.low_latency {
-		(plan.fps / 4).max(1)
-	} else {
-		(plan.fps * 2).max(1)
-	};
+	// sharper picture instead. On a LOSSY path the client asks for a loss-recovery mode
+	// (short GOP / intra refresh) and `recovery_args` overrides both — see there.
+	let (gop, recovery) = recovery_args(plan);
 	a.extend([
 		s("-c:v"),
 		s(enc),
@@ -76,6 +146,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		s("-g"),
 		gop.to_string(),
 	]);
+	a.extend(recovery);
 	match (plan.encoder, plan.low_latency) {
 		// NVENC, game: absolute lowest latency (ultra-low-latency tune, CBR, no lookahead).
 		(HwEncoder::Nvenc, true) => a.extend([
@@ -367,6 +438,90 @@ mod tests {
 			output_idx: 0,
 			hdr: false,
 			yuv444: false,
+			loss_recovery: LossRecovery::Normal,
+		}
+	}
+
+	fn plan_for(enc: HwEncoder, codec: VCodec, low_latency: bool, rec: LossRecovery) -> StreamPlan {
+		StreamPlan {
+			encoder: enc,
+			codec,
+			low_latency,
+			loss_recovery: rec,
+			..sw_av1_plan(false)
+		}
+	}
+
+	fn arg_after(args: &[String], key: &str) -> Option<String> {
+		args.iter().position(|a| a == key).map(|i| args[i + 1].clone())
+	}
+
+	#[test]
+	fn normal_gop_unchanged_by_phase0() {
+		// Remote ≈ 2 s, game ≈ 0.25 s — the pre-Phase-0 values, no refresh args.
+		let (_, a) = encode_command(&plan_for(HwEncoder::Software, VCodec::H264, false, LossRecovery::Normal));
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("120"));
+		assert!(!a.iter().any(|x| x == "-intra-refresh"));
+		let (_, a) = encode_command(&plan_for(HwEncoder::Software, VCodec::H264, true, LossRecovery::Normal));
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("15"));
+	}
+
+	#[test]
+	fn short_gop_is_half_a_second_but_never_longer_than_normal() {
+		let (_, a) = encode_command(&plan_for(HwEncoder::Vaapi, VCodec::H265, false, LossRecovery::ShortGop));
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("30"), "remote 60 fps → IDR every 0.5 s");
+		let (_, a) = encode_command(&plan_for(HwEncoder::Vaapi, VCodec::H265, true, LossRecovery::ShortGop));
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("15"), "game mode's 0.25 s GOP stays");
+	}
+
+	#[test]
+	fn intra_refresh_x264_and_nvenc_use_the_flag_with_period_as_gop() {
+		for (enc, codec) in [
+			(HwEncoder::Software, VCodec::H264),
+			(HwEncoder::Nvenc, VCodec::H264),
+			(HwEncoder::Nvenc, VCodec::H265),
+			(HwEncoder::Nvenc, VCodec::Av1),
+		] {
+			let (_, a) = encode_command(&plan_for(enc, codec, false, LossRecovery::IntraRefresh));
+			let j = a.join(" ");
+			assert!(j.contains("-intra-refresh 1"), "{enc:?}/{codec:?}: {j}");
+			assert_eq!(arg_after(&a, "-g").as_deref(), Some("30"), "{enc:?}/{codec:?}: refresh period");
+		}
+	}
+
+	#[test]
+	fn intra_refresh_qsv_uses_cycle_option_and_keeps_normal_gop() {
+		let (_, a) = encode_command(&plan_for(HwEncoder::Qsv, VCodec::H264, false, LossRecovery::IntraRefresh));
+		let j = a.join(" ");
+		assert!(j.contains("-int_ref_type 1 -int_ref_cycle_size 30"), "{j}");
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("120"));
+	}
+
+	#[test]
+	fn intra_refresh_amf_h264_counts_macroblocks_per_slot() {
+		// 1920×1080 = 120×68 = 8160 MBs; refreshed over 30 frames → 272 per slot.
+		let (_, a) = encode_command(&plan_for(HwEncoder::Amf, VCodec::H264, false, LossRecovery::IntraRefresh));
+		let j = a.join(" ");
+		assert!(j.contains("-intra_refresh_mb 272"), "{j}");
+		assert_eq!(arg_after(&a, "-g").as_deref(), Some("120"));
+	}
+
+	#[test]
+	fn intra_refresh_falls_back_to_short_gop_where_unsupported() {
+		for (enc, codec) in [
+			(HwEncoder::Amf, VCodec::H265),
+			(HwEncoder::Vaapi, VCodec::H264),
+			(HwEncoder::VideoToolbox, VCodec::H265),
+			(HwEncoder::MediaFoundation, VCodec::H264),
+			(HwEncoder::Software, VCodec::H265),
+			(HwEncoder::Software, VCodec::Av1),
+			(HwEncoder::Qsv, VCodec::Av1),
+		] {
+			assert!(!supports_intra_refresh(enc, codec), "{enc:?}/{codec:?}");
+			let (_, a) = encode_command(&plan_for(enc, codec, false, LossRecovery::IntraRefresh));
+			let j = a.join(" ");
+			assert!(!j.contains("intra") && !j.contains("int_ref"), "{enc:?}/{codec:?}: {j}");
+			assert_eq!(arg_after(&a, "-g").as_deref(), Some("30"), "{enc:?}/{codec:?}: short GOP");
 		}
 	}
 

@@ -14,8 +14,12 @@ Read it end to end before touching code. Summary:
 - Today: two divergent bitrate-only controllers (desktop `play/hold.rs`, mobile
   `client.rs`), no resolution/fps ladder, no intra-refresh/FEC/LTR, 2 s GOP in remote
   mode, NACK useless when RTT > 100 ms → each loss is a multi-second freeze.
-- **Start with Phase 0** (stop the freezes), then Phase 1 (operating-point ladder as a
-  pure, unit-tested `pulsar-core::adapt` module used by both apps).
+- **Phases 0–4 are implemented locally (2026-09-03) and await the maintainer's
+  real-session test** — status, decisions, limits and the test procedure are in the design
+  doc ("Implementation status"). Not pushed; desktop and mobile build against this core via
+  a local `.cargo/config.toml` path patch (git-excluded; never commit the rewritten
+  `Cargo.lock`). The controller is `src/adapt/` (pure, unit + scenario tested:
+  `cargo test --test adapt_scenarios`).
 
 ## Rules
 

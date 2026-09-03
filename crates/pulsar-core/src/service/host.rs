@@ -38,6 +38,10 @@ pub struct DataHandlers {
 	/// `FileBegin`/`FileChunk`/`FileEnd`). Default no-op — a host without the
 	/// file manager just never answers.
 	pub on_fs: Box<dyn FnMut(DataMsg) + Send>,
+	/// The client's adaptive controller reported what it measures on the path
+	/// ([`ClientStats`] JSON in a [`DataMsg::Stats`]). Default no-op; the desktop host logs
+	/// it, a host-side controller may act on it (Phase 2.4).
+	pub on_stats: Box<dyn FnMut(ClientStats) + Send>,
 	/// Host-initiated re-stream injection. When the host detects its OWN display mode changed
 	/// mid-session (resolution / refresh rate), a watcher re-sends the last [`StreamReq`] here so
 	/// the capture restarts at the new geometry — the ffmpeg (x11grab/gdigrab/avfoundation) and
@@ -69,6 +73,7 @@ impl Default for DataHandlers {
 			on_peer_name: Box::new(|_| {}),
 			on_peer_id: Box::new(|_| {}),
 			on_fs: Box::new(|_| {}),
+			on_stats: Box::new(|_| {}),
 		}
 	}
 }
@@ -214,7 +219,13 @@ pub async fn serve_with(
 				| DataMsg::FileChunk { .. }
 				| DataMsg::FileEnd { .. }) => (data.on_file)(m),
 				m @ (DataMsg::Audio(_) | DataMsg::AudioEnd) => (data.on_audio)(m),
-				DataMsg::Stats(_) => {} // host→client only; ignore if echoed back
+				// Host→client it's the encode label; client→host it's the controller's JSON
+				// feedback (Phase 0). Anything that isn't a JSON object is ignored.
+				DataMsg::Stats(s) => {
+					if let Some(cs) = ClientStats::parse(&s) {
+						(data.on_stats)(cs);
+					}
+				}
 				DataMsg::DisplayRotation(_) => {} // host→client only; ignore if echoed back
 				DataMsg::ReverseRequest(id) => (data.on_reverse)(id),
 				DataMsg::MediaNack(seqs) => (data.on_nack)(seqs),

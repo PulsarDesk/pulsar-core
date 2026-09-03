@@ -31,8 +31,8 @@ pub use client::{
 };
 pub use host::{serve, serve_with, DataHandlers};
 pub use wire::{
-	DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, QualityPref, StreamCaps, StreamReq,
-	WindowInfo,
+	ClientStats, DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, LossRecovery, QualityPref,
+	StreamCaps, StreamReq, WindowInfo,
 };
 
 /// If a connected peer sends nothing (not even a keepalive) for this long, treat

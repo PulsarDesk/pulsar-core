@@ -353,6 +353,11 @@ pub struct StreamPlan {
 	/// Encode **4:4:4** chroma (no subsampling — sharper text/lines for remote desktop).
 	/// Only a few encoders support it (NVENC, QSV, software); ignored elsewhere.
 	pub yuv444: bool,
+	/// Loss-recovery encode mode the client asked for (see
+	/// [`LossRecovery`](crate::service::LossRecovery)): drives the GOP and the encoder's
+	/// periodic-intra-refresh knobs in [`encode_command`](super::encode_command).
+	/// `Normal` = the long remote GOP.
+	pub loss_recovery: crate::service::LossRecovery,
 }
 
 impl StreamPlan {
