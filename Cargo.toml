@@ -44,3 +44,5 @@ pulsar-relay = { git = "https://github.com/PulsarDesk/relay" }
 # patch it via git to this repo).
 [patch.crates-io]
 vigem-client = { path = "crates/vigem-client" }
+# Vendored reed-solomon-erasure 6.0.0 with lru bumped (RUSTSEC-2026-0253); see its Cargo.toml.
+reed-solomon-erasure = { path = "crates/reed-solomon-erasure" }
