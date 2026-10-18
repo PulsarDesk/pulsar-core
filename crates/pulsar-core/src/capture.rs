@@ -50,6 +50,18 @@ pub struct WaylandCapture {
 	short_gop: Arc<AtomicBool>,
 	/// Set on stop/drop so the helper tasks exit.
 	stopped: Arc<AtomicBool>,
+	/// Where the streamed monitor sits in the output layout, see [`Self::pointer_region`].
+	pointer_region: Option<PointerRegion>,
+}
+
+/// The streamed monitor's rectangle as fractions (0..1) of the bounding box of all outputs
+/// — the area the compositor maps the absolute uinput pointer onto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerRegion {
+	pub x: f64,
+	pub y: f64,
+	pub w: f64,
+	pub h: f64,
 }
 
 impl WaylandCapture {
@@ -90,6 +102,14 @@ impl WaylandCapture {
 	/// are forced instead), `false` = the element's own key interval.
 	pub fn set_short_gop(&self, on: bool) {
 		self.short_gop.store(on, Ordering::Relaxed);
+	}
+
+	/// The streamed monitor within the output layout, for
+	/// [`crate::input::DesktopInput::set_region`]: without it a client's 0..1 pointer spans
+	/// every monitor on a multi-monitor host. `None` for a window cast or when the portal /
+	/// compositor gives no geometry (then the pointer covers the whole layout, as before).
+	pub fn pointer_region(&self) -> Option<PointerRegion> {
+		self.pointer_region
 	}
 
 	/// Stop the capture: tear the pipeline down and **close the portal session**.
@@ -152,7 +172,12 @@ pub async fn start(
 	restore_token: Option<String>,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
 	gst::init().map_err(|e| anyhow::anyhow!("GStreamer başlatılamadı: {e}"))?;
-	let (mut guard, node_id, pw_fd, token) = open_portal(restore_token).await?;
+	let (mut guard, node_id, pw_fd, token, stream_rect) = open_portal(restore_token).await?;
+	let pointer_region = stream_rect.and_then(|r| {
+		let region = outputs::bounds().and_then(|b| region_in(r, b));
+		tracing::info!(?r, ?region, "wayland pointer region");
+		region
+	});
 
 	// The PipeWire node can lag the portal reply by a moment: retry the pipeline start a
 	// few times before giving up (each attempt tears its pipeline down cleanly).
@@ -177,6 +202,7 @@ pub async fn start(
 						dead,
 						short_gop,
 						stopped,
+						pointer_region,
 					},
 					token,
 				));
@@ -192,11 +218,11 @@ pub async fn start(
 
 async fn open_portal(
 	restore_token: Option<String>,
-) -> anyhow::Result<(SessionCloseGuard, u32, OwnedFd, Option<String>)> {
+) -> anyhow::Result<(SessionCloseGuard, u32, OwnedFd, Option<String>, Option<Rect>)> {
 	let proxy: Screencast = Screencast::new().await?;
 	let session: Session<Screencast> = proxy.create_session(Default::default()).await?;
 	let guard = SessionCloseGuard(Some(session));
-	let (node_id, pw_fd, token) = async {
+	let (node_id, pw_fd, token, rect) = async {
 		let session = guard.0.as_ref().expect("session present");
 		proxy
 			.select_sources(
@@ -218,16 +244,171 @@ async fn open_portal(
 			.first()
 			.ok_or_else(|| anyhow::anyhow!("portal returned no screencast stream"))?;
 		let node_id = stream.pipe_wire_node_id();
+		// Monitor casts carry the output's place in the compositor's logical layout.
+		let rect = match (stream.position(), stream.size()) {
+			(Some((x, y)), Some((w, h))) if w > 0 && h > 0 => Some(Rect { x, y, w, h }),
+			_ => None,
+		};
 		let token = response.restore_token().map(|s| s.to_string());
 
 		let pw_fd: OwnedFd = proxy
 			.open_pipe_wire_remote(session, Default::default())
 			.await?;
 		clear_cloexec(pw_fd.as_raw_fd())?;
-		Ok::<_, anyhow::Error>((node_id, pw_fd, token))
+		Ok::<_, anyhow::Error>((node_id, pw_fd, token, rect))
 	}
 	.await?;
-	Ok((guard, node_id, pw_fd, token))
+	Ok((guard, node_id, pw_fd, token, rect))
+}
+
+/// A rectangle in the compositor's logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rect {
+	x: i32,
+	y: i32,
+	w: i32,
+	h: i32,
+}
+
+/// `r` as fractions of `bounds`; `None` unless `r` lies inside `bounds`.
+fn region_in(r: Rect, bounds: Rect) -> Option<PointerRegion> {
+	if bounds.w <= 0
+		|| bounds.h <= 0
+		|| r.x < bounds.x
+		|| r.y < bounds.y
+		|| r.x + r.w > bounds.x + bounds.w
+		|| r.y + r.h > bounds.y + bounds.h
+	{
+		return None;
+	}
+	// Pixel centres of the first and last pixel, so 1.0 lands on the monitor's last pixel
+	// and not on the first pixel of its right/bottom neighbour.
+	let (bw, bh) = (bounds.w as f64, bounds.h as f64);
+	Some(PointerRegion {
+		x: ((r.x - bounds.x) as f64 + 0.5) / bw,
+		y: ((r.y - bounds.y) as f64 + 0.5) / bh,
+		w: (r.w - 1).max(0) as f64 / bw,
+		h: (r.h - 1).max(0) as f64 / bh,
+	})
+}
+
+/// The output layout via xdg-output (logical position + size per output, the same space
+/// the portal reports the stream in).
+mod outputs {
+	use super::Rect;
+	use wayland_client::protocol::{wl_output, wl_registry};
+	use wayland_client::{Connection, Dispatch, QueueHandle};
+	use wayland_protocols::xdg::xdg_output::zv1::client::{
+		zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1, zxdg_output_v1::ZxdgOutputV1,
+	};
+
+	#[derive(Default)]
+	struct State {
+		outputs: Vec<wl_output::WlOutput>,
+		manager: Option<ZxdgOutputManagerV1>,
+		rects: Vec<Rect>,
+	}
+
+	impl Dispatch<wl_registry::WlRegistry, ()> for State {
+		fn event(
+			state: &mut Self,
+			registry: &wl_registry::WlRegistry,
+			event: wl_registry::Event,
+			_: &(),
+			_: &Connection,
+			qh: &QueueHandle<Self>,
+		) {
+			if let wl_registry::Event::Global { name, interface, version } = event {
+				match interface.as_str() {
+					"wl_output" => state.outputs.push(registry.bind(name, version.min(4), qh, ())),
+					"zxdg_output_manager_v1" => state.manager = Some(registry.bind(name, version.min(3), qh, ())),
+					_ => {}
+				}
+			}
+		}
+	}
+
+	impl Dispatch<wl_output::WlOutput, ()> for State {
+		fn event(_: &mut Self, _: &wl_output::WlOutput, _: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+	}
+
+	impl Dispatch<ZxdgOutputManagerV1, ()> for State {
+		fn event(
+			_: &mut Self,
+			_: &ZxdgOutputManagerV1,
+			_: <ZxdgOutputManagerV1 as wayland_client::Proxy>::Event,
+			_: &(),
+			_: &Connection,
+			_: &QueueHandle<Self>,
+		) {
+		}
+	}
+
+	impl Dispatch<ZxdgOutputV1, usize> for State {
+		fn event(
+			state: &mut Self,
+			_: &ZxdgOutputV1,
+			event: zxdg_output_v1::Event,
+			idx: &usize,
+			_: &Connection,
+			_: &QueueHandle<Self>,
+		) {
+			let Some(r) = state.rects.get_mut(*idx) else { return };
+			match event {
+				zxdg_output_v1::Event::LogicalPosition { x, y } => (r.x, r.y) = (x, y),
+				zxdg_output_v1::Event::LogicalSize { width, height } => (r.w, r.h) = (width, height),
+				_ => {}
+			}
+		}
+	}
+
+	/// Bounding box of all outputs, `None` without a Wayland connection / xdg-output.
+	pub(super) fn bounds() -> Option<Rect> {
+		let conn = Connection::connect_to_env().ok()?;
+		let mut queue = conn.new_event_queue();
+		let qh = queue.handle();
+		conn.display().get_registry(&qh, ());
+		let mut state = State::default();
+		queue.roundtrip(&mut state).ok()?;
+		let manager = state.manager.clone()?;
+		state.rects = vec![Rect { x: 0, y: 0, w: 0, h: 0 }; state.outputs.len()];
+		for (i, o) in state.outputs.clone().iter().enumerate() {
+			manager.get_xdg_output(o, &qh, i);
+		}
+		queue.roundtrip(&mut state).ok()?;
+		let rects: Vec<Rect> = state.rects.into_iter().filter(|r| r.w > 0 && r.h > 0).collect();
+		let x0 = rects.iter().map(|r| r.x).min()?;
+		let y0 = rects.iter().map(|r| r.y).min()?;
+		let x1 = rects.iter().map(|r| r.x + r.w).max()?;
+		let y1 = rects.iter().map(|r| r.y + r.h).max()?;
+		Some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn region_of_one_monitor_in_a_three_monitor_layout() {
+		// 2560x1440 + 2560x1440 side by side, 1920x1200 below the first.
+		let bounds = Rect { x: 0, y: 0, w: 5120, h: 2640 };
+		let r = region_in(Rect { x: 2560, y: 0, w: 2560, h: 1440 }, bounds).unwrap();
+		let px = |f: f64, size: f64| (f * size).floor();
+		// 0 → the monitor's first pixel, 1 → its last pixel (never the neighbour's first).
+		assert_eq!((px(r.x, 5120.0), px(r.y, 2640.0)), (2560.0, 0.0));
+		assert_eq!((px(r.x + r.w, 5120.0), px(r.y + r.h, 2640.0)), (5119.0, 1439.0));
+		let left = region_in(Rect { x: 0, y: 0, w: 2560, h: 1440 }, bounds).unwrap();
+		assert_eq!(px(left.x + left.w, 5120.0), 2559.0);
+		assert!(region_in(Rect { x: 4000, y: 0, w: 2560, h: 1440 }, bounds).is_none());
+	}
+
+	/// Needs a live Wayland session: `cargo test -p pulsar-core --lib live_output_bounds -- --ignored --nocapture`.
+	#[test]
+	#[ignore]
+	fn live_output_bounds() {
+		println!("output bounds: {:?}", outputs::bounds());
+	}
 }
 
 /// Build the pipeline from the same description string the `gst-launch` path used, set it

@@ -43,6 +43,11 @@ libc = "0.2"
 # leave a black screen). Needs libgstreamer1.0-dev + gstreamer-plugins-base at build time.
 gstreamer = "0.25"
 gstreamer-video = "0.25"
+# Wayland output layout (xdg-output logical geometry): the compositor spreads the absolute
+# uinput pointer over the bounding box of ALL outputs, so the host needs the layout to keep
+# a client's 0..1 pointer on the one monitor it is streaming.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:

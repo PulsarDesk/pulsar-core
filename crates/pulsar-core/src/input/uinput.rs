@@ -143,6 +143,9 @@ pub struct DesktopInput {
 	/// instead accumulate the remainder so successive fine scrolls eventually move.
 	scroll_acc_v: f64,
 	scroll_acc_h: f64,
+	/// The streamed monitor within the output layout (see `set_region`); `None` = the
+	/// whole layout.
+	region: Option<crate::capture::PointerRegion>,
 	/// Currently-held mouse-button evdev codes and key evdev codes. Tracked so they
 	/// can be released on `flush_held()` (control revoked mid-press → "Sadece izleme")
 	/// and on `Drop` (session teardown) — otherwise a held button/modifier stays stuck.
@@ -198,15 +201,29 @@ impl DesktopInput {
 			keyboard,
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
+			region: None,
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
 		})
 	}
 
-	/// Move the pointer to a normalized (0..1) position on the screen.
+	/// Confine absolute pointer moves to the streamed monitor. The compositor maps the
+	/// absolute device over the bounding box of ALL outputs (verified on KWin 6), so on a
+	/// multi-monitor host an unmapped 0..1 position lands on whichever monitor that point
+	/// of the box belongs to — the cursor left the screen the client was looking at.
+	pub fn set_region(&mut self, region: Option<crate::capture::PointerRegion>) {
+		self.region = region;
+	}
+
+	/// Move the pointer to a normalized (0..1) position on the streamed screen.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let cx = (x.clamp(0.0, 1.0) * ABS_MAX as f64) as i32;
-		let cy = (y.clamp(0.0, 1.0) * ABS_MAX as f64) as i32;
+		let (mut x, mut y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+		if let Some(r) = self.region {
+			x = r.x + x * r.w;
+			y = r.y + y * r.h;
+		}
+		let cx = (x.clamp(0.0, 1.0) * ABS_MAX as f64).round() as i32;
+		let cy = (y.clamp(0.0, 1.0) * ABS_MAX as f64).round() as i32;
 		let _ = self.pointer.emit(&[
 			InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, cx),
 			InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, cy),
