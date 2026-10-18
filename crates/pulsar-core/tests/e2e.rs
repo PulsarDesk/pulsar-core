@@ -97,6 +97,27 @@ async fn relay_password_auth_gates_registration() {
 	);
 }
 
+/// Connecting to an id the relay doesn't know fails as "target unreachable" — never as
+/// `P2pFailed` ("direct P2P failed and relay fallback is disabled"), which is only true in
+/// `P2pOnly` mode. Auto mode always has the relay fallback.
+#[tokio::test]
+async fn connecting_to_an_unknown_id_reports_target_unreachable() {
+	use pulsar_core::proto::DeviceId;
+	let (relay, _h) = start_relay().await;
+	let a = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::Auto)
+		.await
+		.unwrap();
+	a.register().await.unwrap();
+	let err = match a.connect(DeviceId::new(123_456_789).unwrap()).await {
+		Ok(_) => panic!("connect to an unknown id must fail"),
+		Err(e) => e,
+	};
+	assert!(
+		matches!(err, ConnError::TargetUnreachable(_)),
+		"got {err:?}"
+	);
+}
+
 #[tokio::test]
 async fn registering_without_a_relay_yields_no_id() {
 	// Point at a port with nothing listening.
