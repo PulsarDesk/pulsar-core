@@ -4,31 +4,30 @@
 
 use super::{button, GamepadKind, GamepadState, ResolvedTarget, VirtualGamepad};
 use evdev::{
-	uinput::{VirtualDevice, VirtualDeviceBuilder},
-	AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, Key,
-	PropType, RelativeAxisType, UinputAbsSetup,
+	uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent,
+	InputId, KeyCode, PropType, RelativeAxisCode, UinputAbsSetup,
 };
 
 /// Maps our normalized button bits to evdev gamepad key codes (used by the
 /// Linux backend; pure so it's testable).
-fn evdev_buttons() -> [(u32, evdev::Key); 15] {
-	use evdev::Key;
+fn evdev_buttons() -> [(u32, evdev::KeyCode); 15] {
+	use evdev::KeyCode;
 	[
-		(button::A, Key::BTN_SOUTH),
-		(button::B, Key::BTN_EAST),
-		(button::X, Key::BTN_WEST),
-		(button::Y, Key::BTN_NORTH),
-		(button::LB, Key::BTN_TL),
-		(button::RB, Key::BTN_TR),
-		(button::BACK, Key::BTN_SELECT),
-		(button::START, Key::BTN_START),
-		(button::GUIDE, Key::BTN_MODE),
-		(button::L3, Key::BTN_THUMBL),
-		(button::R3, Key::BTN_THUMBR),
-		(button::DPAD_UP, Key::BTN_DPAD_UP),
-		(button::DPAD_DOWN, Key::BTN_DPAD_DOWN),
-		(button::DPAD_LEFT, Key::BTN_DPAD_LEFT),
-		(button::DPAD_RIGHT, Key::BTN_DPAD_RIGHT),
+		(button::A, KeyCode::BTN_SOUTH),
+		(button::B, KeyCode::BTN_EAST),
+		(button::X, KeyCode::BTN_WEST),
+		(button::Y, KeyCode::BTN_NORTH),
+		(button::LB, KeyCode::BTN_TL),
+		(button::RB, KeyCode::BTN_TR),
+		(button::BACK, KeyCode::BTN_SELECT),
+		(button::START, KeyCode::BTN_START),
+		(button::GUIDE, KeyCode::BTN_MODE),
+		(button::L3, KeyCode::BTN_THUMBL),
+		(button::R3, KeyCode::BTN_THUMBR),
+		(button::DPAD_UP, KeyCode::BTN_DPAD_UP),
+		(button::DPAD_DOWN, KeyCode::BTN_DPAD_DOWN),
+		(button::DPAD_LEFT, KeyCode::BTN_DPAD_LEFT),
+		(button::DPAD_RIGHT, KeyCode::BTN_DPAD_RIGHT),
 	]
 }
 
@@ -55,7 +54,7 @@ impl UinputGamepad {
 	///
 	/// Both targets share the same evdev_buttons() + ABS axis layout.
 	pub fn new_target(kind: GamepadKind, resolved: ResolvedTarget) -> std::io::Result<Self> {
-		let mut keys = AttributeSet::<Key>::new();
+		let mut keys = AttributeSet::<KeyCode>::new();
 		for (_, key) in evdev_buttons() {
 			keys.insert(key);
 		}
@@ -76,16 +75,16 @@ impl UinputGamepad {
 				InputId::new(BusType::BUS_USB, 0x045E, 0x028E, 0x0114),
 			),
 		};
-		let dev = VirtualDeviceBuilder::new()?
+		let dev = VirtualDevice::builder()?
 			.name(name)
 			.input_id(input_id)
 			.with_keys(&keys)?
-			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_X))?
-			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_Y))?
-			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_RX))?
-			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_RY))?
-			.with_absolute_axis(&trig(AbsoluteAxisType::ABS_Z))?
-			.with_absolute_axis(&trig(AbsoluteAxisType::ABS_RZ))?
+			.with_absolute_axis(&stick(AbsoluteAxisCode::ABS_X))?
+			.with_absolute_axis(&stick(AbsoluteAxisCode::ABS_Y))?
+			.with_absolute_axis(&stick(AbsoluteAxisCode::ABS_RX))?
+			.with_absolute_axis(&stick(AbsoluteAxisCode::ABS_RY))?
+			.with_absolute_axis(&trig(AbsoluteAxisCode::ABS_Z))?
+			.with_absolute_axis(&trig(AbsoluteAxisCode::ABS_RZ))?
 			.build()?;
 		Ok(Self { kind, dev })
 	}
@@ -99,20 +98,21 @@ impl VirtualGamepad for UinputGamepad {
 		let mut events = Vec::with_capacity(21);
 		for (bit, key) in evdev_buttons() {
 			let val = if state.is_pressed(bit) { 1 } else { 0 };
-			events.push(InputEvent::new(EventType::KEY, key.code(), val));
+			events.push(InputEvent::new(EventType::KEY.0, key.code(), val));
 		}
-		let abs = |axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
+		let abs =
+			|axis: AbsoluteAxisCode, v: i32| InputEvent::new(EventType::ABSOLUTE.0, axis.0, v);
 		// evdev Y points down; gamepad up is +, so invert. Clamp to i16::MIN+1 BEFORE
 		// negating: -(i16::MIN) = 32768 overflows the i16 range and exceeds the declared
 		// AbsInfo max (32767) by one, which some consumers reject / wrap. Clamping the
 		// low end to -32767 makes the negated value land exactly on the +32767 max.
 		let inv_y = |v: i16| -(v.max(i16::MIN + 1) as i32);
-		events.push(abs(AbsoluteAxisType::ABS_X, state.left_x as i32));
-		events.push(abs(AbsoluteAxisType::ABS_Y, inv_y(state.left_y)));
-		events.push(abs(AbsoluteAxisType::ABS_RX, state.right_x as i32));
-		events.push(abs(AbsoluteAxisType::ABS_RY, inv_y(state.right_y)));
-		events.push(abs(AbsoluteAxisType::ABS_Z, state.left_trigger as i32));
-		events.push(abs(AbsoluteAxisType::ABS_RZ, state.right_trigger as i32));
+		events.push(abs(AbsoluteAxisCode::ABS_X, state.left_x as i32));
+		events.push(abs(AbsoluteAxisCode::ABS_Y, inv_y(state.left_y)));
+		events.push(abs(AbsoluteAxisCode::ABS_RX, state.right_x as i32));
+		events.push(abs(AbsoluteAxisCode::ABS_RY, inv_y(state.right_y)));
+		events.push(abs(AbsoluteAxisCode::ABS_Z, state.left_trigger as i32));
+		events.push(abs(AbsoluteAxisCode::ABS_RZ, state.right_trigger as i32));
 		let _ = self.dev.emit(&events);
 	}
 }
@@ -152,43 +152,43 @@ pub struct DesktopInput {
 
 impl DesktopInput {
 	pub fn new() -> std::io::Result<Self> {
-		let mut btns = AttributeSet::<Key>::new();
-		btns.insert(Key::BTN_LEFT);
-		btns.insert(Key::BTN_RIGHT);
-		btns.insert(Key::BTN_MIDDLE);
+		let mut btns = AttributeSet::<KeyCode>::new();
+		btns.insert(KeyCode::BTN_LEFT);
+		btns.insert(KeyCode::BTN_RIGHT);
+		btns.insert(KeyCode::BTN_MIDDLE);
 		// ABSOLUTE pointer: INPUT_PROP_DIRECT + ABS_X/Y. Buttons stay here too so an
 		// absolute-path tap (set position, then click on THIS device) still works.
 		let mut props = AttributeSet::<PropType>::new();
 		props.insert(PropType::DIRECT);
 		let abs = |axis| UinputAbsSetup::new(axis, AbsInfo::new(0, 0, ABS_MAX, 0, 0, 1));
-		let pointer = VirtualDeviceBuilder::new()?
+		let pointer = VirtualDevice::builder()?
 			.name("Pulsar Virtual Pointer")
 			.with_properties(&props)?
 			.with_keys(&btns)?
-			.with_absolute_axis(&abs(AbsoluteAxisType::ABS_X))?
-			.with_absolute_axis(&abs(AbsoluteAxisType::ABS_Y))?
+			.with_absolute_axis(&abs(AbsoluteAxisCode::ABS_X))?
+			.with_absolute_axis(&abs(AbsoluteAxisCode::ABS_Y))?
 			.build()?;
 
 		// RELATIVE mouse: plain REL_X/Y + wheel + buttons, NO direct/abs prop, so
 		// libinput classifies it as an ordinary mouse and its BTN_LEFT clicks land
 		// (the native-renderer path). Kept SEPARATE from the absolute device above —
 		// mixing DIRECT/ABS with REL on one node is exactly what dropped the clicks.
-		let mut rels = AttributeSet::<RelativeAxisType>::new();
-		rels.insert(RelativeAxisType::REL_X);
-		rels.insert(RelativeAxisType::REL_Y);
-		rels.insert(RelativeAxisType::REL_WHEEL);
-		rels.insert(RelativeAxisType::REL_HWHEEL);
-		let mouse = VirtualDeviceBuilder::new()?
+		let mut rels = AttributeSet::<RelativeAxisCode>::new();
+		rels.insert(RelativeAxisCode::REL_X);
+		rels.insert(RelativeAxisCode::REL_Y);
+		rels.insert(RelativeAxisCode::REL_WHEEL);
+		rels.insert(RelativeAxisCode::REL_HWHEEL);
+		let mouse = VirtualDevice::builder()?
 			.name("Pulsar Virtual Mouse")
 			.with_keys(&btns)?
 			.with_relative_axes(&rels)?
 			.build()?;
 
-		let mut keys = AttributeSet::<Key>::new();
+		let mut keys = AttributeSet::<KeyCode>::new();
 		for c in 1u16..=248 {
-			keys.insert(Key::new(c));
+			keys.insert(KeyCode::new(c));
 		}
-		let keyboard = VirtualDeviceBuilder::new()?
+		let keyboard = VirtualDevice::builder()?
 			.name("Pulsar Virtual Keyboard")
 			.with_keys(&keys)?
 			.build()?;
@@ -208,8 +208,8 @@ impl DesktopInput {
 		let cx = (x.clamp(0.0, 1.0) * ABS_MAX as f64) as i32;
 		let cy = (y.clamp(0.0, 1.0) * ABS_MAX as f64) as i32;
 		let _ = self.pointer.emit(&[
-			InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, cx),
-			InputEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, cy),
+			InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, cx),
+			InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, cy),
 		]);
 	}
 
@@ -220,15 +220,15 @@ impl DesktopInput {
 		let y = dy.round() as i32;
 		if x != 0 {
 			ev.push(InputEvent::new(
-				EventType::RELATIVE,
-				RelativeAxisType::REL_X.0,
+				EventType::RELATIVE.0,
+				RelativeAxisCode::REL_X.0,
 				x,
 			));
 		}
 		if y != 0 {
 			ev.push(InputEvent::new(
-				EventType::RELATIVE,
-				RelativeAxisType::REL_Y.0,
+				EventType::RELATIVE.0,
+				RelativeAxisCode::REL_Y.0,
 				y,
 			));
 		}
@@ -240,9 +240,9 @@ impl DesktopInput {
 	/// Press/release a mouse button (0=left, 1=right, 2=middle).
 	pub fn button(&mut self, button: u8, down: bool) {
 		let key = match button {
-			1 => Key::BTN_RIGHT,
-			2 => Key::BTN_MIDDLE,
-			_ => Key::BTN_LEFT,
+			1 => KeyCode::BTN_RIGHT,
+			2 => KeyCode::BTN_MIDDLE,
+			_ => KeyCode::BTN_LEFT,
 		};
 		if down {
 			self.held_buttons.insert(key.code());
@@ -251,7 +251,7 @@ impl DesktopInput {
 		}
 		let _ = self
 			.mouse
-			.emit(&[InputEvent::new(EventType::KEY, key.code(), down as i32)]);
+			.emit(&[InputEvent::new(EventType::KEY.0, key.code(), down as i32)]);
 	}
 
 	/// Scroll by a delta (browser wheel pixels → wheel clicks).
@@ -269,15 +269,15 @@ impl DesktopInput {
 		let mut ev = Vec::new();
 		if v != 0 {
 			ev.push(InputEvent::new(
-				EventType::RELATIVE,
-				RelativeAxisType::REL_WHEEL.0,
+				EventType::RELATIVE.0,
+				RelativeAxisCode::REL_WHEEL.0,
 				v,
 			));
 		}
 		if h != 0 {
 			ev.push(InputEvent::new(
-				EventType::RELATIVE,
-				RelativeAxisType::REL_HWHEEL.0,
+				EventType::RELATIVE.0,
+				RelativeAxisCode::REL_HWHEEL.0,
 				h,
 			));
 		}
@@ -299,7 +299,7 @@ impl DesktopInput {
 		}
 		let _ = self
 			.keyboard
-			.emit(&[InputEvent::new(EventType::KEY, code, down as i32)]);
+			.emit(&[InputEvent::new(EventType::KEY.0, code, down as i32)]);
 	}
 
 	/// Type a resolved Unicode character (layout-independent). uinput is keycode-based with no
@@ -321,16 +321,24 @@ impl DesktopInput {
 		// LEFTSHIFT(0) would release the host's held Shift at the kernel/X layer even though
 		// the client's Shift key is still down — the held_keys set and the actual kernel
 		// modifier state would diverge, breaking subsequent Shift+Arrow / Shift+Home / etc.
-		let shift_already_held = self.held_keys.contains(&Key::KEY_LEFTSHIFT.code())
-			|| self.held_keys.contains(&Key::KEY_RIGHTSHIFT.code());
+		let shift_already_held = self.held_keys.contains(&KeyCode::KEY_LEFTSHIFT.code())
+			|| self.held_keys.contains(&KeyCode::KEY_RIGHTSHIFT.code());
 		let mut ev = Vec::with_capacity(4);
 		if shift && !shift_already_held {
-			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 1));
+			ev.push(InputEvent::new(
+				EventType::KEY.0,
+				KeyCode::KEY_LEFTSHIFT.code(),
+				1,
+			));
 		}
-		ev.push(InputEvent::new(EventType::KEY, code, 1));
-		ev.push(InputEvent::new(EventType::KEY, code, 0));
+		ev.push(InputEvent::new(EventType::KEY.0, code, 1));
+		ev.push(InputEvent::new(EventType::KEY.0, code, 0));
 		if shift && !shift_already_held {
-			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 0));
+			ev.push(InputEvent::new(
+				EventType::KEY.0,
+				KeyCode::KEY_LEFTSHIFT.code(),
+				0,
+			));
 		}
 		let _ = self.keyboard.emit(&ev);
 	}
@@ -344,7 +352,7 @@ impl DesktopInput {
 		let btn_up: Vec<InputEvent> = self
 			.held_buttons
 			.drain()
-			.map(|code| InputEvent::new(EventType::KEY, code, 0))
+			.map(|code| InputEvent::new(EventType::KEY.0, code, 0))
 			.collect();
 		if !btn_up.is_empty() {
 			let _ = self.mouse.emit(&btn_up);
@@ -352,7 +360,7 @@ impl DesktopInput {
 		let key_up: Vec<InputEvent> = self
 			.held_keys
 			.drain()
-			.map(|code| InputEvent::new(EventType::KEY, code, 0))
+			.map(|code| InputEvent::new(EventType::KEY.0, code, 0))
 			.collect();
 		if !key_up.is_empty() {
 			let _ = self.keyboard.emit(&key_up);
@@ -373,57 +381,57 @@ impl Drop for DesktopInput {
 /// The host keyboard device exposes the full evdev keycode range, so emitting these raw codes (the
 /// same codes a Linux client's `Key` path sends) lands the character regardless of the host's own
 /// X/Wayland layout. Returns `None` for non-ASCII (no fixed keycode without a keymap remap).
-fn us_char_to_key(c: char) -> Option<(Key, bool)> {
-	let unshifted = |k: Key| Some((k, false));
-	let shifted = |k: Key| Some((k, true));
+fn us_char_to_key(c: char) -> Option<(KeyCode, bool)> {
+	let unshifted = |k: KeyCode| Some((k, false));
+	let shifted = |k: KeyCode| Some((k, true));
 	match c {
-		'a'..='z' => unshifted(Key::new(letter_key_code(c, false))),
-		'A'..='Z' => shifted(Key::new(letter_key_code(c, true))),
-		'0' => unshifted(Key::KEY_0),
-		'1' => unshifted(Key::KEY_1),
-		'2' => unshifted(Key::KEY_2),
-		'3' => unshifted(Key::KEY_3),
-		'4' => unshifted(Key::KEY_4),
-		'5' => unshifted(Key::KEY_5),
-		'6' => unshifted(Key::KEY_6),
-		'7' => unshifted(Key::KEY_7),
-		'8' => unshifted(Key::KEY_8),
-		'9' => unshifted(Key::KEY_9),
-		' ' => unshifted(Key::KEY_SPACE),
-		'\t' => unshifted(Key::KEY_TAB),
-		'\n' | '\r' => unshifted(Key::KEY_ENTER),
-		'-' => unshifted(Key::KEY_MINUS),
-		'=' => unshifted(Key::KEY_EQUAL),
-		'[' => unshifted(Key::KEY_LEFTBRACE),
-		']' => unshifted(Key::KEY_RIGHTBRACE),
-		'\\' => unshifted(Key::KEY_BACKSLASH),
-		';' => unshifted(Key::KEY_SEMICOLON),
-		'\'' => unshifted(Key::KEY_APOSTROPHE),
-		'`' => unshifted(Key::KEY_GRAVE),
-		',' => unshifted(Key::KEY_COMMA),
-		'.' => unshifted(Key::KEY_DOT),
-		'/' => unshifted(Key::KEY_SLASH),
-		'!' => shifted(Key::KEY_1),
-		'@' => shifted(Key::KEY_2),
-		'#' => shifted(Key::KEY_3),
-		'$' => shifted(Key::KEY_4),
-		'%' => shifted(Key::KEY_5),
-		'^' => shifted(Key::KEY_6),
-		'&' => shifted(Key::KEY_7),
-		'*' => shifted(Key::KEY_8),
-		'(' => shifted(Key::KEY_9),
-		')' => shifted(Key::KEY_0),
-		'_' => shifted(Key::KEY_MINUS),
-		'+' => shifted(Key::KEY_EQUAL),
-		'{' => shifted(Key::KEY_LEFTBRACE),
-		'}' => shifted(Key::KEY_RIGHTBRACE),
-		'|' => shifted(Key::KEY_BACKSLASH),
-		':' => shifted(Key::KEY_SEMICOLON),
-		'"' => shifted(Key::KEY_APOSTROPHE),
-		'~' => shifted(Key::KEY_GRAVE),
-		'<' => shifted(Key::KEY_COMMA),
-		'>' => shifted(Key::KEY_DOT),
-		'?' => shifted(Key::KEY_SLASH),
+		'a'..='z' => unshifted(KeyCode::new(letter_key_code(c, false))),
+		'A'..='Z' => shifted(KeyCode::new(letter_key_code(c, true))),
+		'0' => unshifted(KeyCode::KEY_0),
+		'1' => unshifted(KeyCode::KEY_1),
+		'2' => unshifted(KeyCode::KEY_2),
+		'3' => unshifted(KeyCode::KEY_3),
+		'4' => unshifted(KeyCode::KEY_4),
+		'5' => unshifted(KeyCode::KEY_5),
+		'6' => unshifted(KeyCode::KEY_6),
+		'7' => unshifted(KeyCode::KEY_7),
+		'8' => unshifted(KeyCode::KEY_8),
+		'9' => unshifted(KeyCode::KEY_9),
+		' ' => unshifted(KeyCode::KEY_SPACE),
+		'\t' => unshifted(KeyCode::KEY_TAB),
+		'\n' | '\r' => unshifted(KeyCode::KEY_ENTER),
+		'-' => unshifted(KeyCode::KEY_MINUS),
+		'=' => unshifted(KeyCode::KEY_EQUAL),
+		'[' => unshifted(KeyCode::KEY_LEFTBRACE),
+		']' => unshifted(KeyCode::KEY_RIGHTBRACE),
+		'\\' => unshifted(KeyCode::KEY_BACKSLASH),
+		';' => unshifted(KeyCode::KEY_SEMICOLON),
+		'\'' => unshifted(KeyCode::KEY_APOSTROPHE),
+		'`' => unshifted(KeyCode::KEY_GRAVE),
+		',' => unshifted(KeyCode::KEY_COMMA),
+		'.' => unshifted(KeyCode::KEY_DOT),
+		'/' => unshifted(KeyCode::KEY_SLASH),
+		'!' => shifted(KeyCode::KEY_1),
+		'@' => shifted(KeyCode::KEY_2),
+		'#' => shifted(KeyCode::KEY_3),
+		'$' => shifted(KeyCode::KEY_4),
+		'%' => shifted(KeyCode::KEY_5),
+		'^' => shifted(KeyCode::KEY_6),
+		'&' => shifted(KeyCode::KEY_7),
+		'*' => shifted(KeyCode::KEY_8),
+		'(' => shifted(KeyCode::KEY_9),
+		')' => shifted(KeyCode::KEY_0),
+		'_' => shifted(KeyCode::KEY_MINUS),
+		'+' => shifted(KeyCode::KEY_EQUAL),
+		'{' => shifted(KeyCode::KEY_LEFTBRACE),
+		'}' => shifted(KeyCode::KEY_RIGHTBRACE),
+		'|' => shifted(KeyCode::KEY_BACKSLASH),
+		':' => shifted(KeyCode::KEY_SEMICOLON),
+		'"' => shifted(KeyCode::KEY_APOSTROPHE),
+		'~' => shifted(KeyCode::KEY_GRAVE),
+		'<' => shifted(KeyCode::KEY_COMMA),
+		'>' => shifted(KeyCode::KEY_DOT),
+		'?' => shifted(KeyCode::KEY_SLASH),
 		_ => None,
 	}
 }
@@ -481,12 +489,12 @@ mod tests {
 		assert_eq!(map.len(), 15);
 		assert!(map
 			.iter()
-			.any(|(b, k)| *b == button::A && *k == evdev::Key::BTN_SOUTH));
+			.any(|(b, k)| *b == button::A && *k == evdev::KeyCode::BTN_SOUTH));
 		assert!(map
 			.iter()
-			.any(|(b, k)| *b == button::START && *k == evdev::Key::BTN_START));
+			.any(|(b, k)| *b == button::START && *k == evdev::KeyCode::BTN_START));
 		assert!(map
 			.iter()
-			.any(|(b, k)| *b == button::DPAD_UP && *k == evdev::Key::BTN_DPAD_UP));
+			.any(|(b, k)| *b == button::DPAD_UP && *k == evdev::KeyCode::BTN_DPAD_UP));
 	}
 }

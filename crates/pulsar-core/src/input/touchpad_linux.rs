@@ -29,7 +29,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use evdev::{AbsoluteAxisType, Device, EventType, InputEventKind, Key};
+use evdev::{AbsoluteAxisCode, Device, EventSummary, EventType, KeyCode};
 
 use crate::input::touch_to_delta;
 use crate::service::InputEvent;
@@ -100,10 +100,10 @@ fn find_touchpad() -> Option<Device> {
 			// causing finger_down to never be set (no BTN_TOUCH events).
 			let is_touchpad_node = dev
 				.supported_absolute_axes()
-				.map_or(false, |a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_X))
+				.map_or(false, |a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X))
 				&& dev
 					.supported_keys()
-					.map_or(false, |k| k.contains(Key::BTN_TOUCH));
+					.map_or(false, |k| k.contains(KeyCode::BTN_TOUCH));
 			if is_touchpad_node {
 				return Some(dev);
 			}
@@ -188,23 +188,23 @@ pub fn spawn_touchpad_reader(
 				if !running.load(Ordering::SeqCst) {
 					break 'outer;
 				}
-				match ev.kind() {
+				match ev.destructure() {
 					// Finger position (multi-touch slot 0; we track one finger).
-					InputEventKind::AbsAxis(AbsoluteAxisType::ABS_MT_POSITION_X) => {
+					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, _) => {
 						cur_x = Some(ev.value());
 					}
-					InputEventKind::AbsAxis(AbsoluteAxisType::ABS_MT_POSITION_Y) => {
+					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_Y, _) => {
 						cur_y = Some(ev.value());
 					}
 					// Fall back to single-touch ABS_X / ABS_Y.
-					InputEventKind::AbsAxis(AbsoluteAxisType::ABS_X) => {
+					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, _) => {
 						cur_x = cur_x.or(Some(ev.value()));
 					}
-					InputEventKind::AbsAxis(AbsoluteAxisType::ABS_Y) => {
+					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, _) => {
 						cur_y = cur_y.or(Some(ev.value()));
 					}
 					// BTN_TOUCH: finger placed / lifted.
-					InputEventKind::Key(Key::BTN_TOUCH) => {
+					EventSummary::Key(_, KeyCode::BTN_TOUCH, _) => {
 						if ev.value() == 0 {
 							// Lift — reset tracking so there's no jump on the next touch.
 							finger_down = false;
@@ -214,7 +214,7 @@ pub fn spawn_touchpad_reader(
 						}
 					}
 					// BTN_LEFT (physical click pad) → left mouse button.
-					InputEventKind::Key(Key::BTN_LEFT) => {
+					EventSummary::Key(_, KeyCode::BTN_LEFT, _) => {
 						let down = ev.value() != 0;
 							held_left = down;
 							if !active {
@@ -226,7 +226,7 @@ pub fn spawn_touchpad_reader(
 						});
 					}
 					// EV_SYN / SYN_REPORT: commit the accumulated position.
-					InputEventKind::Synchronization(_) => {
+					EventSummary::Synchronization(..) => {
 						if finger_down {
 							if let (Some(x), Some(y)) = (cur_x, cur_y) {
 								if active {

@@ -12,7 +12,7 @@ fn main() {
 	eprintln!("watching {path}…");
 	loop {
 		for ev in dev.fetch_events().expect("fetch") {
-			if let evdev::InputEventKind::Key(k) = ev.kind() {
+			if let evdev::EventSummary::Key(_, k, _) = ev.destructure() {
 				let c = k.code();
 				if (272..=274).contains(&c) {
 					println!(

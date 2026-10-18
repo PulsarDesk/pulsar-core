@@ -90,15 +90,15 @@ enum Msg {
 /// is brute-forceable for a host left online with a static OTP (see the host-side
 /// global-failure rotation in `src-tauri/src/auth.rs`).
 pub fn gen_password() -> String {
-	use rand::Rng;
+	use rand::RngExt;
 	const CS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-	let mut rng = rand::thread_rng();
+	let mut rng = rand::rng();
 	let mut s = String::with_capacity(9);
 	for i in 0..8 {
 		if i == 4 {
 			s.push('-');
 		}
-		s.push(CS[rng.gen_range(0..CS.len())] as char);
+		s.push(CS[rng.random_range(0..CS.len())] as char);
 	}
 	s
 }

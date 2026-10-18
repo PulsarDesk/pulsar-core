@@ -17,9 +17,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
-use ashpd::WindowIdentifier;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
@@ -43,7 +42,7 @@ pub const ENCODER_NAME: &str = "venc";
 pub struct WaylandCapture {
 	pipeline: gst::Pipeline,
 	venc: Option<gst::Element>,
-	session: Option<Session<'static, Screencast<'static>>>,
+	session: Option<Session<Screencast>>,
 	_pw_fd: OwnedFd,
 	/// Set when the bus reported an error / EOS (the pipeline is dead).
 	dead: Arc<AtomicBool>,
@@ -129,7 +128,7 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 }
 
 /// Closes the portal session if `start` bails out before the capture owns it.
-struct SessionCloseGuard(Option<Session<'static, Screencast<'static>>>);
+struct SessionCloseGuard(Option<Session<Screencast>>);
 
 impl Drop for SessionCloseGuard {
 	fn drop(&mut self) {
@@ -194,23 +193,24 @@ pub async fn start(
 async fn open_portal(
 	restore_token: Option<String>,
 ) -> anyhow::Result<(SessionCloseGuard, u32, OwnedFd, Option<String>)> {
-	let proxy: Screencast<'static> = Screencast::new().await?;
-	let session: Session<'static, Screencast<'static>> = proxy.create_session().await?;
+	let proxy: Screencast = Screencast::new().await?;
+	let session: Session<Screencast> = proxy.create_session(Default::default()).await?;
 	let guard = SessionCloseGuard(Some(session));
 	let (node_id, pw_fd, token) = async {
 		let session = guard.0.as_ref().expect("session present");
 		proxy
 			.select_sources(
 				session,
-				CursorMode::Embedded,
-				SourceType::Monitor | SourceType::Window,
-				false,
-				restore_token.as_deref(),
-				PersistMode::Application,
+				SelectSourcesOptions::default()
+					.set_cursor_mode(CursorMode::Embedded)
+					.set_sources(SourceType::Monitor | SourceType::Window)
+					.set_multiple(false)
+					.set_restore_token(restore_token.as_deref())
+					.set_persist_mode(PersistMode::Application),
 			)
 			.await?;
 		let response = proxy
-			.start(session, &WindowIdentifier::default())
+			.start(session, None, Default::default())
 			.await?
 			.response()?;
 		let stream = response
@@ -220,7 +220,9 @@ async fn open_portal(
 		let node_id = stream.pipe_wire_node_id();
 		let token = response.restore_token().map(|s| s.to_string());
 
-		let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(session).await?;
+		let pw_fd: OwnedFd = proxy
+			.open_pipe_wire_remote(session, Default::default())
+			.await?;
 		clear_cloexec(pw_fd.as_raw_fd())?;
 		Ok::<_, anyhow::Error>((node_id, pw_fd, token))
 	}

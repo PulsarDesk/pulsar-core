@@ -41,16 +41,12 @@ const ANNOUNCE_VERSION: u16 = 1;
 /// used as the device's identity — especially relay-less, where there's no id to
 /// show. Falls back to the login name, then a generic label.
 pub fn os_display_name() -> String {
-	let real = whoami::realname();
-	if !real.trim().is_empty() {
-		return real;
-	}
-	let user = whoami::username();
-	if user.trim().is_empty() {
-		"Pulsar".to_string()
-	} else {
-		user
-	}
+	// whoami 2 returns `Result`s (1.x silently substituted "Unknown" on error); an error
+	// now falls through to the next candidate like an empty name does.
+	let non_empty = |s: whoami::Result<String>| s.ok().filter(|s| !s.trim().is_empty());
+	non_empty(whoami::realname())
+		.or_else(|| non_empty(whoami::username()))
+		.unwrap_or_else(|| "Pulsar".to_string())
 }
 
 /// The beacon payload, bincode-encoded into one datagram.

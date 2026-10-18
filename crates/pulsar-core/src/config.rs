@@ -322,7 +322,7 @@ fn default_device_name() -> String {
 	// `$HOSTNAME` is normally unset on Windows (the name lives in COMPUTERNAME) and
 	// often unexported to GUI sessions on Linux, so reading it gave the generic
 	// placeholder on most fresh installs.
-	whoami::fallible::hostname()
+	whoami::hostname()
 		.ok()
 		.filter(|h| !h.trim().is_empty())
 		.unwrap_or_else(|| "Pulsar Cihazı".to_string())

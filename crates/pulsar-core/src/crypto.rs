@@ -22,10 +22,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -34,7 +35,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// send it alongside the static public key.
 pub fn random_salt() -> [u8; 32] {
 	let mut salt = [0u8; 32];
-	OsRng.fill_bytes(&mut salt);
+	// The OS CSPRNG, panicking on failure (as rand 0.8's `OsRng` did).
+	UnwrapErr(SysRng).fill_bytes(&mut salt);
 	salt
 }
 
@@ -65,7 +67,7 @@ pub struct Identity {
 impl Identity {
 	/// Generate a fresh random identity.
 	pub fn generate() -> Self {
-		let secret = StaticSecret::random_from_rng(OsRng);
+		let secret = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
 		let public = PublicKey::from(&secret);
 		Self { secret, public }
 	}
@@ -172,7 +174,7 @@ fn derive_key(
 	h.update(hi_salt);
 	h.update(session_id.to_be_bytes());
 	let digest = h.finalize();
-	*Key::from_slice(digest.as_slice())
+	Key::try_from(digest.as_slice()).expect("SHA-256 digest is 32 bytes")
 }
 
 /// RFC 6479-style sliding-window anti-replay over the per-direction receive
@@ -314,7 +316,7 @@ impl Session {
 		let mut n = [0u8; 12];
 		n[0] = dir;
 		n[4..12].copy_from_slice(&seq.to_be_bytes());
-		*Nonce::from_slice(&n)
+		Nonce::from(n)
 	}
 
 	fn send_dir(&self) -> u8 {
@@ -582,6 +584,159 @@ mod tests {
 		// A bad/short file falls back to a fresh identity rather than panicking.
 		std::fs::write(&path, b"too short").unwrap();
 		let _ = Identity::load_or_create(&path); // must not panic
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	// ── Known-answer tests ────────────────────────────────────────────────────────
+	// Pin the exact bytes of the X25519 / KDF / AEAD / identity-file path so a
+	// dependency bump (x25519-dalek, chacha20poly1305, sha2, rand) can never silently
+	// change the wire crypto: an upgraded peer must still interoperate with an old one
+	// and an existing `identity.key` must load to the same identity. The expected
+	// values were computed with x25519-dalek 2 / chacha20poly1305 0.10 / sha2 0.10 and
+	// cross-checked against an independent implementation (Python `cryptography`).
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	const KAT_SECRET_A: [u8; 32] = [0x11; 32];
+	const KAT_SECRET_B: [u8; 32] = [0x22; 32];
+	const KAT_SALT_A: [u8; 32] = [0xA5; 32];
+	const KAT_SALT_B: [u8; 32] = [0x5A; 32];
+	const KAT_SESSION_ID: u64 = 0x0123_4567_89ab_cdef;
+	const KAT_PUB_A: &str = "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13";
+	const KAT_PUB_B: &str = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20";
+	const KAT_SHARED: &str = "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056";
+	const KAT_KEY: &str = "5ddb0a32c36cc8f88b323eca098eb941ed2b10cdc16e6de26499be6d28e39b51";
+	// `seal` of the fixed plaintext at the fixed seq, per direction (ciphertext || 16-byte tag).
+	const KAT_CT_INIT: &str =
+		"5fd20575a641b12ea8c640c3f665bc227a472267bdf9f48f07511119e74d66f39c1fe7239960341861cee0104f";
+	const KAT_CT_RESP: &str =
+		"a8d8625134c87361d4e1fbb73e28d00a6846c763cec28e3af999a949a5ce5af08b0baa1b247296951aaa04d568";
+
+	#[test]
+	fn kat_x25519_public_key() {
+		let a = Identity::from_secret_bytes(KAT_SECRET_A);
+		let b = Identity::from_secret_bytes(KAT_SECRET_B);
+		assert_eq!(hex(&a.public_bytes()), KAT_PUB_A);
+		assert_eq!(hex(&b.public_bytes()), KAT_PUB_B);
+		// RFC 7748 §6.1 vector, independent of our fixed secrets.
+		let alice = Identity::from_secret_bytes([
+			0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+			0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+			0x1d, 0xb9, 0x2c, 0x2a,
+		]);
+		assert_eq!(
+			hex(&alice.public_bytes()),
+			"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+		);
+	}
+
+	#[test]
+	fn kat_x25519_shared_secret() {
+		let a = Identity::from_secret_bytes(KAT_SECRET_A);
+		let b = Identity::from_secret_bytes(KAT_SECRET_B);
+		let ab = a.secret.diffie_hellman(&PublicKey::from(b.public_bytes()));
+		let ba = b.secret.diffie_hellman(&PublicKey::from(a.public_bytes()));
+		assert_eq!(ab.as_bytes(), ba.as_bytes());
+		assert_eq!(hex(ab.as_bytes()), KAT_SHARED);
+	}
+
+	#[test]
+	fn kat_session_key_derivation() {
+		let a = Identity::from_secret_bytes(KAT_SECRET_A);
+		let b = Identity::from_secret_bytes(KAT_SECRET_B);
+		let shared = a.secret.diffie_hellman(&PublicKey::from(b.public_bytes()));
+		let key = derive_key(
+			a.public_bytes(),
+			b.public_bytes(),
+			shared.as_bytes(),
+			KAT_SESSION_ID,
+			KAT_SALT_A,
+			KAT_SALT_B,
+		);
+		assert_eq!(hex(key.as_slice()), KAT_KEY);
+		// Role-independent: the peer's view (args swapped) derives the same key.
+		let key_b = derive_key(
+			b.public_bytes(),
+			a.public_bytes(),
+			shared.as_bytes(),
+			KAT_SESSION_ID,
+			KAT_SALT_B,
+			KAT_SALT_A,
+		);
+		assert_eq!(key, key_b);
+	}
+
+	#[test]
+	fn kat_sha256() {
+		// FIPS 180-2 "abc" vector — guards the sha2 bump independently of our KDF.
+		assert_eq!(
+			hex(Sha256::digest(b"abc").as_slice()),
+			"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+		);
+	}
+
+	#[test]
+	fn kat_seal_ciphertext() {
+		let a = Identity::from_secret_bytes(KAT_SECRET_A);
+		let b = Identity::from_secret_bytes(KAT_SECRET_B);
+		let init = a.session(
+			b.public_bytes(),
+			Role::Initiator,
+			KAT_SESSION_ID,
+			KAT_SALT_A,
+			KAT_SALT_B,
+		);
+		let resp = b.session(
+			a.public_bytes(),
+			Role::Responder,
+			KAT_SESSION_ID,
+			KAT_SALT_B,
+			KAT_SALT_A,
+		);
+		// Nonce layout: [dir, 0, 0, 0, seq_be(8)].
+		assert_eq!(
+			hex(Session::nonce(1, 0x0102_0304_0506_0708).as_slice()),
+			"010000000102030405060708"
+		);
+		let seq = 0x0000_0001_0000_002a;
+		// Initiator → responder (direction byte 0).
+		let ct_i = init.seal(seq, b"pulsar known-answer plaintext");
+		assert_eq!(hex(&ct_i), KAT_CT_INIT);
+		// Responder → initiator (direction byte 1): same key + seq, different nonce.
+		let ct_r = resp.seal(seq, b"pulsar known-answer plaintext");
+		assert_eq!(hex(&ct_r), KAT_CT_RESP);
+		assert_eq!(
+			resp.open(seq, &ct_i).unwrap(),
+			b"pulsar known-answer plaintext"
+		);
+		assert_eq!(
+			init.open(seq, &ct_r).unwrap(),
+			b"pulsar known-answer plaintext"
+		);
+	}
+
+	#[test]
+	fn kat_identity_file_round_trip() {
+		let dir = std::env::temp_dir().join(format!("pulsar-id-kat-{}", std::process::id()));
+		let path = dir.join("identity.key");
+		std::fs::create_dir_all(&dir).unwrap();
+		// A pre-existing identity file (as an older build wrote it: 32 raw secret bytes).
+		std::fs::write(&path, KAT_SECRET_A).unwrap();
+		let id = Identity::load_or_create(&path);
+		assert_eq!(id.secret_bytes(), KAT_SECRET_A);
+		assert_eq!(hex(&id.public_bytes()), KAT_PUB_A);
+		// Loading must not rewrite the file.
+		assert_eq!(std::fs::read(&path).unwrap(), KAT_SECRET_A);
+		// A freshly created file holds exactly the identity's secret bytes and reloads to it.
+		std::fs::remove_file(&path).unwrap();
+		let fresh = Identity::load_or_create(&path);
+		assert_eq!(std::fs::read(&path).unwrap(), fresh.secret_bytes());
+		assert_eq!(
+			Identity::load_or_create(&path).public_bytes(),
+			fresh.public_bytes()
+		);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
