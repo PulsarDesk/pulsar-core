@@ -38,7 +38,15 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
 - `capture.rs` — **Linux-only** (`cfg`): Wayland XDG ScreenCast portal →
   PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
   `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev
-  headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
+  headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`). If the in-process
+  GStreamer lacks an element of the pipeline, the same description runs under the system
+  `gst-launch-1.0` (fd inherited; no live controls, `is_in_process() == false`);
+  `use_system_gst_env` strips an AppImage's bundled-GStreamer env (incl. `$APPDIR` entries of
+  `LD_LIBRARY_PATH`/`PATH` — else the "system" tool is, or loads, the bundled one) from such children.
+  `start(.., system_gst)` forces that child (caller validated the encoder only on the
+  system gst). `self_check(fragment)` = headless in-process encode test (desktop `--selftest`).
+  gst VA-API = two families, one wire id `vaapi`: `Vaapi` (gstreamer-vaapi, `vaapih264enc`)
+  and `Va` (gst-plugins-bad `va`, `vah264enc`, what gst ≥1.26 distros ship).
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks.

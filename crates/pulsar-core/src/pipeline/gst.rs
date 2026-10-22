@@ -21,8 +21,12 @@ use crate::service::LossRecovery;
 pub enum GstEncoder {
 	/// Rockchip MPP (RK3588-class SBCs): `mpph264enc` / `mpph265enc`.
 	Mpp,
-	/// VA-API plugins (Intel/AMD on Linux): `vaapih264enc` / `vaapih265enc`.
+	/// gstreamer-vaapi plugins (Intel/AMD on Linux): `vaapih264enc` / `vaapih265enc`.
 	Vaapi,
+	/// The `va` plugin from gst-plugins-bad (`vah264enc` / `vah265enc`, 1.22+): what newer
+	/// distros ship instead of gstreamer-vaapi (dropped upstream in 1.26). Same wire id as
+	/// [`Self::Vaapi`] — one VA-API entry in the UI, served by whichever plugin is present.
+	Va,
 	/// NVIDIA NVENC plugins: `nvh264enc` / `nvh265enc`.
 	Nv,
 	/// Software x264 (always buildable; H.264 only).
@@ -31,7 +35,7 @@ pub enum GstEncoder {
 
 impl GstEncoder {
 	/// Hardware-first probe/selection order, terminal software last.
-	pub const PRIORITY: [GstEncoder; 4] = [Self::Mpp, Self::Vaapi, Self::Nv, Self::X264];
+	pub const PRIORITY: [GstEncoder; 5] = [Self::Mpp, Self::Vaapi, Self::Va, Self::Nv, Self::X264];
 
 	/// The gst element name for a codec, or `None` if this family can't emit it.
 	pub fn element(self, codec: VCodec) -> Option<&'static str> {
@@ -40,6 +44,8 @@ impl GstEncoder {
 			(Self::Mpp, VCodec::H265) => "mpph265enc",
 			(Self::Vaapi, VCodec::H264) => "vaapih264enc",
 			(Self::Vaapi, VCodec::H265) => "vaapih265enc",
+			(Self::Va, VCodec::H264) => "vah264enc",
+			(Self::Va, VCodec::H265) => "vah265enc",
 			(Self::Nv, VCodec::H264) => "nvh264enc",
 			(Self::Nv, VCodec::H265) => "nvh265enc",
 			(Self::X264, VCodec::H264) => "x264enc",
@@ -60,7 +66,7 @@ impl GstEncoder {
 	pub fn wire_id(self) -> &'static str {
 		match self {
 			Self::Mpp => "rkmpp",
-			Self::Vaapi => "vaapi",
+			Self::Vaapi | Self::Va => "vaapi",
 			Self::Nv => "nvenc",
 			Self::X264 => "software",
 		}
@@ -69,7 +75,7 @@ impl GstEncoder {
 	pub fn label(self) -> &'static str {
 		match self {
 			Self::Mpp => "Rockchip MPP",
-			Self::Vaapi => "VA-API",
+			Self::Vaapi | Self::Va => "VA-API",
 			Self::Nv => "NVIDIA NVENC",
 			Self::X264 => "Yazılım (CPU)",
 		}
@@ -77,6 +83,8 @@ impl GstEncoder {
 }
 
 /// Map a wire/UI encoder id to the gst family that serves it (None = no gst analog).
+/// "vaapi" maps to [`GstEncoder::Vaapi`]; match on [`GstEncoder::wire_id`] to also accept
+/// [`GstEncoder::Va`].
 pub fn from_wire_id(id: &str) -> Option<GstEncoder> {
 	match id {
 		"rkmpp" => Some(GstEncoder::Mpp),
@@ -132,6 +140,11 @@ pub fn encoder_fragment_with(
 		// vaapih26Xenc: bitrate in kbit/s; CBR; keyframe-period analog of key-int.
 		GstEncoder::Vaapi => format!(
 			"{element} name=venc rate-control=cbr bitrate={bitrate_kbps} keyframe-period={key_int}"
+		),
+		// vah26Xenc: bitrate in kbit/s (live-changeable); CBR; key-int-max; no B-frames.
+		// Verified on an AMD Cezanne iGPU (Mesa radeonsi, gst 1.28).
+		GstEncoder::Va => format!(
+			"{element} name=venc rate-control=cbr bitrate={bitrate_kbps} key-int-max={key_int} b-frames=0"
 		),
 		// nvh26Xenc: bitrate in kbit/s; zerolatency preset + CBR; gop-size.
 		GstEncoder::Nv => format!(

@@ -525,6 +525,16 @@ fn gst_fragment_mpp_h265_matches_verified_pi_pipeline() {
 }
 
 #[test]
+fn gst_fragment_va_matches_verified_pipeline() {
+	// Property names verified live on an AMD Cezanne iGPU (gst 1.28 `va` plugin, Mesa).
+	let f = gst::encoder_fragment(gst::GstEncoder::Va, VCodec::H265, 8000, 60).unwrap();
+	assert!(f.contains("vah265enc name=venc rate-control=cbr bitrate=8000 key-int-max=60 b-frames=0"));
+	assert!(f.contains("h265parse"));
+	// One UI/wire entry for both VA-API plugins.
+	assert_eq!(gst::GstEncoder::Va.wire_id(), gst::GstEncoder::Vaapi.wire_id());
+}
+
+#[test]
 fn gst_fragment_rejects_impossible_pairs() {
 	// Software HEVC stays off (same policy as the ffmpeg path); no AV1 elements modeled.
 	assert!(gst::encoder_fragment(gst::GstEncoder::X264, VCodec::H265, 8000, 60).is_none());
