@@ -5,7 +5,7 @@
 <h1 align="center">Pulsar Core</h1>
 
 <p align="center">
-  The shared engine behind the Pulsar desktop and mobile apps. 🧩
+  The shared engine behind Pulsar, the free TeamViewer and Parsec alternative. 🧩
 </p>
 
 <p align="center">
