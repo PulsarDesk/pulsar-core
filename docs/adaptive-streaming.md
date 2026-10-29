@@ -247,6 +247,32 @@ General → Open log folder). Log lines to read: client `adaptive controller see
 step` / `abr fast step` / `abr window` (debug), `renderer loss hold`; host `client stats`,
 `fec parity group size`. Env pins: `PULSAR_MAXDELAY` (µs) disables the live reorder wait.
 
+### 2026-10-29 fix — host-bound queues (local, NOT pushed, awaiting the maintainer's test)
+
+Evidence (client log, this Linux desktop → a friend's host with `encoders=["software"]`,
+clean P2P, RTT 33 ms, 0 % loss): the stream asked for **1080p120** (the client's 120 Hz
+panel); the host's x264 couldn't keep up, its frames queued, and the controller read the
+queue as congestion — delay overuse / RTT bloat cut after cut, every cut also lowering the
+ceiling, down to ~400 kbit **at 1080p120** (1 fps on screen) with no way back (+10 % per
+≥ 60 s clean). The next session started at the floor from the poisoned per-peer hint.
+
+Changes (`controller.rs`, `ladder.rs`; desktop `play.rs`):
+- Only the first queue-driven cut of a run lowers the ceiling. A queue that survives
+  `HOST_BOUND_CUTS` (3) cuts in a row is host-side → step to a lighter point (fewer
+  pixels × fps, never more fps), cap the ladder there, retry the heavier one after
+  `POINT_RETRY_WINDOWS` (5 min) clean, doubling up to 40 min. 2 windows of drain grace after
+  the step.
+- Climb at the startup pace (×1.5 per 2 clean windows) while the target is under half the
+  ceiling.
+- Ladder: a > 60 fps native gets a 60 fps rung; > 60 fps minimums grow +50 % per extra
+  60 fps (1080p120 = 12 Mbit, was 15.9 → never reachable under the 15 Mbit default cap).
+- Desktop: the **ladder is ON** (reverses the 2026-09-03 "bitrate-only" decision, at the
+  maintainer's request); a software-only host starts at ≤ 60 fps; the per-peer hint never
+  seeds under 2 Mbit; the first request carries the controller's start point.
+- Tests: `host_that_cannot_encode_1080p120_steps_fps_down_instead_of_starving_the_rate`,
+  `a_burst_of_queue_cuts_lowers_the_ceiling_once_and_the_rate_climbs_back_fast`,
+  `host_bound_step_respects_a_pinned_point`, `native_120_gets_a_60_fps_rung_under_it`.
+
 ### Phase 1 — the operating-point ladder (the heart of "cam gibi minimum")
 
 | # | Task |

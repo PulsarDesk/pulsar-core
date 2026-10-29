@@ -22,6 +22,14 @@
 //!   Climbing back to the ceiling is free (after 20 s clean), going past it is a probe
 //!   allowed only after 60 s clean at the ceiling; every failed probe doubles that wait.
 //! * **Startup fast.** For the first `startup_windows` a clean window climbs ×1.5 at once.
+//!   The same pace (×1.5 per 2 clean windows) applies whenever the target sits under half
+//!   the ceiling — that gap is left by past cuts, not a probe past a known limit.
+//! * **Host-bound queues.** Only the first queue-driven cut (delay overuse / RTT bloat) of a
+//!   run lowers the ceiling. When the queue persists through `HOST_BOUND_CUTS` cuts in a
+//!   row the bitrate is not what fills it — the host can't encode/send this point in real
+//!   time (a software encoder at 1080p120): step to a lighter point (fewer pixels × fps)
+//!   instead of starving the encoder, and don't climb back above it until a long clean
+//!   stretch (`POINT_RETRY_WINDOWS`, doubling on each repeat).
 //!
 //! Ladder rules: pick the highest point whose minimum fits `target × 0.85`; go **down** as
 //! soon as the target is under the current point's minimum (resolution changes restart an
@@ -80,6 +88,15 @@ pub const POINT_DEBOUNCE: u32 = 2;
 pub const FAST_OVERUSE_MS: f64 = 500.0;
 /// Fast reflex: at most one cut per this many ms.
 pub const FAST_COOLDOWN_MS: f64 = 1500.0;
+/// Queue-driven cuts in a row (no calm window between) after which the queue is judged
+/// host-side: the ladder steps to a lighter point instead of cutting the rate again.
+pub const HOST_BOUND_CUTS: u32 = 3;
+/// Clean windows at a host-bound point before the heavier one is tried again (5 min).
+pub const POINT_RETRY_WINDOWS: u32 = 150;
+/// Upper bound of the doubling point-retry wait (40 min).
+pub const POINT_RETRY_MAX: u32 = 1200;
+/// Under this share of the ceiling the climb runs at the startup pace.
+pub const FAST_CLIMB_SHARE: f32 = 0.5;
 
 /// One window's measurements.
 #[derive(Clone, Debug, Default)]
@@ -213,6 +230,15 @@ pub struct Controller {
 	point_age: u32,
 	clean_at_point: u32,
 	manual_point: bool,
+	/// Queue-driven cuts since the last calm window.
+	queue_cuts: u32,
+	/// The heaviest point the host proved it can keep up with (index; 0 = no limit).
+	point_cap: usize,
+	/// Clean windows spent at `point_cap`, and the wait before retrying the next heavier one.
+	at_point_cap: u32,
+	point_retry: u32,
+	/// Windows left in which the host's queue drains after a host-bound step (no queue cuts).
+	drain_left: u32,
 	/// The encoder bitrate last decided (net of FEC).
 	encoder_kbps: u32,
 	/// FEC parity overhead currently observed on the wire (parity bytes / media bytes).
@@ -257,6 +283,11 @@ impl Controller {
 			point_age: POINT_DEBOUNCE,
 			clean_at_point: 0,
 			manual_point: !cfg.ladder,
+			queue_cuts: 0,
+			point_cap: 0,
+			at_point_cap: 0,
+			point_retry: 0,
+			drain_left: 0,
 			encoder_kbps: 0,
 			fec_overhead: 0.0,
 			delay: Trendline::new(),
@@ -351,7 +382,7 @@ impl Controller {
 	pub fn set_manual_point(&mut self, manual: bool) {
 		self.manual_point = manual;
 		if !manual {
-			self.point_idx = ladder::pick(&self.points, self.target, POINT_MARGIN);
+			self.point_idx = ladder::pick(&self.points, self.target, POINT_MARGIN).max(self.point_cap);
 			self.point_age = 0;
 		}
 	}
@@ -367,14 +398,14 @@ impl Controller {
 		if self.delay.overuse_ms(now_ms) < FAST_OVERUSE_MS
 			|| now_ms - self.last_fast_cut_ms < FAST_COOLDOWN_MS
 			|| self.target <= FLOOR_KBPS
+			|| self.drain_left > 0
 		{
 			return None;
 		}
 		self.last_fast_cut_ms = now_ms;
 		let before = self.target;
-		self.punish(before);
 		let mut d = Decision { reason: "delay overuse (fast) → ×0.85", ..Default::default() };
-		self.apply_rate(before * 85 / 100, &mut d);
+		self.queue_cut(before, before * 85 / 100, &mut d);
 		self.apply_ladder(&mut d, true);
 		Some(d)
 	}
@@ -458,21 +489,24 @@ impl Controller {
 		let queued = !draining && (excess >= RTT_OK_MS || delay == DelayState::Overuse);
 
 		// Delay first: the gradient says a queue is filling.
-		if delay == DelayState::Overuse && self.target > FLOOR_KBPS && self.since_step >= 1 {
+		let draining_host = self.drain_left > 0;
+		if delay == DelayState::Overuse && self.target > FLOOR_KBPS && self.since_step >= 1 && !draining_host {
 			let before = self.target;
-			self.punish(before);
-			self.apply_rate(before * 85 / 100, &mut out);
 			out.reason = "delay overuse → ×0.85";
+			self.queue_cut(before, before * 85 / 100, &mut out);
 			return self.finish(out);
 		}
 		// Keepalive RTT over its baseline (and still over it at the end of the window).
-		if excess >= RTT_EXCESS_MS && !draining && self.target > FLOOR_KBPS && self.since_step >= 1 {
+		if excess >= RTT_EXCESS_MS && !draining && !draining_host && self.target > FLOOR_KBPS && self.since_step >= 1 {
 			let before = self.target;
 			let cut = if excess >= RTT_BAD_MS { before / 2 } else { before * 7 / 10 };
-			self.punish(before);
-			self.apply_rate(cut, &mut out);
 			out.reason = if excess >= RTT_BAD_MS { "rtt bloat severe → halve" } else { "rtt bloat → ×0.7" };
+			self.queue_cut(before, cut, &mut out);
 			return self.finish(out);
+		}
+		// No queue-driven cut this window: the run (if any) is over.
+		if !queued {
+			self.queue_cuts = 0;
 		}
 		// Severe raw loss.
 		if total > 100 && loss > LOSS_SEVERE && self.target > FLOOR_KBPS {
@@ -516,15 +550,36 @@ impl Controller {
 			if self.clean_at_target >= LAST_GOOD_WINDOWS {
 				self.last_good = self.target;
 			}
+			// A long clean stretch at the host-bound point: let the ladder try one heavier rung.
+			if self.point_cap > 0 && self.point_idx == self.point_cap {
+				self.at_point_cap += 1;
+				if self.at_point_cap >= self.point_retry {
+					self.at_point_cap = 0;
+					self.point_cap -= 1;
+				}
+			}
 			if self.target < self.ceiling {
 				self.clean += 1;
 				self.at_ceiling = 0;
-				let (need, factor) = if self.startup_left > 0 { (1, 1.5) } else { (CLEAN_WINDOWS_UP, 1.25) };
+				let far = (self.target as f32) < self.ceiling as f32 * FAST_CLIMB_SHARE;
+				let (need, factor) = if self.startup_left > 0 {
+					(1, 1.5)
+				} else if far {
+					(2, 1.5)
+				} else {
+					(CLEAN_WINDOWS_UP, 1.25)
+				};
 				if self.clean >= need {
 					self.clean = 0;
 					let next = ((self.target as f64 * factor) as u32).min(self.ceiling);
 					self.apply_rate(next, &mut out);
-					out.reason = if self.startup_left > 0 { "startup probe ×1.5" } else { "clean → climb toward ceiling" };
+					out.reason = if self.startup_left > 0 {
+						"startup probe ×1.5"
+					} else if far {
+						"clean, far under the ceiling → fast climb ×1.5"
+					} else {
+						"clean → climb toward ceiling"
+					};
 				}
 			} else {
 				self.clean = 0;
@@ -563,6 +618,7 @@ impl Controller {
 
 	fn finish(&mut self, mut out: Decision) -> Decision {
 		self.startup_left = self.startup_left.saturating_sub(1);
+		self.drain_left = self.drain_left.saturating_sub(1);
 		self.apply_ladder(&mut out, false);
 		// The encoder share may change with FEC even when the target holds.
 		let enc = self.encoder_rate();
@@ -623,6 +679,56 @@ impl Controller {
 		(self.rtt_ema, excess, jitter)
 	}
 
+	/// A queue-driven cut (delay overuse / RTT bloat) from `before` to `to`. Only the first
+	/// cut of a run lowers the ceiling; once the queue has survived `HOST_BOUND_CUTS` cuts in
+	/// a row it is the host that can't keep up, so the ladder steps to a lighter point and
+	/// the rate is left alone.
+	fn queue_cut(&mut self, before: u32, to: u32, out: &mut Decision) {
+		self.queue_cuts += 1;
+		if self.queue_cuts >= HOST_BOUND_CUTS && self.step_down_host_bound(out) {
+			self.queue_cuts = 0;
+			return;
+		}
+		let ceiling = self.ceiling;
+		self.punish(before);
+		if self.queue_cuts > 1 {
+			self.ceiling = self.ceiling.max(ceiling);
+		}
+		self.apply_rate(to, out);
+	}
+
+	/// Move to the best rung that costs the host less (fewer pixels × fps, never more fps)
+	/// and cap the ladder there. `false` when pinned or already on the lightest rung.
+	fn step_down_host_bound(&mut self, out: &mut Decision) -> bool {
+		if self.manual_point {
+			return false;
+		}
+		let load = |p: &Point| p.width as u64 * p.height as u64 * p.fps as u64;
+		let cur = self.points[self.point_idx];
+		let Some(next) = (self.point_idx + 1..self.points.len())
+			.find(|&i| load(&self.points[i]) < load(&cur) && self.points[i].fps <= cur.fps)
+		else {
+			return false;
+		};
+		self.point_retry = if self.point_retry == 0 {
+			POINT_RETRY_WINDOWS
+		} else {
+			(self.point_retry * 2).min(POINT_RETRY_MAX)
+		};
+		self.point_idx = next;
+		self.point_cap = next;
+		self.at_point_cap = 0;
+		self.point_age = 0;
+		self.clean_at_point = 0;
+		self.since_step = 0;
+		self.startup_left = 0;
+		// The queue the heavier point built takes a moment to drain: don't read it as a new one.
+		self.drain_left = 2;
+		out.point = Some(self.points[next]);
+		out.reason = "queue persists through rate cuts → host can't keep up, lighter point";
+		true
+	}
+
 	/// A rate produced loss/bloat: remember it as a punished ceiling and, if it was a probe,
 	/// double the wait before the next one.
 	fn punish(&mut self, bad_rate: u32) {
@@ -680,7 +786,7 @@ impl Controller {
 		// clearly allows it (a 20 Mbit path must not crawl up 20 s per rung).
 		if self.point_idx > 0 {
 			let need = if self.startup_left > 0 { 2 } else { CLEAN_WINDOWS_UP };
-			let want = ladder::pick(&self.points, target, 1.0 / UP_HEADROOM);
+			let want = ladder::pick(&self.points, target, 1.0 / UP_HEADROOM).max(self.point_cap);
 			if want < self.point_idx && self.clean_at_point >= need && self.point_age >= POINT_DEBOUNCE {
 				self.point_idx = want;
 				self.point_age = 0;
@@ -896,6 +1002,137 @@ mod tests {
 			c.tick(&win(1000, 0, 20.0));
 		}
 		assert!(c.target_kbps() <= 3000);
+	}
+
+	/// A host whose encoder sustains at most `max_load` pixels×fps per second, on a clean
+	/// path: over it every frame leaves later than the last (a growing host-side queue that
+	/// shows as delay overuse and RTT bloat at ANY bitrate); at or under it, flat. Runs one
+	/// 2 s window (with the fast reflex polled every 200 ms) and returns its decisions.
+	struct HostSim {
+		t_ms: f64,
+		frame: u64,
+		lag_ms: f64,
+	}
+	impl HostSim {
+		fn new() -> Self {
+			Self { t_ms: 0.0, frame: 0, lag_ms: 0.0 }
+		}
+		fn window(&mut self, c: &mut Controller, max_load: u64) -> Vec<Decision> {
+			let p = c.point();
+			let load = p.width as u64 * p.height as u64 * p.fps as u64;
+			let fps = p.fps.max(1) as f64;
+			let mut out = Vec::new();
+			let end = self.t_ms + 2000.0;
+			let mut next_poll = self.t_ms + 200.0;
+			while self.t_ms < end {
+				self.t_ms += 1000.0 / fps;
+				self.frame += 1;
+				if load > max_load {
+					self.lag_ms += 2.0;
+				} else {
+					self.lag_ms = (self.lag_ms - 8.0).max(0.0);
+				}
+				c.on_frame((self.t_ms * 90.0) as u32, self.t_ms + 20.0 + self.lag_ms);
+				if self.t_ms >= next_poll {
+					next_poll += 200.0;
+					if let Some(d) = c.poll_fast(self.t_ms) {
+						out.push(d);
+					}
+				}
+			}
+			let pkts = (c.encoder_kbps() / 8).max(50);
+			out.push(c.tick(&win(pkts, 0, 20.0 + self.lag_ms as f32)));
+			out
+		}
+	}
+
+	fn load(p: Point) -> u64 {
+		p.width as u64 * p.height as u64 * p.fps as u64
+	}
+
+	#[test]
+	fn host_that_cannot_encode_1080p120_steps_fps_down_instead_of_starving_the_rate() {
+		// The 2026-10-29 session: a software-encoding host asked for 1080p120 over a clean
+		// P2P path. The old controller read the host's queue as congestion and cut the rate
+		// to ~400 kbit at 1080p120 (1 fps on screen) and never climbed back.
+		let mut cfg = cfg(15_000, true);
+		cfg.native = (1920, 1080, 120);
+		let mut c = Controller::new(cfg);
+		assert_eq!(c.point().label(), "1080p120");
+		let limit = 1920 * 1080 * 60;
+		let mut sim = HostSim::new();
+		let mut relieved_at = None;
+		let mut over: Vec<u32> = Vec::new();
+		for w in 0..400u32 {
+			sim.window(&mut c, limit);
+			if load(c.point()) <= limit {
+				relieved_at.get_or_insert(w);
+			} else if relieved_at.is_some() {
+				over.push(w);
+			}
+		}
+		assert!(matches!(relieved_at, Some(w) if w <= 5), "relieved at {relieved_at:?}");
+		// A heavier point may be retried after a long clean stretch: each retry is a short
+		// excursion, and once one failed the next waits at least `POINT_RETRY_WINDOWS`.
+		let mut runs: Vec<(u32, u32)> = Vec::new();
+		for &w in &over {
+			match runs.last_mut() {
+				Some((_, end)) if w == *end + 1 => *end = w,
+				_ => runs.push((w, w)),
+			}
+		}
+		assert!(runs.iter().all(|(a, b)| b - a <= 2), "short excursions: {runs:?}");
+		assert!(runs.first().is_none_or(|(a, _)| *a >= 30), "no retry before a long clean stretch: {runs:?}");
+		for pair in runs.windows(2) {
+			assert!(pair[1].0 - pair[0].1 >= POINT_RETRY_WINDOWS, "retry wait: {runs:?}");
+		}
+		assert!(runs.len() <= 2, "the wait doubles: {runs:?}");
+		assert!(load(c.point()) <= limit && c.point().fps <= 120, "{}", c.point().label());
+		assert!(
+			c.target_kbps() >= c.point().min_kbps,
+			"the rate buys the point it settled on: {} @ {}",
+			c.target_kbps(),
+			c.point().label()
+		);
+	}
+
+	#[test]
+	fn a_burst_of_queue_cuts_lowers_the_ceiling_once_and_the_rate_climbs_back_fast() {
+		let mut c = Controller::new(Config::new(VCodec::H264, 15_000));
+		for _ in 0..5 {
+			c.tick(&win(1500, 0, 20.0));
+		}
+		// A transient queue: four bloated windows in a row.
+		for _ in 0..4 {
+			c.tick(&win(1500, 0, 160.0));
+		}
+		assert!(c.target_kbps() < 2000, "{}", c.target_kbps());
+		assert!(c.ceiling() >= 12_000, "only the first cut of the run punishes: {}", c.ceiling());
+		let mut back_at = None;
+		for w in 0..40 {
+			c.tick(&win(1500, 0, 20.0));
+			if back_at.is_none() && c.target_kbps() >= c.ceiling() / 2 {
+				back_at = Some(w);
+			}
+		}
+		// Fast to half the ceiling (startup pace), then the calm climb to the ceiling itself.
+		assert!(matches!(back_at, Some(w) if w <= 10), "{back_at:?}");
+		assert_eq!(c.target_kbps(), c.ceiling(), "back at the ceiling within 80 s");
+	}
+
+	#[test]
+	fn host_bound_step_respects_a_pinned_point() {
+		let mut cfg = cfg(15_000, true);
+		cfg.native = (1920, 1080, 120);
+		cfg.ladder = false;
+		let mut c = Controller::new(cfg);
+		let mut sim = HostSim::new();
+		for _ in 0..20 {
+			for d in sim.window(&mut c, 1920 * 1080 * 60) {
+				assert!(d.point.is_none(), "{d:?}");
+			}
+		}
+		assert_eq!(c.point().label(), "1080p120");
 	}
 
 	#[test]

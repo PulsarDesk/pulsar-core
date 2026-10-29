@@ -45,6 +45,12 @@ fn codec_factor(codec: VCodec) -> f32 {
 /// Minimum bitrate for an arbitrary `w × h @ fps` (H.264 baseline), by bits/pixel/s
 /// interpolated from the reference table: ~0.064 bpp at 60 fps, ~0.085 bpp at ≤ 30 fps.
 fn min_kbps_for(w: u32, h: u32, fps: u32) -> u32 {
+	// Above 60 fps consecutive frames differ less, so the bits grow far slower than the
+	// frame count: +50 % per extra 60 fps (1080p120 ≈ 12 Mbit, not twice 1080p60's 8).
+	if fps > 60 {
+		let at60 = min_kbps_for(w, h, 60) as f64;
+		return (at60 * (1.0 + 0.5 * (fps - 60) as f64 / 60.0)).round() as u32;
+	}
 	let bpp = if fps >= 50 { 0.064 } else { 0.085 };
 	let bits = w as f64 * h as f64 * fps as f64 * bpp;
 	((bits / 1000.0).round() as u32).max(200)
@@ -58,7 +64,7 @@ fn even16(w: f64) -> u32 {
 /// Build the ladder for a host whose native capture is `native_w × native_h @ native_fps`
 /// (0 = unknown → 1920×1080@60), highest quality first. Heights above the native one are
 /// dropped; the native point is always the top rung; widths follow the native aspect
-/// ratio; fps rungs are `native_fps` (if ≥ 50) and 30.
+/// ratio; fps rungs are `native_fps` (if ≥ 50), 60 (if the native is above it) and 30.
 pub fn build(codec: VCodec, native_w: u32, native_h: u32, native_fps: u32) -> Vec<Point> {
 	let (nw, nh, nfps) = (
 		if native_w == 0 { 1920 } else { native_w },
@@ -73,7 +79,15 @@ pub fn build(codec: VCodec, native_w: u32, native_h: u32, native_fps: u32) -> Ve
 			heights.push(h);
 		}
 	}
-	let fps_rungs: Vec<u32> = if nfps >= 50 { vec![nfps, 30] } else { vec![nfps.max(1)] };
+	// A high-refresh native (> 60) also gets a 60 fps rung: halving 120 fps is the cheapest
+	// relief for a host that can't encode it in real time.
+	let fps_rungs: Vec<u32> = if nfps > 60 {
+		vec![nfps, 60, 30]
+	} else if nfps >= 50 {
+		vec![nfps, 30]
+	} else {
+		vec![nfps.max(1)]
+	};
 	let mut out = Vec::new();
 	for &h in &heights {
 		let w = if h == nh { nw } else { even16(h as f64 * aspect) };
@@ -157,12 +171,22 @@ mod tests {
 		let l = build(VCodec::H264, 2560, 1440, 144);
 		assert_eq!(l[0].label(), "1440p144");
 		assert!(l[0].min_kbps > 8000, "{}", l[0].min_kbps);
-		assert_eq!(l[1].label(), "1080p144", "ordered by the bits a rung needs");
-		assert_eq!(l[1].width, 1920);
-		assert_eq!(l[2].label(), "1440p30");
+		assert_eq!(l[1].label(), "1440p60", "a high-refresh native gets a 60 fps rung");
+		assert_eq!(l[2].label(), "1080p144", "ordered by the bits a rung needs");
+		assert_eq!(l[2].width, 1920);
+		assert!(l.iter().any(|p| p.label() == "1440p30"));
 		let uw = build(VCodec::H264, 3440, 1440, 60);
 		let p720 = uw.iter().find(|p| p.height == 720).unwrap();
 		assert_eq!(p720.width, 1728, "3440/1440 × 720 = 1720 → nearest multiple of 16");
+	}
+
+	#[test]
+	fn native_120_gets_a_60_fps_rung_under_it() {
+		let l = build(VCodec::H264, 1920, 1080, 120);
+		let labels: Vec<String> = l.iter().map(Point::label).collect();
+		assert_eq!(&labels[..2], &["1080p120", "1080p60"], "{labels:?}");
+		assert!(labels.contains(&"720p60".to_string()) && labels.contains(&"720p30".to_string()), "{labels:?}");
+		assert!(!labels.iter().any(|l| l == "540p60" || l == "360p60"), "{labels:?}");
 	}
 
 	#[test]
