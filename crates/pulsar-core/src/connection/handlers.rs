@@ -182,6 +182,10 @@ impl Node {
 						direct_ok: false,
 						data_tx: None,
 						our_salt,
+						path_checked: false,
+						relay_preferred: false,
+						measure_on_direct: false,
+						path_ms: None,
 					},
 				);
 				// Stash the relay's per-session cap (kbit/s, 0 = uncapped) so `connect` can copy
@@ -195,8 +199,12 @@ impl Node {
 			RelayMsg::RelayData { session, payload } => {
 				// Relay-fallback inbound: unwrap the tunnelled PeerMsg.
 				// Move the decoded payload into `deliver` so it can decrypt in place.
-				if let Ok(PeerMsg::Data { seq, payload, .. }) = decode::<PeerMsg>(&payload) {
-					self.deliver(session, seq, payload).await;
+				// Punch/PunchAck through the relay are the `Auto` path-latency probes (path.rs).
+				match decode::<PeerMsg>(&payload) {
+					Ok(PeerMsg::Data { seq, payload, .. }) => self.deliver(session, seq, payload).await,
+					Ok(PeerMsg::Punch { seq, .. }) => self.answer_relay_probe(session, seq).await,
+					Ok(PeerMsg::PunchAck { seq, .. }) => self.record_probe(session, seq).await,
+					_ => {}
 				}
 			}
 			RelayMsg::AuthRequired {
@@ -378,6 +386,10 @@ impl Node {
 					direct_ok: false,
 					data_tx: Some(data_tx),
 					our_salt,
+					path_checked: false,
+					relay_preferred: false,
+					measure_on_direct: true,
+					path_ms: None,
 				},
 			);
 		}
@@ -467,17 +479,26 @@ impl Node {
 								s.peer_addr = from;
 							}
 							s.direct_ok = true;
-							s.transport = Transport::Direct;
+							if !s.relay_preferred {
+								s.transport = Transport::Direct;
+							}
+							if s.measure_on_direct && !s.path_checked && self.mode == NetworkMode::Auto {
+								let node = self.clone();
+								tokio::spawn(async move {
+									node.pick_faster_path(session).await;
+								});
+							}
 						}
 					}
 				}
 			}
-			PeerMsg::PunchAck { session, .. } => {
+			PeerMsg::PunchAck { session, seq } => {
 				// Mirror of the Punch arm's mode guard: a RelayOnly node never
 				// punches, so any ack is gratuitous — and must not flip Direct.
 				if self.mode == NetworkMode::RelayOnly {
 					return;
 				}
+				self.record_probe(session, seq).await;
 				let mut g = self.inner.lock().await;
 				let Some(s) = g.sessions.get_mut(&session) else {
 					return;
@@ -499,7 +520,15 @@ impl Node {
 					s.peer_addr = from;
 				}
 				s.direct_ok = true;
-				s.transport = Transport::Direct;
+				if !s.relay_preferred {
+					s.transport = Transport::Direct;
+				}
+				if s.measure_on_direct && !s.path_checked && self.mode == NetworkMode::Auto {
+					let node = self.clone();
+					tokio::spawn(async move {
+						node.pick_faster_path(session).await;
+					});
+				}
 				if let Some(n) = g.punched.get(&session).cloned() {
 					n.notify_one();
 				}
@@ -571,6 +600,10 @@ impl Node {
 						direct_ok: false,
 						data_tx: Some(data_tx),
 						our_salt,
+						path_checked: true, // direct-IP: no relay path to compare
+						relay_preferred: false,
+						measure_on_direct: false,
+						path_ms: None,
 					},
 				);
 				drop(g);
@@ -654,6 +687,10 @@ impl Node {
 							direct_ok: false,
 							data_tx: None,
 							our_salt,
+							path_checked: true, // direct-IP: no relay path to compare
+							relay_preferred: false,
+							measure_on_direct: false,
+							path_ms: None,
 						},
 					);
 				} else {

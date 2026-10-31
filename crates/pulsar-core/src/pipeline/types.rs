@@ -82,13 +82,14 @@ impl CaptureMethod {
 				plan.display.clone(),
 			],
 			Self::Kmsgrab => vec![s("-f"), s("kmsgrab"), s("-framerate"), fps, s("-i"), s("-")],
+			// The whole desktop at ITS size: a `-video_size` larger than the screen (the client
+			// asked for 1080p, the host desktop is 1280×800 — a VM, an RDP session) makes gdigrab
+			// refuse to open. encode_command scales to the requested size instead.
 			Self::Gdigrab => vec![
 				s("-f"),
 				s("gdigrab"),
 				s("-framerate"),
 				fps,
-				s("-video_size"),
-				size,
 				s("-i"),
 				s("desktop"),
 			],

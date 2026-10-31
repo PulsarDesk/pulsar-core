@@ -22,6 +22,16 @@ pub(super) struct SessionState {
 	/// Our per-session handshake salt. Kept so a `Hello`/`HelloAck` retransmit
 	/// re-sends the *same* salt (otherwise the peer would derive a mismatched key).
 	pub(super) our_salt: [u8; 32],
+	/// `Auto` path choice ran for this session (see `path.rs`) — once per session.
+	pub(super) path_checked: bool,
+	/// The path choice found the relay clearly faster: keep sending through it even
+	/// though the direct path works (punch retransmits must not flip it back).
+	pub(super) relay_preferred: bool,
+	/// The accepting (host) side of a relay rendezvous: it runs its own path choice as
+	/// soon as the direct path is proven (the requester runs it inside `connect`).
+	pub(super) measure_on_direct: bool,
+	/// The path choice's best RTTs `(direct, relay)` in ms (see `Session::path_latency`).
+	pub(super) path_ms: Option<(Option<f32>, Option<f32>)>,
 }
 
 #[derive(Default)]
@@ -34,6 +44,8 @@ pub(super) struct Inner {
 	/// instead of a generic `RelayTimeout`. Cleared on a successful `Registered`.
 	pub(super) register_error: Option<ErrCode>,
 	pub(super) sessions: HashMap<SessionId, SessionState>,
+	/// In-flight direct-vs-relay latency probes (see `path.rs`).
+	pub(super) probes: HashMap<SessionId, super::path::PathProbe>,
 	pub(super) peer_found: HashMap<SessionId, Arc<Notify>>,
 	pub(super) punched: HashMap<SessionId, Arc<Notify>>,
 	/// Direct-IP connects waiting for the peer's `HelloAck` (in-band key exchange).

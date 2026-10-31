@@ -30,6 +30,7 @@ use crate::crypto::{random_salt, Identity, Role, Session as Crypto};
 
 mod handlers;
 mod node;
+mod path;
 mod session;
 mod types;
 

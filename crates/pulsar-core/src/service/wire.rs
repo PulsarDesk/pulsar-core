@@ -498,6 +498,7 @@ enum DataMsgWire {
 	},
 	CursorHidden,
 	Rumble { slot: u8, large: u8, small: u8 },
+	CursorLabel(bool),
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -528,6 +529,7 @@ impl From<DataMsgWire> for DataMsg {
 			}
 			DataMsgWire::CursorHidden => DataMsg::CursorHidden,
 			DataMsgWire::Rumble { slot, large, small } => DataMsg::Rumble { slot, large, small },
+			DataMsgWire::CursorLabel(on) => DataMsg::CursorLabel(on),
 		}
 	}
 }
@@ -676,6 +678,11 @@ pub enum DataMsg {
 	/// magnitudes (0–255). The client replays it on the physical controller at that slot
 	/// via gilrs force-feedback. Appended for additive wire compat (old peers ignore it).
 	Rumble { slot: u8, large: u8, small: u8 },
+	/// Client → host: whether the client wants its pointer shown on the host screen with
+	/// its name while it can't control the host (remote-desktop sessions only). Sent once after the session
+	/// is up and again whenever the user flips it; the host may still have it turned off
+	/// for every client. Appended for additive wire compat (an old host ignores it → no label).
+	CursorLabel(bool),
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1081,6 +1088,7 @@ mod tests {
 			},
 			DataMsg::CursorHidden,
 			DataMsg::Rumble { slot: 0, large: 200, small: 80 },
+			DataMsg::CursorLabel(false),
 		];
 
 		for msg in cases {

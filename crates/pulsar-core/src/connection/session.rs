@@ -73,6 +73,12 @@ impl Session {
 		self.data_rx.try_recv().ok()
 	}
 
+	/// The `Auto` path comparison's best round-trip per path in ms — `(direct, relay)`,
+	/// `None` for a path that never answered — once it has run for this session.
+	pub async fn path_latency(&self) -> Option<(Option<f32>, Option<f32>)> {
+		self.node.inner.lock().await.sessions.get(&self.id).and_then(|s| s.path_ms)
+	}
+
 	/// Refresh the transport from the live session state (it may upgrade to
 	/// `Direct` once a late hole-punch succeeds).
 	pub async fn live_transport(&self) -> Transport {
@@ -83,7 +89,7 @@ impl Session {
 			.sessions
 			.get(&self.id)
 			.map(|s| {
-				if s.direct_ok {
+				if s.direct_ok && !s.relay_preferred {
 					Transport::Direct
 				} else {
 					s.transport

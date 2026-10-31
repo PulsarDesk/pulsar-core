@@ -528,6 +528,14 @@ impl Node {
 			}
 		};
 
+		// `Auto`: a proven direct path isn't necessarily the faster one — compare it with
+		// the relay and keep whichever answers clearly quicker (path.rs).
+		let transport = if self.mode == NetworkMode::Auto {
+			self.pick_faster_path(session).await
+		} else {
+			transport
+		};
+
 		// Wire up an inbound data channel for the caller.
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 		let (transport, rate_cap_kbps) = {
@@ -540,7 +548,7 @@ impl Node {
 					// our PunchAck waiter timed out — never downgrade such a
 					// session to the relay (data would ride the relay while
 					// `live_transport()` reports Direct).
-					s.transport = if s.direct_ok {
+					s.transport = if s.direct_ok && !s.relay_preferred {
 						Transport::Direct
 					} else {
 						transport

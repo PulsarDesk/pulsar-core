@@ -195,6 +195,39 @@ async fn auto_mode_connects_end_to_end() {
 }
 
 #[tokio::test]
+async fn auto_mode_times_both_paths_and_keeps_direct_on_a_tie() {
+	// Loopback: both paths answer in well under a millisecond, so the relay is never
+	// "clearly faster" — but BOTH must have been measured (the relay probes are tunnelled
+	// through RelayData and answered by the peer), on the requester and on the host.
+	let (relay, _relay_handle) = start_relay().await;
+	let host = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::Auto).await.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::Auto).await.unwrap();
+	host.register().await.unwrap();
+	client.register().await.unwrap();
+	let host_id = host.self_id().await.unwrap();
+	let client_sess = client.connect(host_id).await.unwrap();
+	let host_sess = timeout(Duration::from_secs(2), host.next_incoming())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(client_sess.transport(), Transport::Direct);
+	let (direct, relay_ms) = client_sess.path_latency().await.expect("requester compared paths");
+	assert!(direct.is_some() && relay_ms.is_some(), "{direct:?} / {relay_ms:?}");
+	// The host runs its own comparison in the background once its direct path is proven.
+	let mut host_lat = None;
+	for _ in 0..40 {
+		host_lat = host_sess.path_latency().await;
+		if host_lat.is_some() {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let (hd, hr) = host_lat.expect("host compared paths");
+	assert!(hd.is_some() && hr.is_some(), "{hd:?} / {hr:?}");
+	assert_eq!(host_sess.live_transport().await, Transport::Direct);
+}
+
+#[tokio::test]
 async fn direct_p2p_survives_the_relay_being_taken_down() {
 	let (relay, relay_handle) = start_relay().await;
 	let host = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::P2pOnly)

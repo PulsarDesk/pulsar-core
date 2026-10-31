@@ -220,6 +220,9 @@ fn capture_backends_emit_the_right_input() {
 	let (_, args) = encode_command(&p);
 	assert!(args.iter().any(|a| a == "gdigrab"));
 	assert!(args.iter().any(|a| a == "desktop"));
+	// Never a fixed capture size (fails when the desktop is smaller); scaled instead.
+	assert!(!args.iter().any(|a| a == "-video_size"));
+	assert!(args.iter().any(|a| a.starts_with("scale=")));
 	p.capture = CaptureMethod::AvFoundation;
 	assert!(encode_command(&p).1.iter().any(|a| a == "avfoundation"));
 	p.capture = CaptureMethod::Kmsgrab;

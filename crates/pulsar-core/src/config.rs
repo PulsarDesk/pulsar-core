@@ -123,6 +123,16 @@ pub struct Config {
 	/// without the prompt. Read once at process startup, so a change needs an app restart.
 	#[serde(default = "default_true")]
 	pub request_admin: bool,
+	/// Host: show a connected client's pointer on this screen with its name while it can't
+	/// control a remote-desktop session (view-only, or the host user is on their own mouse).
+	/// Settings → Güvenlik toggle; default on.
+	#[serde(default = "default_true")]
+	pub show_remote_cursor: bool,
+	/// Client: let the host show this device's pointer, labelled with its name, on its screen
+	/// while this device can't control it (the Pulsar menu → Yayın toggle during a session). Default on; the host can still
+	/// turn it off for everyone with [`Self::show_remote_cursor`].
+	#[serde(default = "default_true")]
+	pub share_cursor_label: bool,
 }
 
 fn default_avatar_mode() -> String {
@@ -153,6 +163,8 @@ impl Default for Config {
 			audio_layout: crate::audio::ChannelLayout::Stereo,
 			ui_hardware_accel: None,
 			request_admin: true,
+			show_remote_cursor: true,
+			share_cursor_label: true,
 		}
 	}
 }

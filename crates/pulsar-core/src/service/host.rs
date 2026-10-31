@@ -33,6 +33,9 @@ pub struct DataHandlers {
 	/// The client pushed its own relay device ID (see [`DataMsg::PeerId`]) so the host
 	/// can show it instead of a bare `ip:port` on a direct connect. Default no-op.
 	pub on_peer_id: Box<dyn FnMut(String) + Send>,
+	/// The client said whether its pointer may be shown, labelled with its name, on the
+	/// host screen (see [`DataMsg::CursorLabel`]). Default no-op.
+	pub on_cursor_label: Box<dyn FnMut(bool) + Send>,
 	/// File-manager requests from the client (`FsList` / `FsGet`). The handler
 	/// replies through `outbound` (`FsEntries`, or the file as
 	/// `FileBegin`/`FileChunk`/`FileEnd`). Default no-op — a host without the
@@ -72,6 +75,7 @@ impl Default for DataHandlers {
 			on_avatar: Box::new(|_| {}),
 			on_peer_name: Box::new(|_| {}),
 			on_peer_id: Box::new(|_| {}),
+			on_cursor_label: Box::new(|_| {}),
 			on_fs: Box::new(|_| {}),
 			on_stats: Box::new(|_| {}),
 		}
@@ -232,6 +236,7 @@ pub async fn serve_with(
 				DataMsg::Avatar(png) => (data.on_avatar)(png),
 				DataMsg::PeerName(name) => (data.on_peer_name)(name),
 				DataMsg::PeerId(id) => (data.on_peer_id)(id),
+				DataMsg::CursorLabel(on) => (data.on_cursor_label)(on),
 				m @ (DataMsg::FsList { .. } | DataMsg::FsGet { .. }) => (data.on_fs)(m),
 				DataMsg::FsEntries { .. } => {} // host→client only; ignore if echoed back
 				// Cursor side-channel + rumble are host→client only; ignore if echoed back.

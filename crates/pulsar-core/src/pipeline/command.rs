@@ -119,6 +119,10 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 
 	// Screen capture (platform-specific).
 	a.extend(plan.capture.input_args(plan));
+	// gdigrab captures the desktop at its own size (see CaptureMethod::input_args).
+	if plan.capture == CaptureMethod::Gdigrab {
+		a.extend([s("-vf"), format!("scale={}:{}", plan.width, plan.height)]);
+	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
 	// format matches the requested depth/chroma (p010 for HDR, yuv444 for 4:4:4).
