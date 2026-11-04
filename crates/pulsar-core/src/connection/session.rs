@@ -14,6 +14,9 @@ pub struct Session {
 	/// Meaningful only when [`transport`](Self::transport) is `Relay` (then the media rides
 	/// the relay and its cap applies) — the caller clamps its stream bitrate accordingly.
 	pub(super) rate_cap_kbps: u32,
+	/// Client-side PAKE state between sending `AuthPake` and the host's reply (see
+	/// `service::pake`). `None` outside a password attempt.
+	pub(crate) pake_client: Option<crate::service::pake::ClientPending>,
 }
 
 impl Drop for Session {
@@ -122,6 +125,40 @@ impl Session {
 			.sessions
 			.get(&self.id)
 			.map(|s| s.peer_pubkey)
+	}
+
+	/// Whether this session's key is forward secret (both ends sent an ephemeral key).
+	pub async fn is_forward_secret(&self) -> bool {
+		self.node
+			.inner
+			.lock()
+			.await
+			.sessions
+			.get(&self.id)
+			.is_some_and(|s| s.crypto.is_forward_secret())
+	}
+
+	/// Whether the peer advertised the PAKE session-auth handshake (`CAP_PAKE`).
+	pub async fn peer_supports_pake(&self) -> bool {
+		self.node
+			.inner
+			.lock()
+			.await
+			.sessions
+			.get(&self.id)
+			.is_some_and(|s| s.peer_caps & pulsar_proto::CAP_PAKE != 0)
+	}
+
+	/// The secret channel-binding value of this session's key (see
+	/// [`crate::crypto::Session::binding`]). `None` once the session is gone.
+	pub(crate) async fn channel_binding(&self) -> Option<[u8; 32]> {
+		self.node
+			.inner
+			.lock()
+			.await
+			.sessions
+			.get(&self.id)
+			.map(|s| s.crypto.binding())
 	}
 }
 

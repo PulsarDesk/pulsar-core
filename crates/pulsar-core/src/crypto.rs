@@ -14,8 +14,19 @@
 //! **session salt** at handshake time and exchanges it alongside its public key;
 //! both salts plus the random per-connect `session_id` are folded into the key
 //! derivation, so two sessions between the same identities derive *different* keys.
-//! (Forward secrecy via ephemeral X25519 is a separate, future enhancement; the
-//! salt+session_id binding already fully fixes the cross-session reuse.)
+//!
+//! **Forward secrecy (key v3).** When both peers advertise a fresh per-session
+//! **ephemeral** X25519 key ([`LocalHs`] / [`PeerHs`]), the data key also folds in the
+//! ephemeral–ephemeral DH. The ephemeral secrets live only in memory for the session,
+//! so a later theft of a device's long-lived identity key can no longer decrypt
+//! recorded traffic. The static DH stays in the mix, so the peer is still authenticated
+//! by its identity key (TOFU pin). An old peer sends no ephemeral key → the v2 key.
+//!
+//! **Channel binding.** [`Session::binding`] is a secret value derived from the data
+//! key: both ends of a genuine session get the same value, but a man-in-the-middle that
+//! terminated the key exchange with each side holds two *different* sessions, so the
+//! values differ. The PAKE session auth (`service::pake`) MACs over it, so a relayed
+//! password exchange through a MITM fails.
 //!
 //! Nonces embed a direction byte so the two halves of a session never collide
 //! even though both peers count their own sequence numbers from zero.
@@ -38,6 +49,46 @@ pub fn random_salt() -> [u8; 32] {
 	// The OS CSPRNG, panicking on failure (as rand 0.8's `OsRng` did).
 	UnwrapErr(SysRng).fill_bytes(&mut salt);
 	salt
+}
+
+/// Our side of a handshake: the fresh per-session salt plus a fresh ephemeral X25519
+/// key (forward secrecy). Mint one per connect/accept and keep it until the key is
+/// derived — a retransmitted hello/ack must re-send the SAME values.
+#[derive(Clone)]
+pub struct LocalHs {
+	pub salt: [u8; 32],
+	eph: StaticSecret,
+	eph_public: [u8; 32],
+}
+
+impl LocalHs {
+	pub fn new() -> Self {
+		let eph = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
+		let eph_public = PublicKey::from(&eph).to_bytes();
+		Self {
+			salt: random_salt(),
+			eph,
+			eph_public,
+		}
+	}
+
+	pub fn eph_public(&self) -> [u8; 32] {
+		self.eph_public
+	}
+}
+
+impl Default for LocalHs {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+/// The peer's side of a handshake: its salt and, for a forward-secret peer, its
+/// ephemeral public key (`None` = old peer → v2 key without forward secrecy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerHs {
+	pub salt: [u8; 32],
+	pub eph: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,15 +188,71 @@ impl Identity {
 			our_salt,
 			peer_salt,
 		);
-		// Wrap the cipher + replay window in one Arc so the connection layer can clone
-		// a cheap `Session` handle out from under the node lock and run the per-packet
-		// AEAD off-lock (the cipher is immutable; only the replay window needs a Mutex).
-		Session(Arc::new(SessionCrypto {
-			cipher: ChaCha20Poly1305::new(&key),
-			role,
-			recv_window: Mutex::new(ReplayWindow::default()),
-		}))
+		Session::from_key(key, role, false)
 	}
+
+	/// Like [`session`](Self::session) but from full handshake state: when the peer
+	/// sent an ephemeral key the data key is the forward-secret v3 key (static DH +
+	/// ephemeral DH); otherwise it is exactly the v2 key an old peer derives.
+	pub fn session_hs(
+		&self,
+		peer_public: [u8; 32],
+		role: Role,
+		session_id: u64,
+		ours: &LocalHs,
+		peer: &PeerHs,
+	) -> Session {
+		let Some(peer_eph) = peer.eph else {
+			return self.session(peer_public, role, session_id, ours.salt, peer.salt);
+		};
+		let shared = self.secret.diffie_hellman(&PublicKey::from(peer_public));
+		let eph_shared = ours.eph.diffie_hellman(&PublicKey::from(peer_eph));
+		let key = derive_key_v3(
+			(self.public.to_bytes(), peer_public),
+			shared.as_bytes(),
+			(ours.eph_public, peer_eph),
+			eph_shared.as_bytes(),
+			session_id,
+			(ours.salt, peer.salt),
+		);
+		Session::from_key(key, role, true)
+	}
+}
+
+fn sorted(a: [u8; 32], b: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+	if a <= b {
+		(a, b)
+	} else {
+		(b, a)
+	}
+}
+
+/// v3 (forward-secret) data key. Every pair is sorted role-independently so both
+/// ends derive the same key.
+fn derive_key_v3(
+	statics: ([u8; 32], [u8; 32]),
+	static_shared: &[u8; 32],
+	ephs: ([u8; 32], [u8; 32]),
+	eph_shared: &[u8; 32],
+	session_id: u64,
+	salts: ([u8; 32], [u8; 32]),
+) -> Key {
+	let (lo, hi) = sorted(statics.0, statics.1);
+	let (elo, ehi) = sorted(ephs.0, ephs.1);
+	let (slo, shi) = sorted(salts.0, salts.1);
+	let mut h = Sha256::new();
+	h.update(b"pulsar-session-key-v3");
+	h.update(lo);
+	h.update(hi);
+	h.update(static_shared);
+	h.update(elo);
+	h.update(ehi);
+	h.update(eph_shared);
+	h.update(slo);
+	h.update(shi);
+	h.update(session_id.to_be_bytes());
+	let digest = h.finalize();
+	Key::try_from(digest.as_slice()).expect("SHA-256 digest is 32 bytes")
 }
 
 fn derive_key(
@@ -301,6 +408,10 @@ impl ReplayWindow {
 struct SessionCrypto {
 	cipher: ChaCha20Poly1305,
 	role: Role,
+	/// Channel-binding value (see [`Session::binding`]).
+	binding: [u8; 32],
+	/// Derived with the ephemeral DH (v3 key)?
+	forward_secret: bool,
 	/// Anti-replay state for the *receive* direction.
 	recv_window: Mutex<ReplayWindow>,
 }
@@ -312,6 +423,34 @@ struct SessionCrypto {
 pub struct Session(Arc<SessionCrypto>);
 
 impl Session {
+	fn from_key(key: Key, role: Role, forward_secret: bool) -> Self {
+		let mut h = Sha256::new();
+		h.update(b"pulsar-channel-binding-v1");
+		h.update(key.as_slice());
+		let binding: [u8; 32] = h.finalize().into();
+		// Wrap the cipher + replay window in one Arc so the connection layer can clone
+		// a cheap `Session` handle out from under the node lock and run the per-packet
+		// AEAD off-lock (the cipher is immutable; only the replay window needs a Mutex).
+		Session(Arc::new(SessionCrypto {
+			cipher: ChaCha20Poly1305::new(&key),
+			role,
+			binding,
+			forward_secret,
+			recv_window: Mutex::new(ReplayWindow::default()),
+		}))
+	}
+
+	/// Secret channel-binding value: equal on both ends of a genuine session, different
+	/// on the two legs of a man-in-the-middle. Never send it in the clear.
+	pub fn binding(&self) -> [u8; 32] {
+		self.0.binding
+	}
+
+	/// Whether the key includes the ephemeral DH (forward secrecy).
+	pub fn is_forward_secret(&self) -> bool {
+		self.0.forward_secret
+	}
+
 	fn nonce(dir: u8, seq: u64) -> Nonce {
 		let mut n = [0u8; 12];
 		n[0] = dir;
@@ -738,5 +877,91 @@ mod tests {
 			fresh.public_bytes()
 		);
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	fn fs_pair(sid: u64) -> (Identity, Identity, Session, Session, Session, Session) {
+		let a = Identity::generate();
+		let b = Identity::generate();
+		let (ha, hb) = (LocalHs::new(), LocalHs::new());
+		let pa = PeerHs {
+			salt: ha.salt,
+			eph: Some(ha.eph_public()),
+		};
+		let pb = PeerHs {
+			salt: hb.salt,
+			eph: Some(hb.eph_public()),
+		};
+		let a_s = a.session_hs(b.public_bytes(), Role::Initiator, sid, &ha, &pb);
+		let b_s = b.session_hs(a.public_bytes(), Role::Responder, sid, &hb, &pa);
+		// The same handshake without ephemerals (old peer) for comparison.
+		let a_old = a.session(b.public_bytes(), Role::Initiator, sid, ha.salt, hb.salt);
+		let b_old = b.session(a.public_bytes(), Role::Responder, sid, hb.salt, ha.salt);
+		(a, b, a_s, b_s, a_old, b_old)
+	}
+
+	#[test]
+	fn forward_secret_session_round_trips_and_binds() {
+		let (_, _, a_s, b_s, _, _) = fs_pair(7);
+		assert!(a_s.is_forward_secret() && b_s.is_forward_secret());
+		let ct = a_s.seal(0, b"fs");
+		assert_eq!(b_s.open(0, &ct).unwrap(), b"fs");
+		assert_eq!(a_s.binding(), b_s.binding());
+	}
+
+	#[test]
+	fn forward_secret_key_differs_from_static_only_key() {
+		let (_, _, a_s, _, _, b_old) = fs_pair(7);
+		let ct = a_s.seal(0, b"x");
+		assert!(
+			b_old.open(0, &ct).is_err(),
+			"v3 key must not equal the v2 key"
+		);
+		assert_ne!(a_s.binding(), b_old.binding());
+	}
+
+	#[test]
+	fn peer_without_ephemeral_gets_the_v2_key() {
+		// A new node talking to an OLD peer (no eph) must derive exactly what the old
+		// peer derives with `session`.
+		let a = Identity::generate();
+		let b = Identity::generate();
+		let ha = LocalHs::new();
+		let b_salt = random_salt();
+		let a_s = a.session_hs(
+			b.public_bytes(),
+			Role::Initiator,
+			3,
+			&ha,
+			&PeerHs {
+				salt: b_salt,
+				eph: None,
+			},
+		);
+		let b_old = b.session(a.public_bytes(), Role::Responder, 3, b_salt, ha.salt);
+		assert!(!a_s.is_forward_secret());
+		let ct = a_s.seal(0, b"old");
+		assert_eq!(b_old.open(0, &ct).unwrap(), b"old");
+	}
+
+	#[test]
+	fn mitm_legs_have_different_bindings() {
+		// A <-> M and M <-> B: M holds both keys, but each leg's binding differs, so a
+		// password exchange relayed by M can't confirm on both legs.
+		let a = Identity::generate();
+		let b = Identity::generate();
+		let m = Identity::generate();
+		let (ha, hm1, hm2, hb) = (
+			LocalHs::new(),
+			LocalHs::new(),
+			LocalHs::new(),
+			LocalHs::new(),
+		);
+		let ph = |h: &LocalHs| PeerHs {
+			salt: h.salt,
+			eph: Some(h.eph_public()),
+		};
+		let a_leg = a.session_hs(m.public_bytes(), Role::Initiator, 9, &ha, &ph(&hm1));
+		let b_leg = b.session_hs(m.public_bytes(), Role::Responder, 9, &hb, &ph(&hm2));
+		assert_ne!(a_leg.binding(), b_leg.binding());
 	}
 }

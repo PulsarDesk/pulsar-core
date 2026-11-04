@@ -21,7 +21,10 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
 - `connection/` — `Node`: register → relay-assigned stable 9-digit ID → P2P
   hole-punch → relay fallback; encrypted `Session`.
 - `crypto.rs` — X25519 identity + ChaCha20-Poly1305; per-session salt +
-  session_id in the KDF, direction byte in the nonce.
+  session_id in the KDF, direction byte in the nonce. **Key v3** adds an ephemeral X25519 DH (forward
+  secrecy) when the peer sends one — relay blob extension `ver||caps||eph` after the
+  always-written 6-byte LAN slot, direct-IP `Hello2/HelloAck2`; old peers → v2 key.
+  `Session::binding()` = channel binding (differs on MITM legs).
 - `config.rs` — persisted JSON config; `DEFAULT_RELAY = "relay.pulsardesk.com"` — the
   official public relay, written without a port because 21116 is implied when an address
   carries none (users can point at a self-hosted/local one, with or without a port);
@@ -51,7 +54,10 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks.
 - `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC.
-- `service/` — the app protocol over the encrypted session: OTP auth,
+- `service/` — the app protocol over the encrypted session: OTP auth (non-empty
+  passwords via **SPAKE2 PAKE** in `service/pake.rs`, MAC'd over the channel binding —
+  the password never travels; new clients refuse to send one to an old host
+  → `ConnError::PeerOutdated`; hosts still accept legacy plaintext from old clients),
   keepalive `Ping`/`Pong`/`Bye`, media framing + NACK + **FEC parity** — Reed-Solomon
   per frame (`TAG_FEC_RS`), XOR kept for v0.11.0 clients (`media.rs`), and **`DataMsg` side channels** (clipboard/chat/file/mic-audio/
   avatar/fs-browse/client `Stats` JSON/…) in `wire.rs`.

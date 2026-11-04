@@ -224,7 +224,7 @@ impl Node {
 	}
 
 	/// Our best same-LAN punch candidate: the OS-routed outbound v4 + the node's
-	/// REAL bound port. Appended to the handshake blobs (`push_lan_candidate`) so
+	/// REAL bound port. Appended to the handshake blobs (`handshake_blob`) so
 	/// a same-NAT peer can punch our private address instead of the lossy router
 	/// hairpin. `None` when there's no usable v4 route (offline / v6-only).
 	pub(super) fn lan_candidate(&self) -> Option<SocketAddr> {
@@ -240,11 +240,9 @@ impl Node {
 
 	/// Append our LAN candidate (`v4 ip(4) || port(2)`, big-endian) to a handshake
 	/// blob — the counterpart of `parse_lan_candidate`. No-op without a candidate.
-	pub(super) fn push_lan_candidate(&self, blob: &mut Vec<u8>) {
-		if let Some(SocketAddr::V4(a)) = self.lan_candidate() {
-			blob.extend_from_slice(&a.ip().octets());
-			blob.extend_from_slice(&a.port().to_be_bytes());
-		}
+	/// Our relay-path handshake blob for `hs` (see `handshake_blob`).
+	pub(super) fn handshake_blob(&self, hs: &LocalHs) -> Vec<u8> {
+		handshake_blob(self.identity.public_bytes(), hs, self.lan_candidate())
 	}
 
 	pub fn public_key(&self) -> [u8; 32] {
@@ -442,11 +440,11 @@ impl Node {
 			expected.map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 		// Mint our per-session salt and remember it: we send it now in `hello`, but
 		// derive the key later (in the `PeerFound` handler) once we have the peer's.
-		let our_salt = random_salt();
+		let our_hs = LocalHs::new();
 		{
 			let mut g = self.inner.lock().await;
 			g.peer_found.insert(session, pf.clone());
-			g.pending_salt.insert(session, our_salt);
+			g.pending_salt.insert(session, our_hs.clone());
 			// Pin the expected identity for this id (TOFU / known-host): the
 			// `PeerFound` handler drops an answer carrying any other key so the relay
 			// can't substitute a different peer behind the requested id. Absent ⇒
@@ -461,9 +459,7 @@ impl Node {
 		// Handshake blob: static pubkey(32) || fresh session salt(32) || optional
 		// LAN candidate (same-NAT peers punch our PRIVATE addr too — see
 		// `parse_lan_candidate`).
-		let mut hello = self.identity.public_bytes().to_vec();
-		hello.extend_from_slice(&our_salt);
-		self.push_lan_candidate(&mut hello);
+		let hello = self.handshake_blob(&our_hs);
 		self.sock
 			.send_to(
 				&encode(&ClientMsg::Connect {
@@ -567,6 +563,7 @@ impl Node {
 			node: self.clone(),
 			data_rx,
 			rate_cap_kbps,
+			pake_client: None,
 		})
 	}
 
@@ -586,14 +583,21 @@ impl Node {
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 		// Mint our salt and stash it; the `HelloAck` handler derives the key using it
 		// plus the peer's salt from the ack.
-		let our_salt = random_salt();
-		let hello = || {
-			encode(&PeerMsg::Hello {
-				session,
-				pubkey: self.identity.public_bytes(),
-				salt: our_salt,
-			})
-		};
+		let our_hs = LocalHs::new();
+		// `Hello2` carries the ephemeral key (forward secrecy) + caps; the legacy
+		// `Hello` is for old responders, which can't decode `Hello2`.
+		let hello2 = encode(&PeerMsg::Hello2 {
+			session,
+			pubkey: self.identity.public_bytes(),
+			salt: our_hs.salt,
+			eph: our_hs.eph_public(),
+			caps: OUR_CAPS,
+		});
+		let hello = encode(&PeerMsg::Hello {
+			session,
+			pubkey: self.identity.public_bytes(),
+			salt: our_hs.salt,
+		});
 
 		// Announce ours, await the peer's HelloAck (carrying their pubkey + salt).
 		let hp = Arc::new(Notify::new());
@@ -605,7 +609,7 @@ impl Node {
 		{
 			let mut g = self.inner.lock().await;
 			g.hello_done.insert(session, hp.clone());
-			g.pending_salt.insert(session, our_salt);
+			g.pending_salt.insert(session, our_hs.clone());
 			// When the caller already knows the peer's key, pin it: the `HelloAck`
 			// handler drops an ack carrying any other key, so an attacker that answers
 			// the Hello in the peer's place can't terminate the E2E with its own key
@@ -626,8 +630,13 @@ impl Node {
 			session,
 			armed: true,
 		};
-		for _ in 0..PUNCH_ATTEMPTS {
-			let _ = self.sock.send_to(&hello(), peer_addr).await;
+		for i in 0..PUNCH_ATTEMPTS {
+			let _ = self.sock.send_to(&hello2, peer_addr).await;
+			// Hold the legacy Hello back a couple of rounds so a new responder normally
+			// sees `Hello2` first (whichever arrives first fixes the session's key).
+			if i >= 2 {
+				let _ = self.sock.send_to(&hello, peer_addr).await;
+			}
 			tokio::time::sleep(Duration::from_millis(40)).await;
 		}
 		let hr = timeout(RENDEZVOUS_TIMEOUT, hp.notified()).await;
@@ -680,6 +689,7 @@ impl Node {
 			node: self.clone(),
 			data_rx,
 			rate_cap_kbps: 0, // direct/typed-IP path: no relay, no cap
+			pake_client: None,
 		})
 	}
 

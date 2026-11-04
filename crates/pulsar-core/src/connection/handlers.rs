@@ -128,9 +128,9 @@ impl Node {
 				answer,
 				rate_cap_kbps,
 			} => {
-				// answer = peer pubkey(32) || peer salt(32) || optional LAN candidate.
-				// Reject a malformed blob rather than index-slicing past the end.
-				let Some((key, peer_salt)) = split_handshake(&answer) else {
+				// answer = peer pubkey(32) || peer salt(32) || LAN slot || v1 extension
+				// (eph + caps). Reject a malformed blob rather than index-slicing past the end.
+				let Some((key, peer_hs, peer_caps)) = split_handshake(&answer) else {
 					tracing::warn!(session, "PeerFound answer blob too short");
 					return;
 				};
@@ -160,7 +160,7 @@ impl Node {
 					}
 				}
 				// Pair the peer's salt with the one we minted in `connect`.
-				let Some(our_salt) = g.pending_salt.remove(&session) else {
+				let Some(our_hs) = g.pending_salt.remove(&session) else {
 					tracing::warn!(session, "PeerFound for an unknown/expired connect");
 					return;
 				};
@@ -169,7 +169,7 @@ impl Node {
 				g.expected_pubkey.remove(&session);
 				let crypto =
 					self.identity
-						.session(key, Role::Initiator, session, our_salt, peer_salt);
+						.session_hs(key, Role::Initiator, session, &our_hs, &peer_hs);
 				g.sessions.insert(
 					session,
 					SessionState {
@@ -181,7 +181,8 @@ impl Node {
 						send_seq: 0,
 						direct_ok: false,
 						data_tx: None,
-						our_salt,
+						our_hs,
+						peer_caps,
 						path_checked: false,
 						relay_preferred: false,
 						measure_on_direct: false,
@@ -317,7 +318,7 @@ impl Node {
 	) {
 		// hello = requester pubkey(32) || requester salt(32) || optional LAN
 		// candidate. Reject a malformed blob.
-		let Some((key, peer_salt)) = split_handshake(&hello) else {
+		let Some((key, peer_hs, peer_caps)) = split_handshake(&hello) else {
 			tracing::warn!(session, "incoming hello blob too short");
 			return;
 		};
@@ -330,13 +331,10 @@ impl Node {
 		{
 			let g = self.inner.lock().await;
 			if let Some(s) = g.sessions.get(&session) {
-				let our_salt = s.our_salt;
+				let answer = self.handshake_blob(&s.our_hs);
 				let (id, token) = (g.self_id, g.token);
 				drop(g);
 				if let (Some(id), Some(token)) = (id, token) {
-					let mut answer = self.identity.public_bytes().to_vec();
-					answer.extend_from_slice(&our_salt);
-					self.push_lan_candidate(&mut answer);
 					let _ = self
 						.sock
 						.send_to(
@@ -354,10 +352,11 @@ impl Node {
 			}
 		}
 		// Mint our salt; both salts + the session id bind this specific session's key.
-		let our_salt = random_salt();
+		let our_hs = LocalHs::new();
 		let crypto = self
 			.identity
-			.session(key, Role::Responder, session, our_salt, peer_salt);
+			.session_hs(key, Role::Responder, session, &our_hs, &peer_hs);
+		let answer = self.handshake_blob(&our_hs);
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 
 		// Read self_id + token BEFORE inserting the session so we never leak a
@@ -385,7 +384,8 @@ impl Node {
 					send_seq: 0,
 					direct_ok: false,
 					data_tx: Some(data_tx),
-					our_salt,
+					our_hs,
+					peer_caps,
 					path_checked: false,
 					relay_preferred: false,
 					measure_on_direct: true,
@@ -394,11 +394,7 @@ impl Node {
 			);
 		}
 
-		// Accept: send back our pubkey(32) || our salt(32) || optional LAN candidate
-		// as the answer, then punch.
-		let mut answer = self.identity.public_bytes().to_vec();
-		answer.extend_from_slice(&our_salt);
-		self.push_lan_candidate(&mut answer);
+		// Accept: send back our handshake blob (minted above) as the answer, then punch.
 		let _ = self
 			.sock
 			.send_to(
@@ -443,6 +439,7 @@ impl Node {
 			node: self.clone(),
 			data_rx,
 			rate_cap_kbps: 0, // host side accepts; the client is the one that requests bitrate
+			pake_client: None,
 		});
 	}
 
@@ -542,184 +539,251 @@ impl Node {
 			PeerMsg::Hello {
 				session,
 				pubkey,
-				salt: peer_salt,
+				salt,
 			} => {
-				// Inbound direct-IP connect (no relay): derive crypto as Responder,
-				// reply with our key + salt, punch, and emit a Session via next_incoming.
-				let mut g = self.inner.lock().await;
-				// SECURITY (conn-r15-1): reject a Hello whose session id matches one of
-				// OUR in-flight outbound connect_direct attempts.  An on-LAN attacker
-				// that snoops (or receives) our Hello{session, our_pk, our_salt} knows
-				// the random session id and can race us with its own Hello{session,
-				// attacker_pk, ...}; without this gate our Hello handler would derive
-				// Responder crypto against the attacker's key, insert a session, and
-				// emit a Session — completing a full MITM before any pin check runs.
-				// `pending_salt` and `hello_done` together uniquely identify a session
-				// id we own as the initiator; a legitimate inbound initiator from a
-				// different machine cannot have either entry for a freshly-random id.
-				if g.pending_salt.contains_key(&session) || g.hello_done.contains_key(&session) {
-					tracing::warn!(
-						session,
-						"inbound Hello for an in-flight outbound connect_direct — dropping (possible MITM)"
-					);
-					return;
-				}
-				if let Some(s) = g.sessions.get(&session) {
-					// Hello retransmit — re-ack with the SAME salt we already committed
-					// to (a different salt would derive a mismatched key), so a lost
-					// HelloAck still recovers.
-					let our_salt = s.our_salt;
-					drop(g);
-					let _ = self
-						.sock
-						.send_to(
-							&encode(&PeerMsg::HelloAck {
-								session,
-								pubkey: self.identity.public_bytes(),
-								salt: our_salt,
-							}),
-							from,
-						)
-						.await;
-					return;
-				}
-				let our_salt = random_salt();
-				let crypto =
-					self.identity
-						.session(pubkey, Role::Responder, session, our_salt, peer_salt);
-				let (data_tx, data_rx) = mpsc::unbounded_channel();
-				g.sessions.insert(
+				self.on_hello(from, session, pubkey, PeerHs { salt, eph: None }, 0)
+					.await
+			}
+			PeerMsg::Hello2 {
+				session,
+				pubkey,
+				salt,
+				eph,
+				caps,
+			} => {
+				self.on_hello(
+					from,
 					session,
-					SessionState {
-						peer_addr: from,
-						peer_lan: None, // direct-IP: the typed address IS the path
-						crypto,
-						peer_pubkey: pubkey,
-						transport: Transport::Direct,
-						send_seq: 0,
-						direct_ok: false,
-						data_tx: Some(data_tx),
-						our_salt,
-						path_checked: true, // direct-IP: no relay path to compare
-						relay_preferred: false,
-						measure_on_direct: false,
-						path_ms: None,
+					pubkey,
+					PeerHs {
+						salt,
+						eph: Some(eph),
 					},
-				);
-				drop(g);
-				let _ = self
-					.sock
-					.send_to(
-						&encode(&PeerMsg::HelloAck {
-							session,
-							pubkey: self.identity.public_bytes(),
-							salt: our_salt,
-						}),
-						from,
-					)
-					.await;
-				for seq in 0..PUNCH_ATTEMPTS as u32 {
-					let _ = self
-						.sock
-						.send_to(&encode(&PeerMsg::Punch { session, seq }), from)
-						.await;
-				}
-				let _ = self.incoming_tx.send(Session {
-					id: session,
-					peer: DeviceId(0),
-					transport: Transport::Direct,
-					node: self.clone(),
-					data_rx,
-					rate_cap_kbps: 0, // direct-IP host accept: no relay, no cap
-				});
+					caps,
+				)
+				.await
 			}
 			PeerMsg::HelloAck {
 				session,
 				pubkey,
-				salt: peer_salt,
+				salt,
 			} => {
-				let mut g = self.inner.lock().await;
-				if !g.sessions.contains_key(&session) {
-					// If the caller pinned the peer's key (beacon/known-host path),
-					// DROP an ack carrying any other key: an attacker that answers our
-					// Hello in the peer's place would otherwise terminate the E2E with
-					// its own key (silent MITM). We don't notify the waiter or consume
-					// our salt, so a legitimate retransmitted ack can still complete
-					// within the connect timeout; if none arrives it fails P2pFailed.
-					if let Some(&expected) = g.expected_pubkey.get(&session) {
-						if pubkey != expected {
-							tracing::warn!(
-								session,
-								"HelloAck pubkey != expected (pinned) key — dropping (possible MITM)"
-							);
-							// Signal the mismatch flag so the caller can return
-							// `IdentityChanged` instead of the generic `P2pFailed`.
-							if let Some(flag) = g.identity_mismatch.get(&session) {
-								flag.store(true, std::sync::atomic::Ordering::Release);
-							}
-							return;
-						}
-					}
-					// Pair the peer's salt with the one we minted in `connect_direct`.
-					let Some(our_salt) = g.pending_salt.remove(&session) else {
-						tracing::warn!(session, "HelloAck for an unknown/expired direct connect");
-						return;
-					};
-					// The key is accepted (matched the pin, or none was set) — the
-					// pin has served its purpose for this session.
-					g.expected_pubkey.remove(&session);
-					let crypto = self.identity.session(
-						pubkey,
-						Role::Initiator,
+				self.on_hello_ack(from, session, pubkey, PeerHs { salt, eph: None }, 0)
+					.await
+			}
+			PeerMsg::HelloAck2 {
+				session,
+				pubkey,
+				salt,
+				eph,
+				caps,
+			} => {
+				self.on_hello_ack(
+					from,
+					session,
+					pubkey,
+					PeerHs {
+						salt,
+						eph: Some(eph),
+					},
+					caps,
+				)
+				.await
+			}
+		}
+	}
+
+	/// Direct-IP `Hello` / `Hello2` (inbound connect, no relay): derive crypto as
+	/// Responder, reply with our key + salt (+ eph for `Hello2`), punch, and emit a
+	/// Session via next_incoming.
+	async fn on_hello(
+		self: &Arc<Self>,
+		from: SocketAddr,
+		session: SessionId,
+		pubkey: PublicKey,
+		peer_hs: PeerHs,
+		peer_caps: u8,
+	) {
+		// Inbound direct-IP connect (no relay): derive crypto as Responder,
+		// reply with our key + salt, punch, and emit a Session via next_incoming.
+		let mut g = self.inner.lock().await;
+		// SECURITY (conn-r15-1): reject a Hello whose session id matches one of
+		// OUR in-flight outbound connect_direct attempts.  An on-LAN attacker
+		// that snoops (or receives) our Hello{session, our_pk, our_salt} knows
+		// the random session id and can race us with its own Hello{session,
+		// attacker_pk, ...}; without this gate our Hello handler would derive
+		// Responder crypto against the attacker's key, insert a session, and
+		// emit a Session — completing a full MITM before any pin check runs.
+		// `pending_salt` and `hello_done` together uniquely identify a session
+		// id we own as the initiator; a legitimate inbound initiator from a
+		// different machine cannot have either entry for a freshly-random id.
+		if g.pending_salt.contains_key(&session) || g.hello_done.contains_key(&session) {
+			tracing::warn!(
+				session,
+				"inbound Hello for an in-flight outbound connect_direct — dropping (possible MITM)"
+			);
+			return;
+		}
+		if let Some(s) = g.sessions.get(&session) {
+			// Hello retransmit — re-ack with the SAME salt we already committed
+			// to (a different salt would derive a mismatched key), so a lost
+			// HelloAck still recovers.
+			// Re-ack in the form the session was created with (v2 ⇔ forward secret).
+			let ack = self.hello_ack(session, &s.our_hs, s.crypto.is_forward_secret());
+			drop(g);
+			let _ = self.sock.send_to(&ack, from).await;
+			return;
+		}
+		let our_hs = LocalHs::new();
+		let crypto = self
+			.identity
+			.session_hs(pubkey, Role::Responder, session, &our_hs, &peer_hs);
+		let ack = self.hello_ack(session, &our_hs, peer_hs.eph.is_some());
+		let (data_tx, data_rx) = mpsc::unbounded_channel();
+		g.sessions.insert(
+			session,
+			SessionState {
+				peer_addr: from,
+				peer_lan: None, // direct-IP: the typed address IS the path
+				crypto,
+				peer_pubkey: pubkey,
+				transport: Transport::Direct,
+				send_seq: 0,
+				direct_ok: false,
+				data_tx: Some(data_tx),
+				our_hs,
+				peer_caps,
+				path_checked: true, // direct-IP: no relay path to compare
+				relay_preferred: false,
+				measure_on_direct: false,
+				path_ms: None,
+			},
+		);
+		drop(g);
+		let _ = self.sock.send_to(&ack, from).await;
+		for seq in 0..PUNCH_ATTEMPTS as u32 {
+			let _ = self
+				.sock
+				.send_to(&encode(&PeerMsg::Punch { session, seq }), from)
+				.await;
+		}
+		let _ = self.incoming_tx.send(Session {
+			id: session,
+			peer: DeviceId(0),
+			transport: Transport::Direct,
+			node: self.clone(),
+			data_rx,
+			rate_cap_kbps: 0, // direct-IP host accept: no relay, no cap
+			pake_client: None,
+		});
+	}
+
+	/// Direct-IP `HelloAck` / `HelloAck2`: the initiator derives the key.
+	async fn on_hello_ack(
+		self: &Arc<Self>,
+		from: SocketAddr,
+		session: SessionId,
+		pubkey: PublicKey,
+		peer_hs: PeerHs,
+		peer_caps: u8,
+	) {
+		let mut g = self.inner.lock().await;
+		if !g.sessions.contains_key(&session) {
+			// If the caller pinned the peer's key (beacon/known-host path),
+			// DROP an ack carrying any other key: an attacker that answers our
+			// Hello in the peer's place would otherwise terminate the E2E with
+			// its own key (silent MITM). We don't notify the waiter or consume
+			// our salt, so a legitimate retransmitted ack can still complete
+			// within the connect timeout; if none arrives it fails P2pFailed.
+			if let Some(&expected) = g.expected_pubkey.get(&session) {
+				if pubkey != expected {
+					tracing::warn!(
 						session,
-						our_salt,
-						peer_salt,
+						"HelloAck pubkey != expected (pinned) key — dropping (possible MITM)"
 					);
-					g.sessions.insert(
-						session,
-						SessionState {
-							peer_addr: from,
-							peer_lan: None, // direct-IP: the typed address IS the path
-							crypto,
-							peer_pubkey: pubkey,
-							transport: Transport::Direct,
-							send_seq: 0,
-							direct_ok: false,
-							data_tx: None,
-							our_salt,
-							path_checked: true, // direct-IP: no relay path to compare
-							relay_preferred: false,
-							measure_on_direct: false,
-							path_ms: None,
-						},
-					);
-				} else {
-					// SECURITY (conn-r15-1, defense-in-depth): the session already
-					// exists — meaning the inbound Hello path raced the HelloAck and
-					// the MITM guard above (Part 1) didn't fire (e.g. timing edge).
-					// If this was a pinned connect, verify the existing session's
-					// peer_pubkey matches the pin; on mismatch evict the session so
-					// connect_direct returns IdentityChanged instead of handing the
-					// caller a session keyed to the attacker.
-					if let Some(&expected) = g.expected_pubkey.get(&session) {
-						let actual = g.sessions.get(&session).map(|s| s.peer_pubkey);
-						if actual != Some(expected) {
-							tracing::warn!(
-								session,
-								"HelloAck: existing session peer_pubkey != pinned expected key — evicting (possible MITM)"
-							);
-							g.sessions.remove(&session);
-							if let Some(flag) = g.identity_mismatch.get(&session) {
-								flag.store(true, std::sync::atomic::Ordering::Release);
-							}
-							return;
-						}
+					// Signal the mismatch flag so the caller can return
+					// `IdentityChanged` instead of the generic `P2pFailed`.
+					if let Some(flag) = g.identity_mismatch.get(&session) {
+						flag.store(true, std::sync::atomic::Ordering::Release);
 					}
-				}
-				if let Some(n) = g.hello_done.get(&session).cloned() {
-					n.notify_one();
+					return;
 				}
 			}
+			// Pair the peer's salt with the one we minted in `connect_direct`.
+			let Some(our_hs) = g.pending_salt.remove(&session) else {
+				tracing::warn!(session, "HelloAck for an unknown/expired direct connect");
+				return;
+			};
+			// The key is accepted (matched the pin, or none was set) — the
+			// pin has served its purpose for this session.
+			g.expected_pubkey.remove(&session);
+			let crypto =
+				self.identity
+					.session_hs(pubkey, Role::Initiator, session, &our_hs, &peer_hs);
+			g.sessions.insert(
+				session,
+				SessionState {
+					peer_addr: from,
+					peer_lan: None, // direct-IP: the typed address IS the path
+					crypto,
+					peer_pubkey: pubkey,
+					transport: Transport::Direct,
+					send_seq: 0,
+					direct_ok: false,
+					data_tx: None,
+					our_hs,
+					peer_caps,
+					path_checked: true, // direct-IP: no relay path to compare
+					relay_preferred: false,
+					measure_on_direct: false,
+					path_ms: None,
+				},
+			);
+		} else {
+			// SECURITY (conn-r15-1, defense-in-depth): the session already
+			// exists — meaning the inbound Hello path raced the HelloAck and
+			// the MITM guard above (Part 1) didn't fire (e.g. timing edge).
+			// If this was a pinned connect, verify the existing session's
+			// peer_pubkey matches the pin; on mismatch evict the session so
+			// connect_direct returns IdentityChanged instead of handing the
+			// caller a session keyed to the attacker.
+			if let Some(&expected) = g.expected_pubkey.get(&session) {
+				let actual = g.sessions.get(&session).map(|s| s.peer_pubkey);
+				if actual != Some(expected) {
+					tracing::warn!(
+						session,
+						"HelloAck: existing session peer_pubkey != pinned expected key — evicting (possible MITM)"
+					);
+					g.sessions.remove(&session);
+					if let Some(flag) = g.identity_mismatch.get(&session) {
+						flag.store(true, std::sync::atomic::Ordering::Release);
+					}
+					return;
+				}
+			}
+		}
+		if let Some(n) = g.hello_done.get(&session).cloned() {
+			n.notify_one();
+		}
+	}
+
+	/// Our direct-IP ack: `HelloAck2` (with eph + caps) for a forward-secret session,
+	/// the legacy `HelloAck` for an old initiator.
+	fn hello_ack(&self, session: SessionId, hs: &LocalHs, v2: bool) -> Vec<u8> {
+		if v2 {
+			encode(&PeerMsg::HelloAck2 {
+				session,
+				pubkey: self.identity.public_bytes(),
+				salt: hs.salt,
+				eph: hs.eph_public(),
+				caps: OUR_CAPS,
+			})
+		} else {
+			encode(&PeerMsg::HelloAck {
+				session,
+				pubkey: self.identity.public_bytes(),
+				salt: hs.salt,
+			})
 		}
 	}
 
@@ -793,7 +857,7 @@ mod tests {
 			.lock()
 			.await
 			.pending_salt
-			.insert(SESSION, random_salt());
+			.insert(SESSION, LocalHs::new());
 		node.handle_relay(RelayMsg::PeerFound {
 			target: DeviceId(1),
 			target_addr: public,

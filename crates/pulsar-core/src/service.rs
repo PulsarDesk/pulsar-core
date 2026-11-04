@@ -18,11 +18,12 @@ mod auth;
 mod client;
 mod host;
 pub mod media;
+pub(crate) mod pake;
 mod wire;
 
 pub use auth::{
 	accept, authenticate, need_password, recv_auth, recv_client_auth, recv_host_auth, reject,
-	send_auth, AuthOutcome, ClientAuth, HostAuth,
+	send_auth, AuthAttempt, AuthOutcome, ClientAuth, HostAuth,
 };
 pub use client::{
 	decode_data, decode_windows, is_bye, is_pong, query_stream_caps, query_windows, request_games,
@@ -30,6 +31,7 @@ pub use client::{
 	send_input_via, send_keepalive, send_query_windows,
 };
 pub use host::{serve, serve_with, DataHandlers};
+pub use pake::{norm_otp, Credential};
 pub use wire::{
 	ClientStats, DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, LossRecovery, QualityPref,
 	StreamCaps, StreamReq, WindowInfo,
@@ -83,6 +85,13 @@ enum Msg {
 	/// windows (`hwnd` + `title`). Empty on a non-Windows host (no WGC per-window
 	/// source) or when enumeration fails.
 	Windows(Vec<wire::WindowInfo>),
+	/// Client → host: PAKE password attempt (see `pake`) — replaces a non-empty `Auth`
+	/// with a PAKE-capable host. The password itself never travels.
+	AuthPake(pake::Offer),
+	/// Host → client: SPAKE2 replies + host key-confirmation MACs.
+	AuthPakeReply(pake::Reply),
+	/// Client → host: which slot matched + the client key-confirmation MAC.
+	AuthPakeConfirm(pake::Confirm),
 }
 
 /// A short, human-typable one-time password like `7yf2-qk9p` (no ambiguous chars).

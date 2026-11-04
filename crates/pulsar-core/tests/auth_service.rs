@@ -4,7 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use pulsar_core::service::{accept, authenticate, need_password, recv_auth, reject, AuthOutcome};
+use pulsar_core::service::{
+	accept, authenticate, need_password, recv_auth, reject, AuthOutcome, Credential,
+};
 use pulsar_core::{NetworkMode, Node};
 use pulsar_relay::Relay;
 use tokio::time::timeout;
@@ -32,10 +34,12 @@ async fn host_prompts_then_accepts_correct_password() {
 		let host = host.clone();
 		tokio::spawn(async move {
 			while let Some(mut session) = host.next_incoming().await {
-				let provided = recv_auth(&mut session).await.unwrap_or_default();
-				if provided.is_empty() {
+				let Some(attempt) = recv_auth(&mut session).await else {
+					continue;
+				};
+				if attempt.is_empty() {
 					let _ = need_password(&mut session).await;
-				} else if provided == "sezam" {
+				} else if attempt.verify(&mut session, "", "sezam").await == Credential::Fixed {
 					let _ = accept(&mut session).await;
 				} else {
 					let _ = reject(&mut session).await;

@@ -26,7 +26,8 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::timeout;
 
 use crate::config::NetworkMode;
-use crate::crypto::{random_salt, Identity, Role, Session as Crypto};
+use crate::crypto::{Identity, LocalHs, PeerHs, Role, Session as Crypto};
+use pulsar_proto::CAP_PAKE;
 
 mod handlers;
 mod node;
@@ -75,6 +76,14 @@ pub enum ConnError {
 	/// A credential was supplied but the relay rejected it (wrong password or wrong TOTP).
 	#[error("relay authentication failed — wrong password or 2FA code")]
 	RelayAuthFailed,
+	/// A password was given but the peer is an older Pulsar without the PAKE session
+	/// auth. The password is NOT sent in that case (a man-in-the-middle relay could read
+	/// it); the user must update the other device (or connect without a password).
+	#[error("peer runs an older Pulsar without secure password auth — update it")]
+	PeerOutdated,
+	/// The session ended (or its state was already gone) mid-operation.
+	#[error("session closed")]
+	SessionClosed,
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
 }
@@ -94,7 +103,7 @@ pub enum Transport {
 /// too short — never index-slices an untrusted, attacker-influenced buffer.
 /// `< 64` (not `!= 64`): the blob may carry the optional LAN-candidate tail
 /// (see [`parse_lan_candidate`]) — anything after the fixed part is tolerated.
-fn split_handshake(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+fn split_handshake(blob: &[u8]) -> Option<([u8; 32], PeerHs, u8)> {
 	if blob.len() < 64 {
 		return None;
 	}
@@ -102,7 +111,43 @@ fn split_handshake(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
 	let mut salt = [0u8; 32];
 	pubkey.copy_from_slice(&blob[..32]);
 	salt.copy_from_slice(&blob[32..64]);
-	Some((pubkey, salt))
+	// Extension v1 (after the always-present 6-byte LAN slot): ver(1) || caps(1) || eph(32).
+	let (eph, caps) = match blob.get(70..HS_BLOB_LEN) {
+		Some(t) if t[0] == HS_EXT_V1 => {
+			let mut eph = [0u8; 32];
+			eph.copy_from_slice(&t[2..34]);
+			(Some(eph), t[1])
+		}
+		_ => (None, 0),
+	};
+	Some((pubkey, PeerHs { salt, eph }, caps))
+}
+
+/// Handshake-blob extension version byte (see [`handshake_blob`]).
+const HS_EXT_V1: u8 = 0x01;
+/// Full v1 blob: pubkey(32) || salt(32) || LAN(6) || ver(1) || caps(1) || eph(32).
+const HS_BLOB_LEN: usize = 104;
+/// Capabilities this build advertises in its handshakes.
+pub(crate) const OUR_CAPS: u8 = CAP_PAKE;
+
+/// Relay-path handshake blob. The LAN slot is ALWAYS written (zeros = none, which
+/// `parse_lan_candidate` reads as absent) so old peers, which read bytes 64..70 as the
+/// LAN candidate and ignore anything after, keep working; new peers read the extension.
+fn handshake_blob(pubkey: [u8; 32], hs: &LocalHs, lan: Option<SocketAddr>) -> Vec<u8> {
+	let mut blob = Vec::with_capacity(HS_BLOB_LEN);
+	blob.extend_from_slice(&pubkey);
+	blob.extend_from_slice(&hs.salt);
+	match lan {
+		Some(SocketAddr::V4(a)) => {
+			blob.extend_from_slice(&a.ip().octets());
+			blob.extend_from_slice(&a.port().to_be_bytes());
+		}
+		_ => blob.extend_from_slice(&[0u8; 6]),
+	}
+	blob.push(HS_EXT_V1);
+	blob.push(OUR_CAPS);
+	blob.extend_from_slice(&hs.eph_public());
+	blob
 }
 
 /// Optional same-LAN punch candidate appended to the 64-byte handshake blobs:

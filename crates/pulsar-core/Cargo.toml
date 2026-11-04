@@ -25,6 +25,10 @@ tracing.workspace = true
 x25519-dalek = { workspace = true, features = ["static_secrets"] }
 chacha20poly1305.workspace = true
 sha2.workspace = true
+# PAKE session auth (service/pake.rs): the one-time / connect password is proven with
+# SPAKE2 and never travels, not even inside the encrypted session. hmac = key confirmation.
+spake2 = { version = "0.4", features = ["getrandom"] }
+hmac = "0.13"
 # gilrs removed: controller reading + rumble are via SDL3 (sdl3-sys) in the app crate.
 # Reed-Solomon erasure coding for the media FEC parity (adaptive streaming Phase 2.1):
 # per video frame, `m` parity packets let the client rebuild up to `m` lost packets with

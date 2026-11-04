@@ -19,9 +19,13 @@ pub(super) struct SessionState {
 	pub(super) send_seq: u64,
 	pub(super) direct_ok: bool,
 	pub(super) data_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
-	/// Our per-session handshake salt. Kept so a `Hello`/`HelloAck` retransmit
-	/// re-sends the *same* salt (otherwise the peer would derive a mismatched key).
-	pub(super) our_salt: [u8; 32],
+	/// Our per-session handshake state (salt + ephemeral key). Kept so a
+	/// `Hello`/`HelloAck` retransmit re-sends the *same* values (otherwise the peer
+	/// would derive a mismatched key).
+	pub(super) our_hs: LocalHs,
+	/// The peer's advertised handshake capabilities (`pulsar_proto::CAP_*`); `0` for
+	/// an old peer.
+	pub(super) peer_caps: u8,
 	/// `Auto` path choice ran for this session (see `path.rs`) — once per session.
 	pub(super) path_checked: bool,
 	/// The path choice found the relay clearly faster: keep sending through it even
@@ -54,7 +58,7 @@ pub(super) struct Inner {
 	/// *before* we receive the peer's reply (and thus derive the key later): the
 	/// relay-path requester (`connect` → `PeerFound`) and the direct-IP initiator
 	/// (`connect_direct` → `HelloAck`). Removed once the key is derived.
-	pub(super) pending_salt: HashMap<SessionId, [u8; 32]>,
+	pub(super) pending_salt: HashMap<SessionId, LocalHs>,
 	/// The relay's per-session forwarding rate cap (kbit/s, 0 = uncapped) parsed from a
 	/// `PeerFound`, held until `connect` builds the [`Session`] and copies it in. Only set on
 	/// the relay-fallback rendezvous path; consumed when the session is returned.

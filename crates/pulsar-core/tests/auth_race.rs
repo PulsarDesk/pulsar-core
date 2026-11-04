@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use pulsar_core::service::{
 	accept, need_password, recv_auth, recv_client_auth, recv_host_auth, reject, send_auth,
-	ClientAuth, HostAuth,
+	ClientAuth, Credential, HostAuth,
 };
 use pulsar_core::{NetworkMode, Node};
 use pulsar_relay::Relay;
@@ -26,8 +26,12 @@ async fn spawn_host(host: Arc<Node>, allow: oneshot::Receiver<bool>, accepted: A
 		let Some(mut session) = host.next_incoming().await else {
 			return;
 		};
-		let provided = recv_auth(&mut session).await.unwrap_or_default();
-		let ok = if provided == "sezam" {
+		let Some(provided) = recv_auth(&mut session).await else {
+			return;
+		};
+		let ok = if !provided.is_empty()
+			&& provided.verify(&mut session, "", "sezam").await != Credential::None
+		{
 			true
 		} else {
 			let _ = need_password(&mut session).await;
@@ -37,8 +41,8 @@ async fn spawn_host(host: Arc<Node>, allow: oneshot::Receiver<bool>, accepted: A
 					biased;
 					d = &mut allow => break matches!(d, Ok(true)),
 					m = recv_client_auth(&mut session) => match m {
-						ClientAuth::Password(pw) => {
-							if pw == "sezam" { break true; }
+						ClientAuth::Attempt(a) => {
+							if a.verify(&mut session, "", "sezam").await != Credential::None { break true; }
 							let _ = need_password(&mut session).await;
 						}
 						ClientAuth::Keepalive => {}
