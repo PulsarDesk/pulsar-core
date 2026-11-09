@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::ChannelLayout;
+use crate::audio::{AudioQuality, ChannelLayout};
 use crate::input::{EmulationTarget, GamepadState};
 
 /// A game/app the host exposes to clients.
@@ -336,6 +336,12 @@ pub struct StreamReq {
 	/// `#[serde(default)]` (false): old clients keep the single-reference stream.
 	#[serde(default)]
 	pub rfi: bool,
+	/// How to encode the audio ([`AudioQuality`]; the client resolved its "auto"). `Raw`
+	/// only to a host advertising [`FEAT_AUDIO_RAW`](crate::service::media::FEAT_AUDIO_RAW).
+	/// `#[serde(default)]` (`Standard`): an old client gets the same Opus stream as before,
+	/// and an old host ignores the field.
+	#[serde(default)]
+	pub audio_quality: AudioQuality,
 }
 
 /// Client → host feedback the adaptive controller sends every window as
@@ -519,6 +525,7 @@ enum DataMsgWire {
 	CursorLabel(bool),
 	MediaRfi { first: u16, last: u16 },
 	ProbeReq { rates_kbps: Vec<u32>, train_ms: u16 },
+	PointerLock(bool),
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -552,6 +559,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::CursorLabel(on) => DataMsg::CursorLabel(on),
 			DataMsgWire::MediaRfi { first, last } => DataMsg::MediaRfi { first, last },
 			DataMsgWire::ProbeReq { rates_kbps, train_ms } => DataMsg::ProbeReq { rates_kbps, train_ms },
+			DataMsgWire::PointerLock(on) => DataMsg::PointerLock(on),
 		}
 	}
 }
@@ -717,6 +725,12 @@ pub enum DataMsg {
 	/// media datagrams. Sent only to hosts advertising
 	/// [`FEAT_PROBE`](crate::service::media::FEAT_PROBE); appended for additive wire compat.
 	ProbeReq { rates_kbps: Vec<u32>, train_ms: u16 },
+	/// Host → client: the host's mouse cursor is hidden (`true` — a game captured the mouse and
+	/// reads RELATIVE motion) or shown again (`false`). A client that positions the host pointer
+	/// absolutely switches to relative deltas while it is on, as Parsec does: absolute moves
+	/// spin a raw-input game's camera without end. Appended for additive wire compat (an old
+	/// client ignores it).
+	PointerLock(bool),
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -750,6 +764,16 @@ impl<'de> Deserialize<'de> for DataMsg {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn streamreq_missing_audio_quality_defaults_to_standard() {
+		let json = r#"{"port":5000,"codec":"h264","encoder":"auto","width":0,"height":0}"#;
+		let req: StreamReq = serde_json::from_str(json).expect("old StreamReq must deserialize");
+		assert_eq!(req.audio_quality, AudioQuality::Standard);
+		for (q, s) in [(AudioQuality::Standard, "\"standard\""), (AudioQuality::High, "\"high\""), (AudioQuality::Raw, "\"raw\"")] {
+			assert_eq!(serde_json::to_string(&q).unwrap(), s);
+		}
+	}
 
 	#[test]
 	fn streamreq_missing_loss_recovery_defaults_to_normal() {
@@ -1126,6 +1150,7 @@ mod tests {
 			DataMsg::CursorLabel(false),
 			DataMsg::MediaRfi { first: 65530, last: 4 },
 			DataMsg::ProbeReq { rates_kbps: vec![2_500, 5_000, 10_000], train_ms: 150 },
+			DataMsg::PointerLock(true),
 		];
 
 		for msg in cases {

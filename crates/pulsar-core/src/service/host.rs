@@ -305,7 +305,7 @@ pub async fn serve_with(
 				m @ (DataMsg::FsList { .. } | DataMsg::FsGet { .. }) => (data.on_fs)(m),
 				DataMsg::FsEntries { .. } => {} // host→client only; ignore if echoed back
 				// Cursor side-channel + rumble are host→client only; ignore if echoed back.
-				DataMsg::CursorPos { .. } | DataMsg::CursorShape { .. } | DataMsg::CursorHidden => {}
+				DataMsg::CursorPos { .. } | DataMsg::CursorShape { .. } | DataMsg::CursorHidden | DataMsg::PointerLock(_) => {}
 				DataMsg::Rumble { .. } => {}
 			},
 			_ => {}

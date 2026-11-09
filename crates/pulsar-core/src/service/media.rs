@@ -427,6 +427,10 @@ pub const TAG_PROBE: u8 = 0x05;
 /// Feature id: the host answers [`DataMsg::ProbeReq`](crate::service::DataMsg::ProbeReq) with
 /// probe packet trains (the session-start bandwidth probe, `adapt::probe`).
 pub const FEAT_PROBE: &str = "probe";
+/// Feature id: the host can send uncompressed audio
+/// ([`AudioQuality::Raw`](crate::audio::AudioQuality::Raw), RTP L16 on
+/// [`L16_PAYLOAD_TYPE`](crate::audio::L16_PAYLOAD_TYPE)).
+pub const FEAT_AUDIO_RAW: &str = "audio_raw";
 
 /// One probe packet as a media session payload: `[TAG_PROBE][hdr][padding]`.
 pub fn probe_frame(h: &crate::adapt::probe::Hdr) -> Vec<u8> {

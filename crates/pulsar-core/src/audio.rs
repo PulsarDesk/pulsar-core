@@ -49,7 +49,8 @@ mod sink;
 mod sink_unix;
 
 pub use command::{
-	audio_command, audio_command_layout, opus_bitrate, opus_rtp_output, opus_rtp_output_layout,
+	audio_command, audio_command_layout, audio_command_quality, opus_bitrate, opus_bitrate_for, opus_rtp_output,
+	opus_rtp_output_layout, opus_rtp_output_quality,
 };
 #[cfg(windows)]
 pub use loopback::{
@@ -63,7 +64,8 @@ pub use process_loopback::{
 };
 pub use mute::{mute_fallback_marker_path, restore_stale_mute_fallback, set_host_muted};
 pub use settings::{
-	AudioInput, AudioPolicy, AudioSettings, ChannelLayout, CHANNELS, SAMPLE_RATE,
+	AudioInput, AudioPolicy, AudioQuality, AudioSettings, ChannelLayout, CHANNELS, L16_PAYLOAD_TYPE,
+	OPUS_PAYLOAD_TYPE, SAMPLE_RATE,
 };
 pub use sink::{
 	default_render_device_id, find_render_device_by_name, restore_stale_redirect,

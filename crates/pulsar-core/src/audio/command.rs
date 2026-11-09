@@ -6,7 +6,7 @@ use super::{AudioInput, CHANNELS, SAMPLE_RATE};
 // `ChannelLayout` is referenced via the sibling `settings` module directly: the
 // `audio` module's re-export list (in audio.rs) is owned by the integration phase,
 // so we don't depend on it re-exporting `ChannelLayout` to compile here.
-use super::settings::ChannelLayout;
+use super::settings::{AudioQuality, ChannelLayout};
 
 /// The shared ffmpeg **output** stage: encode low-latency **Opus** and packetize as
 /// **RTP** to `dest` (e.g. `rtp://1.2.3.4:9100`). Used by both the direct-capture
@@ -40,6 +40,13 @@ pub fn opus_rtp_output(dest: &str) -> Vec<String> {
 /// [`ChannelLayout::opus_streams`] / [`ChannelLayout::opus_mapping`] so a future
 /// native (non-ffmpeg) `opus_multistream_encoder_create` path stays in lock-step.
 pub fn opus_rtp_output_layout(dest: &str, layout: ChannelLayout) -> Vec<String> {
+	opus_rtp_output_quality(dest, layout, AudioQuality::Standard)
+}
+
+/// [`opus_rtp_output_layout`] at a chosen [`AudioQuality`]: `High` raises the bitrate
+/// ([`opus_bitrate_for`]). ffmpeg here only ever sends Opus, so `Raw` gets `High` too — the
+/// uncompressed stream is the in-process encoder's (desktop host).
+pub fn opus_rtp_output_quality(dest: &str, layout: ChannelLayout, quality: AudioQuality) -> Vec<String> {
 	let s = |x: &str| x.to_string();
 	let mut a: Vec<String> = vec![
 		s("-ac"),
@@ -62,7 +69,7 @@ pub fn opus_rtp_output_layout(dest: &str, layout: ChannelLayout) -> Vec<String> 
 		s("-c:a"),
 		s("libopus"),
 		s("-b:a"),
-		opus_bitrate(layout).to_string(),
+		opus_bitrate_for(layout, quality).to_string(),
 		s("-application"),
 		s("lowdelay"),
 		// 10 ms Opus frames. 5 ms halves per-packet latency but doubled the packet rate and
@@ -85,6 +92,18 @@ pub fn opus_rtp_output_layout(dest: &str, layout: ChannelLayout) -> Vec<String> 
 		dest.to_string(),
 	]);
 	a
+}
+
+/// The Opus bitrate (bits/s) for a layout at a quality: `Standard` = [`opus_bitrate`]; `High`
+/// (and `Raw`, when it has to fall back to Opus) = 320 kb/s stereo, 510 kb/s 5.1, 640 kb/s
+/// 7.1 — near libopus' ceiling, past which nothing is audible.
+pub fn opus_bitrate_for(layout: ChannelLayout, quality: AudioQuality) -> u32 {
+	match (quality, layout) {
+		(AudioQuality::Standard, _) => opus_bitrate(layout),
+		(_, ChannelLayout::Stereo) => 320_000,
+		(_, ChannelLayout::Surround51) => 510_000,
+		(_, ChannelLayout::Surround71) => 640_000,
+	}
 }
 
 /// The total Opus bitrate (in bits/s, as an ffmpeg `-b:a` value) for a layout. More
@@ -127,6 +146,16 @@ pub fn audio_command_layout(
 	dest: &str,
 	layout: ChannelLayout,
 ) -> (String, Vec<String>) {
+	audio_command_quality(input, dest, layout, AudioQuality::Standard)
+}
+
+/// [`audio_command_layout`] at a chosen [`AudioQuality`] (see [`opus_rtp_output_quality`]).
+pub fn audio_command_quality(
+	input: &AudioInput,
+	dest: &str,
+	layout: ChannelLayout,
+	quality: AudioQuality,
+) -> (String, Vec<String>) {
 	let s = |x: &str| x.to_string();
 	let mut a: Vec<String> = vec![s("-hide_banner"), s("-loglevel"), s("error")];
 
@@ -140,7 +169,7 @@ pub fn audio_command_layout(
 	}
 
 	// Encode Opus (multistream past stereo), low-latency, and packetize as RTP.
-	a.extend(opus_rtp_output_layout(dest, layout));
+	a.extend(opus_rtp_output_quality(dest, layout, quality));
 	("ffmpeg".to_string(), a)
 }
 
@@ -242,6 +271,18 @@ mod tests {
 		// …and the encode stage is the 8-channel multistream one.
 		assert_eq!(val_after(&args, "-ac"), Some("8"));
 		assert_eq!(val_after(&args, "-mapping_family"), Some("1"));
+	}
+
+	#[test]
+	fn high_quality_raises_the_opus_bitrate_and_raw_falls_back_to_it() {
+		assert_eq!(opus_bitrate_for(ChannelLayout::Stereo, AudioQuality::Standard), 128_000);
+		assert_eq!(opus_bitrate_for(ChannelLayout::Stereo, AudioQuality::High), 320_000);
+		assert_eq!(opus_bitrate_for(ChannelLayout::Stereo, AudioQuality::Raw), 320_000);
+		let a = opus_rtp_output_quality("rtp://127.0.0.1:9", ChannelLayout::Stereo, AudioQuality::High);
+		let i = a.iter().position(|x| x == "-b:a").unwrap();
+		assert_eq!(a[i + 1], "320000");
+		// The layout-only builder is unchanged (Standard).
+		assert_eq!(opus_rtp_output_layout("rtp://127.0.0.1:9", ChannelLayout::Stereo), opus_rtp_output("rtp://127.0.0.1:9"));
 	}
 
 	#[test]

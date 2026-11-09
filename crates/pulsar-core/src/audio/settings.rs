@@ -41,6 +41,31 @@ impl Default for ChannelLayout {
 	}
 }
 
+/// How the host encodes the session's audio. The client resolves its "auto" setting to one of
+/// these (from the measured bandwidth and the path) before asking, so the wire only carries a
+/// concrete choice. `Standard` is the serde default: an older client gets what it always got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioQuality {
+	/// Opus at [`opus_bitrate`](super::opus_bitrate) (128 kb/s stereo).
+	#[default]
+	Standard,
+	/// Opus at [`opus_bitrate_for`](super::opus_bitrate_for)`(.., High)` — 320 kb/s stereo,
+	/// transparent for practical purposes.
+	High,
+	/// Uncompressed 16-bit PCM (RTP L16, [`L16_PAYLOAD_TYPE`], 5 ms packets) — ~1.6 Mb/s
+	/// stereo with no loss concealment to speak of: for a clean, fast path. Needs a host that
+	/// advertises [`FEAT_AUDIO_RAW`](crate::service::media::FEAT_AUDIO_RAW); a host that
+	/// can't send it (ffmpeg fallback paths) sends `High` instead.
+	Raw,
+}
+
+/// RTP payload type of the [`AudioQuality::Raw`] stream: 16-bit big-endian PCM (RFC 3551
+/// L16), 48 kHz, interleaved. Opus stays on 97. Dynamic range, so no static-PT clash.
+pub const L16_PAYLOAD_TYPE: u8 = 98;
+/// Opus RTP payload type (the ffmpeg `-payload_type` both paths use).
+pub const OPUS_PAYLOAD_TYPE: u8 = 97;
+
 impl ChannelLayout {
 	/// Number of PCM/Opus channels in this layout (also the enum's discriminant).
 	pub fn channels(self) -> u16 {
