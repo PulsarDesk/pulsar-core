@@ -32,6 +32,7 @@ use pulsar_proto::CAP_PAKE;
 mod handlers;
 mod node;
 mod path;
+mod portmap;
 mod session;
 mod types;
 
@@ -42,7 +43,16 @@ use types::{Inner, SessionState};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(3);
-const PUNCH_TIMEOUT: Duration = Duration::from_millis(800);
+/// How long `connect` waits for the punch to be answered (after the opening burst) before it
+/// starts the session on the relay. Punches are retransmitted every [`PUNCH_RETRY`] meanwhile,
+/// and both ends keep punching in the background for [`BACKGROUND_PUNCH`] after that.
+const PUNCH_TIMEOUT: Duration = Duration::from_millis(1200);
+const PUNCH_RETRY: Duration = Duration::from_millis(150);
+/// A session that started on the relay keeps trying hard for a direct path this long; the punch
+/// handlers move it over (`transport` → `Direct`) the moment one answers. After that it keeps
+/// trying every [`SLOW_PUNCH`] for as long as it stays on the relay.
+const BACKGROUND_PUNCH: Duration = Duration::from_secs(20);
+const SLOW_PUNCH: Duration = Duration::from_secs(15);
 /// How often to ping the relay so it doesn't evict us. Must stay well under the
 /// relay's `DEVICE_TTL` (30s) or `connect()` later fails with `BadToken`.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);

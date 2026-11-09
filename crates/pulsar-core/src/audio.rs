@@ -18,6 +18,11 @@
 //! capture is live (muting an already-running loopback is safe; opening *into* a mute
 //! is not).
 //!
+//! On Windows the host's whole-desktop audio now comes from
+//! [`run_process_loopback_capture_mode`] in [`ProcessLoopbackMode::Exclude`] mode (everything but
+//! Pulsar's own tree). That taps the app streams before the endpoint volume and mute, so the
+//! caveats above only apply to the endpoint loopback, which remains the fallback.
+//!
 //! Transport mirrors video: a dedicated ffmpeg captures the OS audio, encodes
 //! **Opus** (multistream for 5.1/7.1 — see [`ChannelLayout`]), and ships **RTP over
 //! UDP** to the client (a second flow alongside the H.264 video). The command
@@ -54,6 +59,7 @@ pub use loopback::{
 #[cfg(windows)]
 pub use process_loopback::{
 	process_loopback_format, process_loopback_supported, run_process_loopback_capture,
+	run_process_loopback_capture_mode, ProcessLoopbackMode,
 };
 pub use mute::{mute_fallback_marker_path, restore_stale_mute_fallback, set_host_muted};
 pub use settings::{

@@ -327,6 +327,10 @@ impl DesktopInput {
 	/// matching US-layout evdev keycode (+ Shift when needed) on the existing keyboard device —
 	/// reliable for URLs, passwords, chat and filenames. Non-ASCII codepoints have no fixed
 	/// keycode without a temporary keymap remap and remain unhandled.
+	/// Pinch gestures are not injected on this platform (the host doesn't advertise
+	/// `FEAT_PINCH`, so clients send Ctrl + wheel instead).
+	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
+
 	pub fn type_char(&mut self, c: char) {
 		let Some((key, shift)) = us_char_to_key(c) else {
 			return;

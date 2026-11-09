@@ -16,10 +16,33 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
 - `adapt/` — **adaptive streaming controller** shared by both apps (pure, no I/O):
   `Controller` (2 s windows → target rate, operating point, encoder bitrate net of FEC,
   loss-recovery mode), `ladder` (resolution × fps rungs per codec), `delay` (trendline
-  delay-gradient estimator), `fec_policy` (parity group size from loss). Simulation matrix
-  in `tests/adapt_scenarios.rs`; design in `docs/adaptive-streaming.md`.
+  delay-gradient estimator over arrival **groups**, WebRTC InterArrival style), `fec_policy`
+  (v1 `parity_ratio` for mobile + v2 `FecPolicy` sized from pre-repair loss, desktop host).
+  Simulation matrix in `tests/adapt_scenarios.rs`; design in `docs/adaptive-streaming.md`
+  (poor-link rules of 2026-11-09: cautious 4 Mbit start, soft pins, point floor, goodput cut,
+  floor escape — `Sample::recv_bytes`/`window_ms` > 0 enables the goodput paths; mobile
+  passes 0 and keeps the old halving).
 - `connection/` — `Node`: register → relay-assigned stable 9-digit ID → P2P
-  hole-punch → relay fallback; encrypted `Session`.
+  hole-punch → relay fallback; encrypted `Session`. Punching: opening burst + retransmits for
+  `PUNCH_TIMEOUT`, then the session starts on the relay while BOTH ends keep punching for
+  `BACKGROUND_PUNCH` (20 s) — the Punch/PunchAck handlers move it to `Direct` when one
+  answers. A punch from the peer's public IP on a NEW port is accepted as a peer-reflexive
+  candidate until the path is proven (mobile carrier NATs map per destination).
+  `connection/portmap.rs`: on the first `register()` the node maps its UDP port on the router
+  (NAT-PMP inline, UPnP-IGD in the background; renewed every 10 min, deleted on drop; skipped
+  for loopback nodes / relay-only / `Config::port_mapping = false`). Measured 2026-11-08: a
+  home router behind the ISP's CGNAT let 0 punch packets through without it, all with it.
+  `connection/path.rs` (2026-11-09, Auto mode): **path watchdog** — a relay-rendezvous session
+  on Direct whose direct path is silent 3 s while the relay answers a probe falls back to the
+  relay without dropping (`live_transport()` → Relay; `transport()` stays the connect-time
+  snapshot); authenticated relay Data after ≥ 1 s direct silence = the peer moved → follow at
+  once. Re-upgrade to direct after a hold-down (10 s, doubled per fallback, ≤ 160 s); while
+  relayed, `punch_in_background` re-punches every 15 s for the whole stint; a direct session
+  sends one relay-tunnelled probe per 30 s so the relay keeps its session entry. Only
+  adoption / probe-range acks stamp direct liveness (a peer's background punches prove one
+  direction only). **NAT rebinding:** an authenticated, non-replayed packet from a new address
+  after 1 s quiet on the old one triggers a Punch path check; only the matching PunchAck moves
+  `peer_addr` (residual: the check is unauthenticated — real PATH_CHALLENGE needs a wire change).
 - `crypto.rs` — X25519 identity + ChaCha20-Poly1305; per-session salt +
   session_id in the KDF, direction byte in the nonce. **Key v3** adds an ephemeral X25519 DH (forward
   secrecy) when the peer sends one — relay blob extension `ver||caps||eph` after the
@@ -58,8 +81,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   passwords via **SPAKE2 PAKE** in `service/pake.rs`, MAC'd over the channel binding —
   the password never travels; new clients refuse to send one to an old host
   → `ConnError::PeerOutdated`; hosts still accept legacy plaintext from old clients),
-  keepalive `Ping`/`Pong`/`Bye`, media framing + NACK + **FEC parity** — Reed-Solomon
-  per frame (`TAG_FEC_RS`), XOR kept for v0.11.0 clients (`media.rs`), and **`DataMsg` side channels** (clipboard/chat/file/mic-audio/
+  keepalive `Ping`/`Pong`/`Bye` (no ping id — the desktop client's `PongMatcher` copes),
+  media framing + NACK + **FEC parity** — Reed-Solomon (`TAG_FEC_RS`; `RsFecEncoder::new`
+  groups up to 3 small frames within 25 ms into one block, `per_frame` = old behaviour,
+  released decoders unchanged), XOR kept for v0.11.0 clients, `MediaSendStats` send counters
+  (`media.rs`), and **`DataMsg` side channels** (clipboard/chat/file/mic-audio/
   avatar/fs-browse/client `Stats` JSON/…) in `wire.rs`.
   **`DataMsg` lives HERE, not in pulsar-proto** — proto only covers the
   relay/transport layer.

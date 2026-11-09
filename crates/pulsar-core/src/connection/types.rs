@@ -36,6 +36,13 @@ pub(super) struct SessionState {
 	pub(super) measure_on_direct: bool,
 	/// The path choice's best RTTs `(direct, relay)` in ms (see `Session::path_latency`).
 	pub(super) path_ms: Option<(Option<f32>, Option<f32>)>,
+	/// A relay rendezvous set this session up, so the relay can carry it when the direct path
+	/// dies mid-session (path.rs watchdog). `false` for direct-IP sessions (no relay).
+	pub(super) has_relay: bool,
+	/// Last receive per path (direct / relay), written lock-free by `deliver` (see path.rs).
+	pub(super) stamps: Arc<super::path::LinkStamps>,
+	/// The mid-session path watchdog's state (see path.rs).
+	pub(super) watch: super::path::PathWatch,
 }
 
 #[derive(Default)]

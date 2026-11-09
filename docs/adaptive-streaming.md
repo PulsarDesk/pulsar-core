@@ -273,6 +273,37 @@ Changes (`controller.rs`, `ladder.rs`; desktop `play.rs`):
   `a_burst_of_queue_cuts_lowers_the_ceiling_once_and_the_rate_climbs_back_fast`,
   `host_bound_step_respects_a_pinned_point`, `native_120_gets_a_60_fps_rung_under_it`.
 
+### 2026-11-09 poor-link pass (LOCAL, NOT pushed, untested on the field link)
+
+Evidence: a tethered ~10 Mbit / 78 ms mobile link, 1080p120 pick, seeded from a 40 Mbit LAN
+memory → loss from window 1 → blind halving to the floor, no way back. Changes:
+
+- **Controller** (`adapt/controller.rs`, module doc "Poor-link rules (2026-11-09)"): no memory
+  → start at `min(cap, START_KBPS_NO_MEMORY = 4000)`; startup ramp ×1.5 per clean window, runs
+  past `startup_windows` while clean (≤ 15), ends at the first congestion sign (one mild window
+  only pauses it). Pins are a preferred maximum: `pinned_chain` = pick → lower fps → lower
+  resolution (resolution first if only fps is pinned); `pick_shortfall()` reports when the point
+  is under the pick. Rate never under the point's minimum — the point steps down instead; the
+  bottom rung floor is `rate_floor_for_fps` = max(300, fps × 12). With `window_ms` > 0: severe
+  loss cuts to clamp(0.85 × de-noised delivered, before/2, 0.85 × before), one cut per window
+  (fast reflex counts), hold the next; a cut that lowered the send rate without raising the
+  delivered share = non-congestive loss → learned as noise, cut undone
+  (`loss_is_non_responsive()`); host sending > 1.6× the ask → step the point. Loss tolerance
+  is binomial-aware. **Floor escape:** 10 windows at the floor with steady loss → that loss is
+  the baseline, ceiling reset, probe ×1.5 (20 windows after failed escapes).
+- **Delay** (`adapt/delay.rs`): arrival groups (5 ms send span / 5 ms burst delta, ≤ 100 ms
+  burst), ±30 ms smoother clamp widening ×2 per same-side clamp (≤ 64×), slope cap → trend
+  bounded ±600. Simulated cellular batching: false Overuse in ~1–4 % of windows (was 67–100 %).
+- **FEC v2** (`adapt/fec_policy.rs` `FecPolicy`, desktop `host.rs`): ratio from pre-repair loss
+  (post loss + (nack_ok + fec_ok)/sent), est × 2.5 + 5 %, 10–50 %, fast up / 2-window confirm
+  down; WAN (relayed or non-LAN IP, or RTT ≥ 40 ms) starts at 15 % and keeps it 30 s after the
+  last loss; RTT < 10 ms → LAN. Small frames share RS blocks (`service/media.rs`).
+- **Desktop**: host wire pacer, encoder RFI/rate-control policy, client repair/NACK/ping/
+  watchdog changes, path-class adapt memory — see pulsar-desktop `docs/agents/host-encode.md`
+  and `client-video.md`. **Transport**: path watchdog + NAT rebinding (`docs/agents/modules.md`).
+- Tests: controller units + `adapt_scenarios` (a)–(f) tethered/random-loss/policer/LAN/floor/
+  escape; real sessions: none yet.
+
 ### Phase 1 — the operating-point ladder (the heart of "cam gibi minimum")
 
 | # | Task |

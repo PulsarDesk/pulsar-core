@@ -71,6 +71,12 @@ pub enum InputEvent {
 	/// Sent for printable keys with no Ctrl/Alt/Win held; shortcuts (Ctrl+C) + non-text keys
 	/// (Enter, arrows, F-keys, modifiers) still come as `Key` so VK-level semantics are preserved.
 	Char(char),
+	/// Touchpad pinch (zoom) gesture: `phase` 0 = begin, 1 = update, 2 = end; `scale` is
+	/// cumulative since begin (1.0 = fingers where they started, > 1 = spread / zoom in).
+	/// Additive new->new variant: sent only to hosts that advertise
+	/// [`crate::service::media::FEAT_PINCH`]; every other host gets the Windows-style
+	/// Ctrl + wheel the client falls back to.
+	Pinch { phase: u8, scale: f64 },
 }
 
 /// How the client wants the host to bias the encode: minimize latency, balance,
@@ -163,6 +169,11 @@ pub struct DisplayInfo {
 	/// shows only its fixed resolution presets, no adaptation. See [`StreamReq::adapt`].
 	#[serde(default)]
 	pub modes: Vec<(u32, u32)>,
+	/// The monitor's current refresh rate (Hz); 0 = unknown (old host / not detected). The
+	/// client caps its frame-rate target to it: the host can't capture new frames faster
+	/// than its own panel refreshes.
+	#[serde(default)]
+	pub refresh_hz: u32,
 }
 
 /// One host top-level WINDOW the client can pick as a per-window capture target
@@ -318,6 +329,13 @@ pub struct StreamReq {
 	/// host that has it prefers it over the single-loss XOR parity. `#[serde(default)]`.
 	#[serde(default)]
 	pub fec_rs: bool,
+	/// The client recovers a lost frame by reference-frame invalidation: it reports the lost
+	/// packets ([`DataMsg::MediaRfi`]) and resumes at the host's tagged recovery frame. The
+	/// host then keeps a deeper reference buffer, so an older intact frame is still there to
+	/// predict from. Ask only a host advertising [`FEAT_RFI`](crate::service::media::FEAT_RFI).
+	/// `#[serde(default)]` (false): old clients keep the single-reference stream.
+	#[serde(default)]
+	pub rfi: bool,
 }
 
 /// Client → host feedback the adaptive controller sends every window as
@@ -499,6 +517,8 @@ enum DataMsgWire {
 	CursorHidden,
 	Rumble { slot: u8, large: u8, small: u8 },
 	CursorLabel(bool),
+	MediaRfi { first: u16, last: u16 },
+	ProbeReq { rates_kbps: Vec<u32>, train_ms: u16 },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -530,6 +550,8 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::CursorHidden => DataMsg::CursorHidden,
 			DataMsgWire::Rumble { slot, large, small } => DataMsg::Rumble { slot, large, small },
 			DataMsgWire::CursorLabel(on) => DataMsg::CursorLabel(on),
+			DataMsgWire::MediaRfi { first, last } => DataMsg::MediaRfi { first, last },
+			DataMsgWire::ProbeReq { rates_kbps, train_ms } => DataMsg::ProbeReq { rates_kbps, train_ms },
 		}
 	}
 }
@@ -683,6 +705,18 @@ pub enum DataMsg {
 	/// is up and again whenever the user flips it; the host may still have it turned off
 	/// for every client. Appended for additive wire compat (an old host ignores it → no label).
 	CursorLabel(bool),
+	/// Client → host: the RTP **video** sequence range `first..=last` was lost for good (the
+	/// NACK repair window ran out) — recover WITHOUT a keyframe if you can: invalidate the
+	/// frames those packets carried as references and encode the next frame from an older,
+	/// intact one, tagged as the recovery point (reference-frame invalidation). A host that
+	/// cannot treats it as a keyframe request. Sent only to hosts advertising
+	/// [`FEAT_RFI`](crate::service::media::FEAT_RFI); appended for additive wire compat.
+	MediaRfi { first: u16, last: u16 },
+	/// Client → host, before the stream starts: send bandwidth-probe packet trains at these
+	/// rates, `train_ms` each (`adapt::probe`), as [`TAG_PROBE`](crate::service::media::TAG_PROBE)
+	/// media datagrams. Sent only to hosts advertising
+	/// [`FEAT_PROBE`](crate::service::media::FEAT_PROBE); appended for additive wire compat.
+	ProbeReq { rates_kbps: Vec<u32>, train_ms: u16 },
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -827,6 +861,7 @@ mod tests {
 				height: 1440,
 				primary: true,
 				modes: vec![(2560, 1440), (1920, 1080)],
+				refresh_hz: 144,
 			}],
 		};
 		let json = serde_json::to_string(&caps).unwrap();
@@ -1089,6 +1124,8 @@ mod tests {
 			DataMsg::CursorHidden,
 			DataMsg::Rumble { slot: 0, large: 200, small: 80 },
 			DataMsg::CursorLabel(false),
+			DataMsg::MediaRfi { first: 65530, last: 4 },
+			DataMsg::ProbeReq { rates_kbps: vec![2_500, 5_000, 10_000], train_ms: 150 },
 		];
 
 		for msg in cases {

@@ -5,7 +5,7 @@ use super::*;
 
 impl Node {
 	pub(super) async fn establish_transport(
-		&self,
+		self: &Arc<Self>,
 		session: SessionId,
 	) -> Result<Transport, ConnError> {
 		if self.mode == NetworkMode::RelayOnly {
@@ -15,34 +15,123 @@ impl Node {
 			Some(s) => (s.peer_addr, s.peer_lan),
 			None => return Err(ConnError::P2pFailed),
 		};
+		tracing::info!(session, peer = %peer_addr, lan = ?peer_lan, "p2p: punching the peer");
+		let started = std::time::Instant::now();
 
 		let pk = Arc::new(Notify::new());
 		self.inner.lock().await.punched.insert(session, pk.clone());
-		for seq in 0..PUNCH_ATTEMPTS as u32 {
-			let _ = self
-				.sock
-				.send_to(&encode(&PeerMsg::Punch { session, seq }), peer_addr)
-				.await;
-			// Same-NAT peer: also punch its PRIVATE candidate — the public addr
-			// above is a router hairpin there (lossy); whichever path answers
-			// first wins `peer_addr` (LAN preferred, see the Punch handler).
-			if let Some(lan) = peer_lan {
-				let _ = self
-					.sock
-					.send_to(&encode(&PeerMsg::Punch { session, seq }), lan)
-					.await;
-			}
+		let mut seq = 0u32;
+		// Opening burst. Same-NAT peer: `send_punch` also punches its PRIVATE candidate —
+		// the public addr is a router hairpin there (lossy); whichever path answers first
+		// wins `peer_addr` (LAN preferred, see the Punch handler).
+		while seq < PUNCH_ATTEMPTS as u32 {
+			self.send_punch(session, seq, peer_addr, peer_lan).await;
+			seq += 1;
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
-		let res = timeout(PUNCH_TIMEOUT, pk.notified()).await;
+		// Then keep retransmitting while we wait: the peer's own punches open its NAT for us
+		// only once they leave, and the first ones are often lost to that race.
+		let deadline = tokio::time::Instant::now() + PUNCH_TIMEOUT;
+		let acked = loop {
+			let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+			if left.is_zero() {
+				break false;
+			}
+			if timeout(left.min(PUNCH_RETRY), pk.notified()).await.is_ok() {
+				break true;
+			}
+			self.send_punch(session, seq, peer_addr, peer_lan).await;
+			seq += 1;
+		};
 		// The waiter is only needed during the punch — remove it on every path so the
 		// `punched` map doesn't grow one stale `Arc<Notify>` per session, forever.
 		self.inner.lock().await.punched.remove(&session);
-		match res {
-			Ok(()) => Ok(Transport::Direct),
-			Err(_) if self.mode == NetworkMode::Auto => Ok(Transport::Relay),
-			Err(_) => Err(ConnError::P2pFailed),
+		let ms = started.elapsed().as_millis() as u64;
+		if acked {
+			tracing::info!(session, ms, "p2p: direct path answered");
+			return Ok(Transport::Direct);
 		}
+		if self.mode != NetworkMode::Auto {
+			tracing::info!(session, ms, "p2p: no direct answer — P2P-only mode, giving up");
+			return Err(ConnError::P2pFailed);
+		}
+		tracing::info!(
+			session,
+			ms,
+			"p2p: no direct answer yet — starting on the relay, punching on in the background"
+		);
+		// A direct path proven later should still be compared against the relay (path.rs).
+		if let Some(s) = self.inner.lock().await.sessions.get_mut(&session) {
+			s.measure_on_direct = true;
+		}
+		self.punch_in_background(session, seq);
+		Ok(Transport::Relay)
+	}
+
+	/// One `Punch` to the peer's public candidate (+ its LAN candidate, when it gave one).
+	pub(super) async fn send_punch(
+		&self,
+		session: SessionId,
+		seq: u32,
+		peer_addr: SocketAddr,
+		peer_lan: Option<SocketAddr>,
+	) {
+		let msg = encode(&PeerMsg::Punch { session, seq });
+		let _ = self.sock.send_to(&msg, peer_addr).await;
+		if let Some(lan) = peer_lan {
+			let _ = self.sock.send_to(&msg, lan).await;
+		}
+	}
+
+	/// Keep punching a session that is (still) on the relay for [`BACKGROUND_PUNCH`]: every
+	/// 250 ms for the first seconds, then every second. Stops as soon as the direct path is
+	/// proven (the Punch/PunchAck handlers then move the session's traffic over) or the
+	/// session ends. Both ends run it, so their NATs open towards each other in step even
+	/// when the first packets crossed in the wrong order.
+	///
+	/// After [`BACKGROUND_PUNCH`] it keeps going every [`SLOW_PUNCH`] for the rest of the
+	/// session (one tiny packet): a path that was blocked at connect time (or one the watchdog
+	/// just left, see path.rs) can come back mid-session, and the session should move back to it.
+	/// A fallback starts a fresh loop and bumps `punch_gen`, which retires the older one.
+	pub(super) fn punch_in_background(self: &Arc<Self>, session: SessionId, first_seq: u32) {
+		let weak = Arc::downgrade(self);
+		tokio::spawn(async move {
+			let Some(node) = weak.upgrade() else { return };
+			let gen = match node.inner.lock().await.sessions.get(&session) {
+				Some(s) => s.watch.punch_gen,
+				None => return,
+			};
+			drop(node);
+			let started = std::time::Instant::now();
+			let mut seq = first_seq;
+			let mut told = false;
+			loop {
+				let gap = if started.elapsed() < Duration::from_secs(4) {
+					Duration::from_millis(250)
+				} else if started.elapsed() < BACKGROUND_PUNCH {
+					Duration::from_secs(1)
+				} else {
+					SLOW_PUNCH
+				};
+				tokio::time::sleep(gap).await;
+				let Some(node) = weak.upgrade() else { return };
+				let (addr, lan) = match node.inner.lock().await.sessions.get(&session) {
+					Some(s) if !s.direct_ok && s.watch.punch_gen == gen => (s.peer_addr, s.peer_lan),
+					_ => return, // direct already, a newer loop took over, or the session is gone
+				};
+				if !told && started.elapsed() >= BACKGROUND_PUNCH {
+					told = true;
+					tracing::info!(
+						session,
+						secs = BACKGROUND_PUNCH.as_secs(),
+						every_secs = SLOW_PUNCH.as_secs(),
+						"p2p: no direct path found — the session stays on the relay, retrying slowly"
+					);
+				}
+				node.send_punch(session, seq, addr, lan).await;
+				seq = seq.wrapping_add(1) % super::path::PROBE_SEQ;
+			}
+		});
 	}
 
 	/// Punch a direct path to a known addr. Never relay-falls-back (direct-IP has no
@@ -187,6 +276,9 @@ impl Node {
 						relay_preferred: false,
 						measure_on_direct: false,
 						path_ms: None,
+						has_relay: true,
+						stamps: super::path::LinkStamps::new(),
+						watch: Default::default(),
 					},
 				);
 				// Stash the relay's per-session cap (kbit/s, 0 = uncapped) so `connect` can copy
@@ -200,11 +292,20 @@ impl Node {
 			RelayMsg::RelayData { session, payload } => {
 				// Relay-fallback inbound: unwrap the tunnelled PeerMsg.
 				// Move the decoded payload into `deliver` so it can decrypt in place.
-				// Punch/PunchAck through the relay are the `Auto` path-latency probes (path.rs).
+				// Punch/PunchAck through the relay are the `Auto` path-latency probes (path.rs) —
+				// and proof the relay path is alive (the mid-session watchdog's fallback input).
 				match decode::<PeerMsg>(&payload) {
-					Ok(PeerMsg::Data { seq, payload, .. }) => self.deliver(session, seq, payload).await,
-					Ok(PeerMsg::Punch { seq, .. }) => self.answer_relay_probe(session, seq).await,
-					Ok(PeerMsg::PunchAck { seq, .. }) => self.record_probe(session, seq).await,
+					Ok(PeerMsg::Data { seq, payload, .. }) => {
+						self.deliver(session, seq, payload, None).await
+					}
+					Ok(PeerMsg::Punch { seq, .. }) => {
+						self.relay_heard(session).await;
+						self.answer_relay_probe(session, seq).await
+					}
+					Ok(PeerMsg::PunchAck { seq, .. }) => {
+						self.relay_heard(session).await;
+						self.record_probe(session, seq).await
+					}
 					_ => {}
 				}
 			}
@@ -390,6 +491,9 @@ impl Node {
 					relay_preferred: false,
 					measure_on_direct: true,
 					path_ms: None,
+					has_relay: true,
+					stamps: super::path::LinkStamps::new(),
+					watch: Default::default(),
 				},
 			);
 		}
@@ -416,19 +520,14 @@ impl Node {
 		// session there yet) — the paced retransmits land after it exists, and
 		// recv_loop keeps draining meanwhile.
 		if self.mode != NetworkMode::RelayOnly {
-			let sock = self.sock.clone();
+			tracing::info!(session, peer = %from_addr, lan = ?peer_lan, "p2p: punching the requester");
+			let node = self.clone();
 			tokio::spawn(async move {
 				for seq in 0..PUNCH_ATTEMPTS as u32 {
-					let _ = sock
-						.send_to(&encode(&PeerMsg::Punch { session, seq }), from_addr)
-						.await;
-					if let Some(lan) = peer_lan {
-						let _ = sock
-							.send_to(&encode(&PeerMsg::Punch { session, seq }), lan)
-							.await;
-					}
+					node.send_punch(session, seq, from_addr, peer_lan).await;
 					tokio::time::sleep(Duration::from_millis(20)).await;
 				}
+				node.punch_in_background(session, PUNCH_ATTEMPTS as u32);
 			});
 		}
 
@@ -459,6 +558,11 @@ impl Node {
 						.await;
 					let mut g = self.inner.lock().await;
 					if let Some(s) = g.sessions.get_mut(&session) {
+						// A session that just fell back from a dead direct path keeps it unused for
+						// a hold-down even when a punch proves it again (path.rs `upgrade_held`):
+						// still acked above, so the PEER can see the path; we wait.
+						let held = !s.direct_ok
+							&& super::path::upgrade_held(&s.watch, std::time::Instant::now());
 						// SECURITY: only adopt the data path if `from` is one of this
 						// session's known punch candidates (the relay-observed public addr
 						// or the LAN candidate we were given during rendezvous). Without
@@ -466,7 +570,7 @@ impl Node {
 						// relay, an on-LAN sniff) can redirect the victim's data path to
 						// itself and suppress relay fallback. Mirrors the PunchAck guard
 						// at the PunchAck arm below.
-						if from == s.peer_addr || Some(from) == s.peer_lan {
+						if let Some(reflexive) = punch_candidate(s, from).filter(|_| !held) {
 							// PREFER THE PRIVATE PATH: with both the LAN route and the
 							// router-hairpin route alive, punch retransmits would otherwise
 							// flap `peer_addr` between them — and the hairpin route is the
@@ -474,6 +578,15 @@ impl Node {
 							// arrival no longer overwrites it.
 							if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
 								s.peer_addr = from;
+							}
+							if !s.direct_ok {
+								tracing::info!(session, via = %from, reflexive, "p2p: direct path established (peer's punch arrived)");
+								// Stamped when the path is adopted (the watchdog judges only a proven
+								// path). Later punches are NOT liveness: they are unauthenticated and
+								// prove only peer -> us. A peer that fell back off a path dead towards
+								// it punches us every 250 ms, and counting those kept our watchdog
+								// from ever seeing the silence — our video went on into the dead path.
+								s.stamps.mark_direct(std::time::Instant::now());
 							}
 							s.direct_ok = true;
 							if !s.relay_preferred {
@@ -500,13 +613,23 @@ impl Node {
 				let Some(s) = g.sessions.get_mut(&session) else {
 					return;
 				};
+				// The answer to a NAT-rebinding check (path.rs `maybe_rebind`): the new address is
+				// not a punch candidate, so this comes first.
+				if Node::rebind_answered(s, from, seq, std::time::Instant::now()) {
+					return;
+				}
 				// Only honor acks from one of THIS session's punch candidates:
 				// every Pulsar binds the same well-known port and acks probes for
 				// unknown sessions, so a stale private candidate can resolve to a
 				// DIFFERENT device on our LAN — its ack would lock Direct while
 				// `peer_addr` still points at an unpunchable public addr,
 				// suppressing the relay fallback.
-				if from != s.peer_addr && Some(from) != s.peer_lan {
+				let Some(reflexive) = punch_candidate(s, from) else {
+					return;
+				};
+				// Fallback hold-down (see the Punch arm): the path answers again, but stays unused
+				// for now; the background punch keeps proving it until the hold-down ends.
+				if !s.direct_ok && super::path::upgrade_held(&s.watch, std::time::Instant::now()) {
 					return;
 				}
 				// The ack's source IS a verified working path — adopt it, with the
@@ -515,6 +638,15 @@ impl Node {
 				// blackholes on non-hairpin NATs / rides the lossy hairpin).
 				if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
 					s.peer_addr = from;
+				}
+				if !s.direct_ok {
+					tracing::info!(session, via = %from, reflexive, "p2p: direct path established (our punch was answered)");
+				}
+				// An answer from the session's direct address is liveness for the watchdog (its
+				// own probes come back here) — the adoption, or an ack of a probe-range seq (the
+				// watchdog's / path choice's). Not a late ack of an old hole-punch burst.
+				if from == s.peer_addr && (!s.direct_ok || seq >= super::path::PROBE_SEQ) {
+					s.stamps.mark_direct(std::time::Instant::now());
 				}
 				s.direct_ok = true;
 				if !s.relay_preferred {
@@ -534,7 +666,7 @@ impl Node {
 				session,
 				seq,
 				payload,
-			} => self.deliver(session, seq, payload).await,
+			} => self.deliver(session, seq, payload, Some(from)).await,
 			PeerMsg::KeepAlive { .. } => {}
 			PeerMsg::Hello {
 				session,
@@ -657,6 +789,9 @@ impl Node {
 				relay_preferred: false,
 				measure_on_direct: false,
 				path_ms: None,
+				has_relay: false,
+				stamps: super::path::LinkStamps::new(),
+				watch: Default::default(),
 			},
 		);
 		drop(g);
@@ -737,6 +872,9 @@ impl Node {
 					relay_preferred: false,
 					measure_on_direct: false,
 					path_ms: None,
+					has_relay: false,
+					stamps: super::path::LinkStamps::new(),
+					watch: Default::default(),
 				},
 			);
 		} else {
@@ -798,22 +936,71 @@ impl Node {
 	/// node lock is held ONLY to clone the (Arc-backed) crypto handle and the data
 	/// sender — the AEAD runs AFTER the lock is released, so recv_loop keeps draining
 	/// the socket during a keyframe burst instead of blocking behind a full decrypt.
-	async fn deliver(&self, session: SessionId, seq: u64, ciphertext: Vec<u8>) {
-		let (crypto, tx) = {
+	///
+	/// `from` is the direct source (`None` = tunnelled through the relay). An authenticated
+	/// packet stamps its path's liveness for the mid-session watchdog (lock-free), and one from a
+	/// direct address other than the session's may be a NAT rebinding (`maybe_rebind`, which
+	/// takes the lock again — only in that rare case).
+	async fn deliver(
+		self: &Arc<Self>,
+		session: SessionId,
+		seq: u64,
+		ciphertext: Vec<u8>,
+		from: Option<SocketAddr>,
+	) {
+		let (crypto, tx, stamps, from_current, may_move, may_follow) = {
 			let g = self.inner.lock().await;
 			match g.sessions.get(&session) {
-				Some(s) => (s.crypto.clone(), s.data_tx.clone()),
+				Some(s) => (
+					s.crypto.clone(),
+					s.data_tx.clone(),
+					s.stamps.clone(),
+					from.is_none_or(|f| f == s.peer_addr),
+					// Only a session sending direct has an address to move (`maybe_rebind`).
+					s.transport == Transport::Direct,
+					// ... or a relay to follow the peer onto (`peer_moved_to_relay`).
+					s.has_relay && s.transport == Transport::Direct && s.direct_ok && !s.relay_preferred,
+				),
 				None => return,
 			}
 		};
 		// Decrypt in place off-lock; `buf` is truncated to the plaintext on success.
 		let mut buf = ciphertext;
 		if crypto.open_in_place(seq, &mut buf).is_ok() {
+			let now = std::time::Instant::now();
+			match from {
+				None => {
+					stamps.mark_relay(now);
+					// Checked lock-free per packet; the lock is taken only for the switch itself.
+					if may_follow && super::path::peer_moved(stamps.direct(), now) {
+						self.peer_moved_to_relay(session, now).await;
+					}
+				}
+				Some(_) if from_current => stamps.mark_direct(now),
+				Some(addr) if may_move => self.maybe_rebind(session, addr, now).await,
+				Some(_) => {}
+			}
 			if let Some(tx) = tx {
 				let _ = tx.send(buf);
 			}
 		}
 	}
+}
+
+/// Is `from` an acceptable source for this session's punch traffic? `Some(false)` for one of
+/// the candidates we were given (the relay-observed address, the LAN candidate);
+/// `Some(true)` for a PEER-REFLEXIVE source — the same public IP on another port, which is
+/// what a peer behind an endpoint-dependent ("symmetric") NAT looks like: its NAT gave its
+/// packets to us a different port than the one the relay saw. Only accepted until the direct
+/// path is proven, and never for private/loopback IPs (there, another port on the same IP is
+/// another Pulsar instance, not the peer). Session ids are 53 random bits known only to the
+/// relay and the two peers, so a stray sender on the same carrier IP can't guess one.
+fn punch_candidate(s: &SessionState, from: SocketAddr) -> Option<bool> {
+	if from == s.peer_addr || Some(from) == s.peer_lan {
+		return Some(false);
+	}
+	let public = !is_private_v4(from) && !from.ip().is_loopback() && !from.ip().is_unspecified();
+	(!s.direct_ok && public && from.ip() == s.peer_addr.ip()).then_some(true)
 }
 
 #[cfg(test)]
@@ -1045,6 +1232,36 @@ mod tests {
 		}
 	}
 
+	/// A peer behind an endpoint-dependent NAT answers from the relay-observed IP but a NEW
+	/// port: accepted (and adopted) while the direct path is unproven; once it is proven, another
+	/// port no longer moves it, and a different IP never counts.
+	#[tokio::test]
+	async fn peer_reflexive_port_is_adopted_only_before_the_path_is_proven() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let lan = addr("192.168.77.5:21118");
+		rendezvous(&node, public, lan).await;
+
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 0 }, addr("198.51.100.9:40000")).await;
+		assert!(!node.inner.lock().await.sessions[&SESSION].direct_ok, "another IP never counts");
+
+		let remapped = addr("203.0.113.7:40312");
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 1 }, remapped).await;
+		{
+			let g = node.inner.lock().await;
+			let s = &g.sessions[&SESSION];
+			assert!(s.direct_ok);
+			assert_eq!(s.peer_addr, remapped, "the reflexive source becomes the data path");
+		}
+
+		node.handle_peer(PeerMsg::Punch { session: SESSION, seq: 2 }, addr("203.0.113.7:40999")).await;
+		assert_eq!(
+			node.inner.lock().await.sessions[&SESSION].peer_addr,
+			remapped,
+			"a proven path isn't moved by yet another port"
+		);
+	}
+
 	/// Only a candidate-validated ack wakes the `punched` waiter that gates
 	/// `establish_transport` — a foreign ack must leave it parked (so Auto can
 	/// still fall back to the relay).
@@ -1084,5 +1301,214 @@ mod tests {
 		assert!(timeout(Duration::from_millis(50), pk.notified())
 			.await
 			.is_ok());
+	}
+
+	/// A relay-rendezvous session with a REAL peer key (so the test can seal data the node
+	/// accepts), proven direct via `public`, with relay credentials set (a fallback needs them).
+	/// Returns the peer's crypto, the app-side `Session` and the instant the direct path was
+	/// proven.
+	async fn live_direct_session(
+		node: &Arc<Node>,
+		public: SocketAddr,
+	) -> (Crypto, Session, std::time::Instant) {
+		let ours = LocalHs::new();
+		{
+			let mut g = node.inner.lock().await;
+			g.pending_salt.insert(SESSION, ours.clone());
+			g.self_id = Some(DeviceId(100_000_001));
+			g.token = Some(Token([3u8; 16]));
+		}
+		let peer_id = Identity::generate();
+		let peer_hs = LocalHs::new();
+		node.handle_relay(RelayMsg::PeerFound {
+			target: DeviceId(1),
+			target_addr: public,
+			session: SESSION,
+			answer: handshake_blob(peer_id.public_bytes(), &peer_hs, None),
+			rate_cap_kbps: 0,
+		})
+		.await;
+		let peer_crypto = peer_id.session_hs(
+			node.public_key(),
+			Role::Responder,
+			SESSION,
+			&peer_hs,
+			&PeerHs {
+				salt: ours.salt,
+				eph: Some(ours.eph_public()),
+			},
+		);
+		let (data_tx, data_rx) = mpsc::unbounded_channel();
+		node.inner.lock().await.sessions.get_mut(&SESSION).unwrap().data_tx = Some(data_tx);
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 0 }, public).await;
+		let proven = std::time::Instant::now();
+		let sess = Session {
+			id: SESSION,
+			peer: DeviceId(1),
+			transport: Transport::Direct,
+			node: node.clone(),
+			data_rx,
+			rate_cap_kbps: 0,
+			pake_client: None,
+		};
+		assert_eq!(sess.live_transport().await, Transport::Direct);
+		(peer_crypto, sess, proven)
+	}
+
+	/// Direct path goes silent while the relay still answers → the session moves onto the relay
+	/// (no drop, `live_transport` says so); a brief gap never does; the recovered direct path is
+	/// taken back only after the hold-down.
+	#[tokio::test]
+	async fn a_silent_direct_path_falls_back_to_the_relay_and_recovers() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let (_peer, sess, t0) = live_direct_session(&node, public).await;
+		let ms = Duration::from_millis;
+
+		// A 1 s gap: nothing happens.
+		node.watch_tick(t0 + ms(1000)).await;
+		assert_eq!(sess.live_transport().await, Transport::Direct);
+		// Silent past DEAD_AFTER but the relay hasn't answered (both paths down): stay.
+		node.watch_tick(t0 + ms(2100)).await;
+		node.watch_tick(t0 + ms(3500)).await;
+		assert_eq!(sess.live_transport().await, Transport::Direct, "no fallback onto an unproven relay");
+		// The relay answers during the silence → fall back.
+		node.inner.lock().await.sessions[&SESSION].stamps.mark_relay(t0 + ms(3400));
+		node.watch_tick(t0 + ms(3600)).await;
+		assert_eq!(sess.live_transport().await, Transport::Relay);
+		{
+			let g = node.inner.lock().await;
+			let s = &g.sessions[&SESSION];
+			assert!(!s.direct_ok);
+			assert_eq!(s.transport, Transport::Relay);
+			assert_eq!(s.peer_addr, public, "the direct address is kept for the re-punch");
+		}
+
+		// The direct path answers again at once: held down, the session stays on the relay.
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 7 }, public).await;
+		node.handle_peer(PeerMsg::Punch { session: SESSION, seq: 8 }, public).await;
+		assert_eq!(sess.live_transport().await, Transport::Relay, "no flap inside the hold-down");
+
+		// After the hold-down a proven direct path is taken back.
+		node.inner.lock().await.sessions.get_mut(&SESSION).unwrap().watch.fell_back_at =
+			std::time::Instant::now().checked_sub(Duration::from_secs(11));
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 9 }, public).await;
+		assert_eq!(sess.live_transport().await, Transport::Direct);
+		assert!(node.inner.lock().await.sessions[&SESSION].direct_ok);
+	}
+
+	/// A quiet session whose direct probes are answered is just idle — it never falls back.
+	#[tokio::test]
+	async fn an_idle_session_with_an_answering_direct_path_stays_direct() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let (_peer, sess, _t0) = live_direct_session(&node, public).await;
+		let ms = Duration::from_millis;
+		// Probe answered (the PunchAck stamps the direct path), relay answered too.
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 0x8010_0000 }, public).await;
+		let t1 = std::time::Instant::now();
+		node.inner.lock().await.sessions[&SESSION].stamps.mark_relay(t1 + ms(100));
+		node.watch_tick(t1 + ms(2500)).await;
+		assert_eq!(sess.live_transport().await, Transport::Direct, "2.5 s since the answer: only probing");
+	}
+
+	/// NAT rebinding: only an AUTHENTICATED, non-replayed packet from a new address starts a move,
+	/// only once the old address went quiet, and the move happens only when the new address
+	/// answers the path check (an on-path replay with a third party's source can't redirect the
+	/// stream there).
+	#[tokio::test]
+	async fn rebinding_follows_only_authenticated_packets_after_the_old_address_goes_quiet() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let moved = addr("198.51.100.44:52011"); // the peer behind a new carrier mapping
+		let (peer, mut sess, _t0) = live_direct_session(&node, public).await;
+		let data = |seq: u64, ct: Vec<u8>| PeerMsg::Data {
+			session: SESSION,
+			seq,
+			payload: ct,
+		};
+
+		// Authenticated, but the old address is still live: delivered, not followed.
+		node.handle_peer(data(1, peer.seal(1, b"one")), moved).await;
+		assert_eq!(sess.try_recv().as_deref(), Some(&b"one"[..]));
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, public);
+
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		// Unauthenticated (forged) and replayed packets from the new address: ignored.
+		node.handle_peer(data(2, vec![0u8; 40]), moved).await;
+		node.handle_peer(data(1, peer.seal(1, b"one")), moved).await;
+		assert!(sess.try_recv().is_none());
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, public, "never on unauthenticated packets");
+
+		// A fresh authenticated packet once the old address is quiet: delivered, and the new
+		// address is checked — but nothing moves until it answers.
+		node.handle_peer(data(3, peer.seal(3, b"three")), moved).await;
+		assert_eq!(sess.try_recv().as_deref(), Some(&b"three"[..]));
+		let (checked, seq) = node.inner.lock().await.sessions[&SESSION].watch.rebind_check().expect("a path check");
+		assert_eq!(checked, moved);
+		assert!(seq >= super::super::path::PROBE_SEQ, "a probe-range seq");
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, public, "not before the answer");
+		// More media from the candidate: no second check while the first is in flight.
+		node.handle_peer(data(4, peer.seal(4, b"four")), moved).await;
+		assert_eq!(sess.try_recv().as_deref(), Some(&b"four"[..]));
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].watch.rebind_check(), Some((moved, seq)));
+
+		// A wrong seq, or the right one from elsewhere: not an answer.
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: seq ^ 1 }, moved).await;
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq }, addr("198.51.100.45:52011")).await;
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, public);
+
+		// The new address answers: followed.
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq }, moved).await;
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, moved);
+		assert_eq!(sess.peer_addr().await, Some(moved));
+		assert_eq!(sess.live_transport().await, Transport::Direct);
+		assert!(node.inner.lock().await.sessions[&SESSION].watch.rebind_check().is_none());
+	}
+
+	/// A path dead only towards the peer: the peer falls back onto the relay and punches our
+	/// direct address in the background. Those punches must not keep our direct path "alive",
+	/// and the peer's authenticated relay data makes us follow it at once (not ~3 s later, after
+	/// the peer's app gave up on the silence).
+	#[tokio::test]
+	async fn a_peer_that_fell_back_while_still_punching_is_followed_onto_the_relay() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let (peer, mut sess, _t0) = live_direct_session(&node, public).await;
+		let relay_data = |seq: u64, ct: Vec<u8>| RelayMsg::RelayData {
+			session: SESSION,
+			payload: encode(&PeerMsg::Data { session: SESSION, seq, payload: ct }),
+		};
+		let proven = node.inner.lock().await.sessions[&SESSION].stamps.direct().expect("stamped at adoption");
+
+		// The peer's background punches (unauthenticated, peer -> us only): no liveness.
+		node.handle_peer(PeerMsg::Punch { session: SESSION, seq: 5 }, public).await;
+		node.handle_peer(PeerMsg::PunchAck { session: SESSION, seq: 6 }, public).await;
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].stamps.direct(), Some(proven));
+
+		// Relay data while the direct address delivered just now: the peer mixes paths, stay.
+		node.handle_relay(relay_data(1, peer.seal(1, b"one"))).await;
+		assert_eq!(sess.try_recv().as_deref(), Some(&b"one"[..]));
+		assert_eq!(sess.live_transport().await, Transport::Direct);
+
+		// The direct address quiet for over a second, relay data arrives: the peer moved — follow.
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		node.handle_peer(PeerMsg::Punch { session: SESSION, seq: 7 }, public).await;
+		node.handle_relay(relay_data(2, peer.seal(2, b"two"))).await;
+		assert_eq!(sess.try_recv().as_deref(), Some(&b"two"[..]));
+		assert_eq!(sess.live_transport().await, Transport::Relay);
+		{
+			let g = node.inner.lock().await;
+			let s = &g.sessions[&SESSION];
+			assert!(!s.direct_ok);
+			assert!(s.watch.fell_back_at.is_some(), "an ordinary fallback (hold-down, re-punch)");
+		}
+
+		// Forged relay data never moves a session (it doesn't decrypt).
+		let node2 = test_node().await;
+		let (_peer2, sess2, _t2) = live_direct_session(&node2, public).await;
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		node2.handle_relay(relay_data(3, vec![0u8; 40])).await;
+		assert_eq!(sess2.live_transport().await, Transport::Direct);
 	}
 }

@@ -13,5 +13,6 @@ impl DesktopInput {
 	pub fn scroll(&mut self, _dx: f64, _dy: f64) {}
 	pub fn key(&mut self, _code: u32, _down: bool) {}
 	pub fn type_char(&mut self, _c: char) {}
+	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
 	pub fn flush_held(&mut self) {}
 }

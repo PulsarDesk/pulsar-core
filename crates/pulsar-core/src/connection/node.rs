@@ -51,6 +51,12 @@ pub struct Node {
 	/// so the app can update it (e.g. after prompting for a password/2FA) and re-register on
 	/// the SAME node without rebinding the socket.
 	pub(super) relay_creds: std::sync::Mutex<RelayCreds>,
+	/// Ask the local router for a port mapping (NAT-PMP / UPnP) on the first `register()`
+	/// (see `portmap.rs`). On by default; the app turns it off from its settings.
+	pub(super) port_mapping: std::sync::atomic::AtomicBool,
+	pub(super) portmap_started: std::sync::atomic::AtomicBool,
+	/// Signalled by `Drop`: the port-mapping keeper deletes the router mapping and exits.
+	pub(super) portmap_stop: Arc<Notify>,
 }
 
 /// Credentials a node offers to a relay that requires authentication (v4). Both optional;
@@ -91,6 +97,8 @@ impl Drop for Node {
 		self.id_changed.notify_one();
 		// Wake any version-error watcher so it exits cleanly too.
 		self.version_error.notify_one();
+		// Release the router port mapping (if one was made).
+		self.portmap_stop.notify_one();
 	}
 }
 
@@ -181,8 +189,13 @@ impl Node {
 			incoming_rx: Mutex::new(incoming_rx),
 			shutdown: Arc::new(Notify::new()),
 			relay_creds: std::sync::Mutex::new(creds),
+			port_mapping: std::sync::atomic::AtomicBool::new(true),
+			portmap_started: std::sync::atomic::AtomicBool::new(false),
+			portmap_stop: Arc::new(Notify::new()),
 		});
 		let weak = Arc::downgrade(&node);
+		// Mid-session direct/relay re-evaluation (path.rs); exits at once outside `Auto`.
+		tokio::spawn(super::path::watch_loop(weak.clone()));
 		tokio::spawn(recv_loop(weak));
 		Ok(node)
 	}
@@ -211,6 +224,32 @@ impl Node {
 	/// following a [`ConnError::RelayAuthRequired`]). The next `register()` uses them.
 	pub fn set_relay_creds(&self, creds: RelayCreds) {
 		*self.relay_creds.lock().unwrap() = creds;
+	}
+
+	/// Allow or forbid the router port mapping (NAT-PMP / UPnP) this node asks for on its first
+	/// `register()`. Default on; call before `register()` to turn it off.
+	pub fn set_port_mapping(&self, enabled: bool) {
+		self.port_mapping.store(enabled, std::sync::atomic::Ordering::Relaxed);
+	}
+
+	/// Map the node's UDP port on the local router, once per node, before the first relay
+	/// registration (so the relay already sees the mapped flow). Skipped in relay-only mode
+	/// (it never punches), when disabled, and for loopback-bound nodes (tests, same-PC relays):
+	/// those must never touch the real router.
+	async fn start_port_mapping(&self) {
+		use std::sync::atomic::Ordering;
+		if self.mode == NetworkMode::RelayOnly
+			|| !self.port_mapping.load(Ordering::Relaxed)
+			|| self.portmap_started.swap(true, Ordering::Relaxed)
+		{
+			return;
+		}
+		let Ok(local) = self.sock.local_addr() else { return };
+		if local.ip().is_loopback() || self.relay.ip().is_loopback() {
+			return;
+		}
+		let Some(SocketAddr::V4(lan)) = self.lan_candidate() else { return };
+		super::portmap::start(local.port(), *lan.ip(), self.portmap_stop.clone()).await;
 	}
 
 	/// Whether the relay advertised end-to-end-encryption as required (learned at
@@ -321,6 +360,7 @@ impl Node {
 		// Open with the stored access key when we have one: an authenticated relay accepts
 		// it outright, so a returning device never sees a prompt. Without a key the first
 		// Register carries no auth and the relay challenges as usual.
+		self.start_port_mapping().await;
 		let mut proof: Option<pulsar_proto::AuthProof> = self.key_only_proof();
 		let mut attempts = 0;
 		let id = loop {

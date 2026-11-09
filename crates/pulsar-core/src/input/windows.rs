@@ -48,12 +48,25 @@ fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
 }
 
 fn send_key(vk: u16, flags: u32) {
+	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+		MapVirtualKeyW, KEYEVENTF_EXTENDEDKEY, MAPVK_VK_TO_VSC_EX,
+	};
+	// Carry the real scan code (+ the extended flag for E0/E1 keys: right Ctrl/Alt, Win,
+	// arrows, Ins/Del/Home/End/PgUp/PgDn, ...), like RustDesk's enigo does. A VK-only event
+	// (wScan = 0) is not a complete keystroke: shell shortcuts such as Alt+Tab and many
+	// games look at the scan code and ignored our injected keys.
+	let ext = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
+	let scan = (ext & 0xFF) as u16;
+	let mut flags = flags;
+	if matches!(ext >> 8, 0xE0 | 0xE1) {
+		flags |= KEYEVENTF_EXTENDEDKEY;
+	}
 	let input = INPUT {
 		r#type: INPUT_KEYBOARD,
 		Anonymous: INPUT_0 {
 			ki: KEYBDINPUT {
 				wVk: vk,
-				wScan: 0,
+				wScan: scan,
 				dwFlags: flags,
 				time: 0,
 				dwExtraInfo: 0,
@@ -177,6 +190,118 @@ pub struct DesktopInput {
 	/// absolute mapping. `Some` ⇒ map the normalized coords onto that monitor's rect across
 	/// the whole virtual screen so a non-primary monitor's clicks land on it.
 	monitor: Option<MonitorRect>,
+	/// Lazily started touch-pinch worker (see `pinch`).
+	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
+}
+
+/// Commands for the touch-pinch worker thread.
+enum PinchCmd {
+	Begin,
+	Scale(f64),
+	End,
+}
+
+/// Finger spread (px) at pinch begin, and the clamp for the spread while pinching.
+const PINCH_D0: f64 = 300.0;
+const PINCH_MIN: f64 = 40.0;
+const PINCH_MAX: f64 = 3000.0;
+
+/// Two synthetic touch contacts around the cursor whose spread follows the client's pinch
+/// scale (`InjectTouchInput`, Windows 8+), so host apps see a REAL pinch gesture (browsers,
+/// Photos, Maps, PDF viewers) rather than Ctrl + wheel. The worker re-injects every ~16 ms:
+/// it smooths the client's step-sized updates into continuous finger motion, and keeps the
+/// contacts alive (unrefreshed injected touch is canceled by the system).
+fn pinch_worker(rx: std::sync::mpsc::Receiver<PinchCmd>) {
+	use std::sync::mpsc::RecvTimeoutError;
+	use std::time::{Duration, Instant};
+	use windows_sys::Win32::Foundation::RECT;
+	use windows_sys::Win32::UI::Input::Pointer::{
+		InitializeTouchInjection, InjectTouchInput, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT,
+		POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_TOUCH_INFO,
+		TOUCH_FEEDBACK_NONE,
+	};
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		GetSystemMetrics, PT_TOUCH, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+		SM_YVIRTUALSCREEN, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE,
+	};
+	if unsafe { InitializeTouchInjection(2, TOUCH_FEEDBACK_NONE) } == 0 {
+		tracing::warn!(err = %std::io::Error::last_os_error(), "touch injection unavailable — pinch ignored");
+		for _ in rx {}
+		return;
+	}
+	let inject = |center: POINT, d: f64, flags: u32| {
+		let (vx, vy) = unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)) };
+		let (vw, vh) = unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
+		let clamp_x = |x: i32| x.clamp(vx + 4, vx + vw.max(9) - 5);
+		let y = center.y.clamp(vy + 4, vy + vh.max(9) - 5);
+		let half = (d / 2.0).round() as i32;
+		let xs = [clamp_x(center.x - half), clamp_x(center.x + half)];
+		let mut c: [POINTER_TOUCH_INFO; 2] = unsafe { std::mem::zeroed() };
+		for (i, t) in c.iter_mut().enumerate() {
+			t.pointerInfo.pointerType = PT_TOUCH;
+			t.pointerInfo.pointerId = i as u32;
+			t.pointerInfo.pointerFlags = flags;
+			t.pointerInfo.ptPixelLocation = POINT { x: xs[i], y };
+			t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+			t.rcContact = RECT { left: xs[i] - 4, top: y - 4, right: xs[i] + 4, bottom: y + 4 };
+			t.orientation = 90;
+			t.pressure = 32000;
+		}
+		unsafe { InjectTouchInput(2, c.as_ptr()) }
+	};
+	const MOVE: u32 = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+	let mut active = false;
+	let mut center = POINT { x: 0, y: 0 };
+	let (mut d, mut target) = (PINCH_D0, PINCH_D0);
+	let mut last_msg = Instant::now();
+	loop {
+		let wait = if active { Duration::from_millis(16) } else { Duration::from_secs(3600) };
+		match rx.recv_timeout(wait) {
+			Ok(PinchCmd::Begin) => {
+				if active {
+					inject(center, d, POINTER_FLAG_UP);
+				}
+				unsafe { GetCursorPos(&mut center) };
+				d = PINCH_D0;
+				target = PINCH_D0;
+				active = inject(center, d, POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT) != 0;
+				if !active {
+					tracing::warn!(err = %std::io::Error::last_os_error(), "pinch: touch down injection failed");
+				}
+				last_msg = Instant::now();
+				continue;
+			}
+			Ok(PinchCmd::Scale(s)) => {
+				target = (PINCH_D0 * s).clamp(PINCH_MIN, PINCH_MAX);
+				last_msg = Instant::now();
+			}
+			Ok(PinchCmd::End) => {
+				if active {
+					inject(center, target, MOVE);
+					inject(center, target, POINTER_FLAG_UP);
+					active = false;
+				}
+				continue;
+			}
+			Err(RecvTimeoutError::Timeout) => {}
+			Err(RecvTimeoutError::Disconnected) => {
+				if active {
+					inject(center, d, POINTER_FLAG_UP);
+				}
+				return;
+			}
+		}
+		if active {
+			// A client that vanished mid-pinch must not leave two fingers on the screen.
+			if last_msg.elapsed() > Duration::from_millis(1500) {
+				inject(center, d, POINTER_FLAG_UP);
+				active = false;
+				continue;
+			}
+			d += (target - d) * 0.45;
+			inject(center, d, MOVE);
+		}
+	}
 }
 
 impl DesktopInput {
@@ -187,7 +312,28 @@ impl DesktopInput {
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
 			monitor: None,
+			pinch_tx: None,
 		})
+	}
+
+	/// Touchpad pinch from the client (`InputEvent::Pinch`): phase 0 begin / 1 update / 2 end,
+	/// `scale` cumulative since begin. Injected as a real two-finger touch pinch at the cursor.
+	pub fn pinch(&mut self, phase: u8, scale: f64) {
+		let tx = self.pinch_tx.get_or_insert_with(|| {
+			let (tx, rx) = std::sync::mpsc::channel();
+			let _ = std::thread::Builder::new()
+				.name("pulsar-pinch".into())
+				.spawn(move || pinch_worker(rx));
+			tx
+		});
+		let cmd = match phase {
+			0 => PinchCmd::Begin,
+			1 => PinchCmd::Scale(if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }),
+			_ => PinchCmd::End,
+		};
+		if tx.send(cmd).is_err() {
+			self.pinch_tx = None;
+		}
 	}
 
 	/// Set (or clear) the streamed monitor's virtual-desktop geometry so absolute pointer
@@ -338,6 +484,9 @@ impl DesktopInput {
 	/// Shift/Ctrl or a held mouse button (drag-select) stays stuck on the host.
 	/// Idempotent — drained sets make repeat calls no-ops.
 	pub fn flush_held(&mut self) {
+		if let Some(tx) = &self.pinch_tx {
+			let _ = tx.send(PinchCmd::End); // never leave injected fingers down
+		}
 		for b in self.held_buttons.drain() {
 			let flag = match b {
 				1 => MOUSEEVENTF_RIGHTUP,

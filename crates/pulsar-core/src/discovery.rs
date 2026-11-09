@@ -311,6 +311,48 @@ impl Drop for Discovery {
 	}
 }
 
+/// True when `ip` sits on the subnet of a local VPN / overlay adapter (ZeroTier, Tailscale,
+/// WireGuard, Hamachi, ...) or in Tailscale's CGNAT range. LAN discovery works across such
+/// overlays (ZeroTier even carries the multicast beacon), so a peer found that way LOOKS
+/// same-LAN — but connecting over the overlay adds its encapsulation (and, when it can't go
+/// peer-to-peer, its relays) to every packet. Callers skip the same-LAN shortcut for these
+/// and take the regular internet P2P path instead.
+pub fn is_overlay_vpn_addr(ip: IpAddr) -> bool {
+	let IpAddr::V4(peer) = ip else {
+		return false;
+	};
+	let o = peer.octets();
+	if o[0] == 100 && (64..128).contains(&o[1]) {
+		return true; // 100.64.0.0/10 — Tailscale / carrier-grade NAT, never a real LAN
+	}
+	if_addrs::get_if_addrs()
+		.map(|ifs| {
+			ifs.iter().any(|i| match &i.addr {
+				if_addrs::IfAddr::V4(a) => {
+					let mask = u32::from(a.netmask);
+					mask != 0
+						&& (u32::from(a.ip) & mask) == (u32::from(peer) & mask)
+						&& is_overlay_iface_name(&i.name)
+				}
+				_ => false,
+			})
+		})
+		.unwrap_or(false)
+}
+
+/// Interface names of VPN / overlay adapters: Windows friendly names ("ZeroTier One [..]",
+/// "Tailscale", "WireGuard Tunnel", "Hamachi") and Unix names (`zt*`, `tailscale0`, `wg*`,
+/// `tun*`, `utun*`, `ham*`).
+fn is_overlay_iface_name(name: &str) -> bool {
+	let n = name.to_ascii_lowercase();
+	const WORDS: &[&str] = &[
+		"zerotier", "tailscale", "wireguard", "hamachi", "radmin", "openvpn", "tap-windows", "wintun",
+		"nordlynx", "mullvad", "protonvpn", "netbird", "nebula",
+	];
+	const PREFIXES: &[&str] = &["zt", "wg", "tun", "utun", "ham"];
+	WORDS.iter().any(|w| n.contains(w)) || PREFIXES.iter().any(|p| n.starts_with(p))
+}
+
 /// Every usable local IPv4 NIC address (excludes loopback + link-local APIPA `169.254/16`).
 ///
 /// LAN discovery must join/send the multicast group on ALL of these, not just the OS default
@@ -483,5 +525,22 @@ mod tests {
 
 		// A never lists itself.
 		assert!(a.peers().await.iter().all(|p| p.name != "Alice"));
+	}
+}
+
+#[cfg(test)]
+mod overlay_tests {
+	use super::*;
+
+	#[test]
+	fn overlay_adapters_are_recognised_and_real_nics_are_not() {
+		for n in ["ZeroTier One [0123456789abcdef]", "Tailscale", "WireGuard Tunnel", "Hamachi", "zt5u4y3j2k", "tailscale0", "wg0", "utun3", "ham0"] {
+			assert!(is_overlay_iface_name(n), "{n}");
+		}
+		for n in ["Ethernet 3", "Wi-Fi 5", "eth0", "wlan0", "enp3s0", "vEthernet (Default Switch)"] {
+			assert!(!is_overlay_iface_name(n), "{n}");
+		}
+		assert!(is_overlay_vpn_addr("100.101.102.103".parse().unwrap()), "Tailscale CGNAT range");
+		assert!(!is_overlay_vpn_addr("192.0.2.10".parse().unwrap()), "not on any local overlay");
 	}
 }

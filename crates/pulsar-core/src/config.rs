@@ -60,6 +60,10 @@ pub struct Config {
 	pub use_local_relay: bool,
 	/// Connection strategy.
 	pub network_mode: NetworkMode,
+	/// Ask the local router to map Pulsar's UDP port (NAT-PMP, then UPnP) so peers' direct
+	/// (P2P) packets get through routers that otherwise drop them. Settings → Ağ; default on.
+	#[serde(default = "default_true")]
+	pub port_mapping: bool,
 	/// Friendly name advertised to peers.
 	pub device_name: String,
 	/// UI language.
@@ -128,6 +132,12 @@ pub struct Config {
 	/// Settings → Güvenlik toggle; default on.
 	#[serde(default = "default_true")]
 	pub show_remote_cursor: bool,
+	/// Client: hold a new session on the "optimizing stream" screen until the adaptive bitrate
+	/// has found the path's stable rate (a few seconds), so the first picture is already at
+	/// it. Off = show the picture on the first frame and adapt in view. Settings → Ekran;
+	/// default on.
+	#[serde(default = "default_true")]
+	pub pre_optimize_stream: bool,
 	/// Client: let the host show this device's pointer, labelled with its name, on its screen
 	/// while this device can't control it (the Pulsar menu → Yayın toggle during a session). Default on; the host can still
 	/// turn it off for everyone with [`Self::show_remote_cursor`].
@@ -150,6 +160,7 @@ impl Default for Config {
 			relay_keys: std::collections::HashMap::new(),
 			use_local_relay: false,
 			network_mode: NetworkMode::Auto,
+			port_mapping: true,
 			device_name: default_device_name(),
 			language: Language::Tr,
 			unattended_access: false,
@@ -164,6 +175,7 @@ impl Default for Config {
 			ui_hardware_accel: None,
 			request_admin: true,
 			show_remote_cursor: true,
+			pre_optimize_stream: true,
 			share_cursor_label: true,
 		}
 	}

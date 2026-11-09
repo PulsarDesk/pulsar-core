@@ -33,6 +33,9 @@ const REF_H264: &[(u32, u32, u32)] = &[
 	(360, 30, 600),
 ];
 
+/// Common display refresh rates the fps rungs step through (below the target).
+pub const FPS_STEPS: &[u32] = &[240, 165, 144, 120, 90, 60, 30];
+
 /// Codec efficiency relative to H.264 (a lower factor = fewer bits for the same look).
 fn codec_factor(codec: VCodec) -> f32 {
 	match codec {
@@ -79,12 +82,14 @@ pub fn build(codec: VCodec, native_w: u32, native_h: u32, native_fps: u32) -> Ve
 			heights.push(h);
 		}
 	}
-	// A high-refresh native (> 60) also gets a 60 fps rung: halving 120 fps is the cheapest
-	// relief for a host that can't encode it in real time.
-	let fps_rungs: Vec<u32> = if nfps > 60 {
-		vec![nfps, 60, 30]
-	} else if nfps >= 50 {
-		vec![nfps, 30]
+	// Frame-rate rungs: the target (the client's display refresh, capped by the host's) first,
+	// then every common display rate under it down to 30 — 240 → 165 → 144 → 120 → 90 → 60 →
+	// 30 — so a budget or a host that can't hold the target steps the fps down gradually
+	// instead of halving it.
+	let fps_rungs: Vec<u32> = if nfps >= 50 {
+		let mut v = vec![nfps];
+		v.extend(FPS_STEPS.iter().copied().filter(|&f| f < nfps));
+		v
 	} else {
 		vec![nfps.max(1)]
 	};
@@ -120,6 +125,22 @@ pub fn build(codec: VCodec, native_w: u32, native_h: u32, native_fps: u32) -> Ve
 	});
 	out.dedup();
 	out
+}
+
+/// One point at an arbitrary `w × h @ fps` (a user-picked display mode that isn't a ladder
+/// rung), its minimum derived like `build`'s.
+pub fn point_at(codec: VCodec, w: u32, h: u32, fps: u32) -> Point {
+	let reference = REF_H264
+		.iter()
+		.find(|&&(rh, rf, _)| rh == h && rf == fps && (w as f64 / h as f64 - 16.0 / 9.0).abs() < 0.05)
+		.map(|&(_, _, k)| k);
+	let base = reference.unwrap_or_else(|| min_kbps_for(w, h, fps));
+	Point {
+		width: w,
+		height: h,
+		fps,
+		min_kbps: ((base as f64 * codec_factor(codec) as f64).round() as u32).max(200),
+	}
 }
 
 /// Index of the highest point whose minimum fits `budget_kbps × margin` (0.85 in the
@@ -171,9 +192,11 @@ mod tests {
 		let l = build(VCodec::H264, 2560, 1440, 144);
 		assert_eq!(l[0].label(), "1440p144");
 		assert!(l[0].min_kbps > 8000, "{}", l[0].min_kbps);
-		assert_eq!(l[1].label(), "1440p60", "a high-refresh native gets a 60 fps rung");
-		assert_eq!(l[2].label(), "1080p144", "ordered by the bits a rung needs");
-		assert_eq!(l[2].width, 1920);
+		assert_eq!(l[1].label(), "1440p120", "a high-refresh native steps down through the common rates");
+		assert_eq!(l[2].label(), "1440p90", "ordered by the bits a rung needs");
+		let p1080 = l.iter().position(|p| p.label() == "1080p144").expect("1080p144 rung");
+		assert!(p1080 > 2 && l[p1080].min_kbps < l[2].min_kbps, "{l:?}");
+		assert_eq!(l[p1080].width, 1920);
 		assert!(l.iter().any(|p| p.label() == "1440p30"));
 		let uw = build(VCodec::H264, 3440, 1440, 60);
 		let p720 = uw.iter().find(|p| p.height == 720).unwrap();
@@ -184,9 +207,25 @@ mod tests {
 	fn native_120_gets_a_60_fps_rung_under_it() {
 		let l = build(VCodec::H264, 1920, 1080, 120);
 		let labels: Vec<String> = l.iter().map(Point::label).collect();
-		assert_eq!(&labels[..2], &["1080p120", "1080p60"], "{labels:?}");
+		assert_eq!(&labels[..2], &["1080p120", "1080p90"], "{labels:?}");
+		assert!(labels.contains(&"1080p60".to_string()), "{labels:?}");
 		assert!(labels.contains(&"720p60".to_string()) && labels.contains(&"720p30".to_string()), "{labels:?}");
 		assert!(!labels.iter().any(|l| l == "540p60" || l == "360p60"), "{labels:?}");
+	}
+
+	/// The fps rungs at one height: the target first, then every common display rate under it.
+	#[test]
+	fn fps_rungs_step_through_the_common_display_rates() {
+		let fps_at = |native: u32, h: u32| -> Vec<u32> {
+			let mut v: Vec<u32> =
+				build(VCodec::H265, 1920, 1080, native).iter().filter(|p| p.height == h).map(|p| p.fps).collect();
+			v.sort_unstable_by(|a, b| b.cmp(a));
+			v
+		};
+		assert_eq!(fps_at(240, 1080), vec![240, 165, 144, 120, 90, 60, 30]);
+		assert_eq!(fps_at(165, 1080), vec![165, 144, 120, 90, 60, 30]);
+		assert_eq!(fps_at(75, 1080), vec![75, 60, 30], "an uncommon panel rate is the target as-is");
+		assert_eq!(fps_at(60, 1080), vec![60, 30]);
 	}
 
 	#[test]

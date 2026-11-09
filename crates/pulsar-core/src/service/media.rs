@@ -35,7 +35,7 @@ pub fn frame(tag: u8, rtp: &[u8]) -> Vec<u8> {
 /// control messages, junk). Empty RTP is rejected.
 pub fn parse(payload: &[u8]) -> Option<(u8, &[u8])> {
 	match payload.split_first() {
-		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS), rest)) if !rest.is_empty() => Some((tag, rest)),
+		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS | TAG_PROBE), rest)) if !rest.is_empty() => Some((tag, rest)),
 		_ => None,
 	}
 }
@@ -400,8 +400,10 @@ mod fec_tests {
 // (Sunshine/Moonlight, Parsec) is Reed-Solomon per video frame: the frame's `k` packets are
 // the data shards, `m = ceil(k × ratio)` parity shards ride behind them, and the client
 // rebuilds ANY `≤ m` lost packets of that frame — still with zero round-trips. The ratio
-// follows the measured loss (`adapt::fec_policy::parity_ratio`, 10–30 %), off on a clean
-// path. A separate tag so old clients (XOR only) ignore it and old hosts never see it.
+// follows the measured loss (`adapt::fec_policy::parity_ratio`, 10–30 %; the desktop host
+// uses `FecPolicy`: pre-repair loss, proactive on WAN, up to 50 %), off on a clean path.
+// Small frames share one block across up to three frames (see `RsFecEncoder`). A separate
+// tag so old clients (XOR only) ignore it and old hosts never see it.
 //
 // Framing: `[TAG_FEC_RS][base_seq u16][k u8][m u8][idx u8][shard_len u16][shard…]` — one
 // parity shard per datagram. Every DATA shard is `[len u16][rtp…][zero pad]` so a rebuilt
@@ -411,6 +413,33 @@ mod fec_tests {
 pub const TAG_FEC_RS: u8 = 0x04;
 /// Feature id: the host can send Reed-Solomon parity (client asks with `StreamReq::fec_rs`).
 pub const FEAT_FEC_RS: &str = "fec_rs";
+/// Feature id: the host injects real pinch gestures (`InputEvent::Pinch`) instead of the
+/// client's Ctrl + wheel fallback.
+pub const FEAT_PINCH: &str = "pinch";
+/// Feature id: the host recovers a lost frame by reference-frame invalidation
+/// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
+/// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.
+pub const FEAT_RFI: &str = "rfi";
+/// Tag byte: a bandwidth-probe packet follows (`adapt::probe::Hdr` + padding). Only sent in
+/// answer to a client's [`DataMsg::ProbeReq`](crate::service::DataMsg::ProbeReq), so a client
+/// that never asks never sees one.
+pub const TAG_PROBE: u8 = 0x05;
+/// Feature id: the host answers [`DataMsg::ProbeReq`](crate::service::DataMsg::ProbeReq) with
+/// probe packet trains (the session-start bandwidth probe, `adapt::probe`).
+pub const FEAT_PROBE: &str = "probe";
+
+/// One probe packet as a media session payload: `[TAG_PROBE][hdr][padding]`.
+pub fn probe_frame(h: &crate::adapt::probe::Hdr) -> Vec<u8> {
+	use crate::adapt::probe::{HDR_LEN, PACKET_BYTES};
+	let mut v = Vec::with_capacity(1 + PACKET_BYTES.max(HDR_LEN));
+	v.push(TAG_PROBE);
+	h.write(&mut v);
+	v.resize(1 + PACKET_BYTES.max(HDR_LEN), 0);
+	v
+}
+/// The UUID of the SEI (`user_data_unregistered`, payload type 5) that marks a host's RFI
+/// recovery frame: the client resumes decoding there. No zero bytes (no emulation prevention).
+pub const RFI_RECOVERY_UUID: [u8; 16] = *b"PULSAR-RFI-RECOV";
 /// Most data shards per RS block (a big keyframe is split into several blocks).
 pub const RS_MAX_DATA: usize = 200;
 const RS_HDR: usize = 7;
@@ -486,20 +515,52 @@ pub fn rs_parity_frames(base_seq: u16, pkts: &[&[u8]], ratio: f32) -> Vec<Vec<u8
 		.collect()
 }
 
+/// Most frames one RS block may span when frames are small (see [`RsFecEncoder`]).
+pub const RS_GROUP_MAX_FRAMES: u8 = 3;
+/// Longest RTP-time span (90 kHz ticks, 25 ms) one multi-frame RS block may cover — the
+/// extra wait the first frame's parity takes.
+pub const RS_GROUP_MAX_SPAN: u32 = 90 * 25;
+
 /// Host side: groups the outgoing video datagrams by FRAME (RTP timestamp / marker) and
 /// emits the block's parity when the frame completes. `ratio == 0` disables FEC.
-#[derive(Debug, Default)]
+///
+/// Small frames: `m = ceil(k × ratio)` is at least 1, so a one-packet frame (every frame of
+/// a low-bitrate stream at 120 fps) carried 100 % parity — twice the packet rate on exactly
+/// the link that can't take it. When a closed frame's block is still below `⌈1/ratio⌉`
+/// packets it is held open and the next frames join it (at most
+/// [`RS_GROUP_MAX_FRAMES`] frames within [`RS_GROUP_MAX_SPAN`]). The decoder never cared
+/// about frame boundaries — a block is any run of consecutive sequence numbers — so this
+/// needs no format change and old clients repair it as before. Big frames are unchanged.
+#[derive(Debug)]
 pub struct RsFecEncoder {
 	ratio: f32,
 	group: Vec<Vec<u8>>,
 	base: u16,
 	next: Option<u16>,
 	cur_ts: Option<u32>,
+	/// RTP timestamp of the block's first frame, and how many of its frames are complete.
+	first_ts: u32,
+	frames: u8,
+	/// The last packet carried the marker: the block holds only complete frames.
+	closed: bool,
+	/// Multi-frame blocks for small frames (on by default; `per_frame` turns it off).
+	grouping: bool,
+}
+
+impl Default for RsFecEncoder {
+	fn default() -> Self {
+		Self { ratio: 0.0, group: Vec::new(), base: 0, next: None, cur_ts: None, first_ts: 0, frames: 0, closed: false, grouping: true }
+	}
 }
 
 impl RsFecEncoder {
 	pub fn new(ratio: f32) -> Self {
 		Self { ratio: ratio.max(0.0), ..Default::default() }
+	}
+
+	/// The strict one-block-per-frame encoder (no multi-frame blocks for small frames).
+	pub fn per_frame(ratio: f32) -> Self {
+		Self { grouping: false, ..Self::new(ratio) }
 	}
 
 	pub fn ratio(&self) -> f32 {
@@ -511,7 +572,36 @@ impl RsFecEncoder {
 		self.ratio = ratio.max(0.0);
 	}
 
+	/// Smallest block worth closing at `ratio`: below `⌈1/ratio⌉` packets the one parity shard
+	/// costs more than the ratio asked for.
+	fn min_block(&self) -> usize {
+		if !self.grouping || self.ratio <= 0.0 {
+			return 1;
+		}
+		((1.0 / self.ratio).ceil() as usize).clamp(1, RS_MAX_DATA)
+	}
+
+	/// Whether a frame starting at `ts` may still join the held block.
+	fn can_extend(&self, ts: u32) -> bool {
+		self.grouping
+			&& self.frames < RS_GROUP_MAX_FRAMES
+			&& self.group.len() < self.min_block()
+			&& ts.wrapping_sub(self.first_ts) <= RS_GROUP_MAX_SPAN
+	}
+
+	/// Emit the parity of a block held back for the next frame (call from a timer when no
+	/// frame follows — an idle screen — so the last small frames still get their parity).
+	/// Empty when nothing is held or the open frame is still incomplete.
+	pub fn flush_pending(&mut self) -> Vec<Vec<u8>> {
+		if !self.closed {
+			return Vec::new();
+		}
+		self.flush()
+	}
+
 	fn flush(&mut self) -> Vec<Vec<u8>> {
+		self.frames = 0;
+		self.closed = false;
 		if self.group.is_empty() || self.ratio <= 0.0 {
 			self.group.clear();
 			return Vec::new();
@@ -528,10 +618,12 @@ impl RsFecEncoder {
 	}
 
 	/// One outgoing video datagram (after it was sent). Returns the parity datagrams to send
-	/// (usually empty; the frame's parity when this packet closes the frame).
+	/// (usually empty; the block's parity when this packet closes its frame / block).
 	pub fn push(&mut self, seq: u16, rtp: &[u8]) -> Vec<Vec<u8>> {
 		if self.ratio <= 0.0 || rtp.len() < 12 || rtp.len() > FEC_MAX_PACKET {
 			self.group.clear();
+			self.frames = 0;
+			self.closed = false;
 			self.next = Some(seq.wrapping_add(1));
 			return Vec::new();
 		}
@@ -540,19 +632,40 @@ impl RsFecEncoder {
 		let mut out = Vec::new();
 		if self.next != Some(seq) {
 			// A gap at the intake (encoder restart): the open frame is unrepairable — drop.
-			self.group.clear();
+			// Complete frames held for a multi-frame block are fine: they still get parity.
+			if self.closed {
+				out.extend(self.flush());
+			} else {
+				self.group.clear();
+				self.frames = 0;
+			}
 		} else if self.cur_ts != Some(ts) && !self.group.is_empty() {
-			// The previous frame never carried a marker: close it now.
-			out.extend(self.flush());
+			if !self.closed {
+				// The previous frame never carried a marker: it is complete now.
+				self.frames = self.frames.saturating_add(1);
+				self.closed = true;
+			}
+			// Close the block unless this small frame may still join it.
+			if !self.can_extend(ts) {
+				out.extend(self.flush());
+			}
 		}
 		if self.group.is_empty() {
 			self.base = seq;
+			self.first_ts = ts;
+			self.frames = 0;
 		}
 		self.cur_ts = Some(ts);
 		self.next = Some(seq.wrapping_add(1));
 		self.group.push(rtp.to_vec());
+		self.closed = false;
 		if marker {
-			out.extend(self.flush());
+			self.frames = self.frames.saturating_add(1);
+			self.closed = true;
+			// A small frame waits for the next ones (see the type doc); anything else closes now.
+			if !self.grouping || self.frames >= RS_GROUP_MAX_FRAMES || self.group.len() >= self.min_block() {
+				out.extend(self.flush());
+			}
 		}
 		out
 	}
@@ -694,6 +807,120 @@ impl RsFecDecoder {
 	}
 }
 
+// ── Host send counters (measurement) ───────────────────────────────────────────────────
+//
+// A field test on a ~10 Mbit/s mobile link showed the host putting ~6× the target on the
+// wire (keyframes + parity) — invisible in the logs, so congestion could not be told from
+// policing or an MTU problem. The video forwarder counts what it sends per kind; the
+// session's stats handler diffs two snapshots per client window, logs them, and uses the
+// first-copy packet count to rebuild the client's pre-repair loss
+// (`adapt::fec_policy::raw_loss`). Lock-free: the forwarder bumps them per packet.
+
+/// Cumulative per-session send counters of the media-over-session video flow.
+#[derive(Debug, Default)]
+pub struct MediaSendStats {
+	video_pkts: std::sync::atomic::AtomicU64,
+	video_bytes: std::sync::atomic::AtomicU64,
+	parity_pkts: std::sync::atomic::AtomicU64,
+	parity_bytes: std::sync::atomic::AtomicU64,
+	rtx_pkts: std::sync::atomic::AtomicU64,
+	rtx_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`MediaSendStats`] (or the difference of two).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MediaSendSnapshot {
+	/// First copies of video RTP datagrams.
+	pub video_pkts: u64,
+	pub video_bytes: u64,
+	/// FEC parity datagrams (XOR or RS).
+	pub parity_pkts: u64,
+	pub parity_bytes: u64,
+	/// NACK retransmits of video datagrams.
+	pub rtx_pkts: u64,
+	pub rtx_bytes: u64,
+}
+
+impl MediaSendStats {
+	fn bump(pkts: &std::sync::atomic::AtomicU64, bytes: &std::sync::atomic::AtomicU64, len: usize) {
+		use std::sync::atomic::Ordering::Relaxed;
+		pkts.fetch_add(1, Relaxed);
+		bytes.fetch_add(len as u64, Relaxed);
+	}
+
+	/// One first-copy video datagram sent (`len` = session payload bytes).
+	pub fn add_video(&self, len: usize) {
+		Self::bump(&self.video_pkts, &self.video_bytes, len);
+	}
+
+	/// One parity datagram sent.
+	pub fn add_parity(&self, len: usize) {
+		Self::bump(&self.parity_pkts, &self.parity_bytes, len);
+	}
+
+	/// One retransmitted video datagram sent.
+	pub fn add_rtx(&self, len: usize) {
+		Self::bump(&self.rtx_pkts, &self.rtx_bytes, len);
+	}
+
+	pub fn snapshot(&self) -> MediaSendSnapshot {
+		use std::sync::atomic::Ordering::Relaxed;
+		MediaSendSnapshot {
+			video_pkts: self.video_pkts.load(Relaxed),
+			video_bytes: self.video_bytes.load(Relaxed),
+			parity_pkts: self.parity_pkts.load(Relaxed),
+			parity_bytes: self.parity_bytes.load(Relaxed),
+			rtx_pkts: self.rtx_pkts.load(Relaxed),
+			rtx_bytes: self.rtx_bytes.load(Relaxed),
+		}
+	}
+}
+
+impl MediaSendSnapshot {
+	/// What was sent between `earlier` and `self` (saturating: a reset counter reads as 0).
+	pub fn since(&self, earlier: &MediaSendSnapshot) -> MediaSendSnapshot {
+		MediaSendSnapshot {
+			video_pkts: self.video_pkts.saturating_sub(earlier.video_pkts),
+			video_bytes: self.video_bytes.saturating_sub(earlier.video_bytes),
+			parity_pkts: self.parity_pkts.saturating_sub(earlier.parity_pkts),
+			parity_bytes: self.parity_bytes.saturating_sub(earlier.parity_bytes),
+			rtx_pkts: self.rtx_pkts.saturating_sub(earlier.rtx_pkts),
+			rtx_bytes: self.rtx_bytes.saturating_sub(earlier.rtx_bytes),
+		}
+	}
+
+	/// Total datagrams.
+	pub fn pkts(&self) -> u64 {
+		self.video_pkts + self.parity_pkts + self.rtx_pkts
+	}
+
+	/// Total bytes.
+	pub fn bytes(&self) -> u64 {
+		self.video_bytes + self.parity_bytes + self.rtx_bytes
+	}
+}
+
+#[cfg(test)]
+mod send_stats_tests {
+	use super::*;
+
+	#[test]
+	fn counters_snapshot_and_diff() {
+		let s = MediaSendStats::default();
+		let a = s.snapshot();
+		s.add_video(1200);
+		s.add_video(300);
+		s.add_parity(1210);
+		s.add_rtx(1200);
+		let d = s.snapshot().since(&a);
+		assert_eq!((d.video_pkts, d.video_bytes), (2, 1500));
+		assert_eq!((d.parity_pkts, d.parity_bytes), (1, 1210));
+		assert_eq!((d.rtx_pkts, d.rtx_bytes), (1, 1200));
+		assert_eq!((d.pkts(), d.bytes()), (4, 3910));
+		assert_eq!(a.since(&s.snapshot()), MediaSendSnapshot::default(), "saturates");
+	}
+}
+
 #[cfg(test)]
 mod rs_fec_tests {
 	use super::*;
@@ -752,7 +979,7 @@ mod rs_fec_tests {
 		let (_, body) = parse(&parity[0]).unwrap();
 		assert!(dec.on_parity(body).is_empty(), "2 lost, 1 parity: not repairable");
 		// A complete frame's parity is a no-op.
-		let mut enc2 = RsFecEncoder::new(0.10);
+		let mut enc2 = RsFecEncoder::per_frame(0.10);
 		let mut par2 = Vec::new();
 		for i in 20..25u16 {
 			let p = rtp(i, 2, i == 24, 300);
@@ -765,7 +992,7 @@ mod rs_fec_tests {
 
 	#[test]
 	fn frames_close_on_marker_or_timestamp_change_and_gaps_restart() {
-		let mut enc = RsFecEncoder::new(0.20);
+		let mut enc = RsFecEncoder::per_frame(0.20);
 		// Frame A without a marker (3 pkts), frame B starts → A's parity flushes.
 		assert!(enc.push(1, &rtp(1, 100, false, 400)).is_empty());
 		assert!(enc.push(2, &rtp(2, 100, false, 400)).is_empty());
@@ -815,5 +1042,129 @@ mod rs_fec_tests {
 		assert!(rs_parity_frames(0, &[], 0.2).is_empty());
 		let mut d = RsFecDecoder::default();
 		assert!(d.on_parity(&[1, 2, 3]).is_empty());
+	}
+
+	/// 90 kHz ticks per frame at 120 fps.
+	const T120: u32 = 750;
+
+	#[test]
+	fn small_frames_share_one_block_and_cut_the_parity_packet_rate() {
+		let run = |mut enc: RsFecEncoder| -> usize {
+			(0..30u16).map(|f| enc.push(100 + f, &rtp(100 + f, f as u32 * T120, true, 300)).len()).sum()
+		};
+		assert_eq!(run(RsFecEncoder::per_frame(0.15)), 30, "per frame: one parity per one-packet frame (100 %)");
+		assert_eq!(run(RsFecEncoder::new(0.15)), 10, "grouped: one parity per three frames");
+	}
+
+	/// Multi-frame blocks are ordinary RS blocks of consecutive sequence numbers: the
+	/// decoder (unchanged since released clients) repairs them from the packets alone.
+	#[test]
+	fn grouped_blocks_round_trip_with_losses() {
+		// 1-packet frames at 34 %: blocks of 3 frames (⌈1/0.34⌉), 2 parity each → any 2 of 3 lost.
+		let mut enc = RsFecEncoder::new(0.34);
+		let mut dec = RsFecDecoder::default();
+		let lost = [0u16, 1, 4, 5, 6, 8, 11];
+		let mut pkts = Vec::new();
+		let mut rebuilt = Vec::new();
+		for f in 0..12u16 {
+			let seq = 1000 + f;
+			let p = rtp(seq, 5000 + f as u32 * T120, true, 200 + f as usize * 7);
+			let parity = enc.push(seq, &p);
+			if !lost.contains(&f) {
+				dec.on_packet(seq, &p);
+			}
+			for par in &parity {
+				let (tag, body) = parse(par).unwrap();
+				assert_eq!(tag, TAG_FEC_RS);
+				let h = parse_rs_parity(body).unwrap();
+				assert_eq!((h.k, h.m), (3, 2), "one block = three frames");
+				rebuilt.extend(dec.on_parity(body));
+			}
+			pkts.push(p);
+		}
+		let mut got: Vec<u16> = rebuilt.iter().map(|(s, _)| s - 1000).collect();
+		got.sort();
+		assert_eq!(got, lost.to_vec());
+		for (s, p) in &rebuilt {
+			assert_eq!(p, &pkts[(s - 1000) as usize], "seq {s} byte-exact");
+		}
+		// 2-packet frames at 25 %: two frames make the 4-packet block worth one parity.
+		let mut enc = RsFecEncoder::new(0.25);
+		let mut dec = RsFecDecoder::default();
+		let mut rebuilt = Vec::new();
+		let mut blocks = 0;
+		for f in 0..8u16 {
+			for j in 0..2u16 {
+				let seq = 60_000 + f * 2 + j;
+				let p = rtp(seq, f as u32 * T120, j == 1, 900);
+				let parity = enc.push(seq, &p);
+				if (f * 2 + j) % 4 != 2 {
+					dec.on_packet(seq, &p);
+				}
+				for par in &parity {
+					let h = parse_rs_parity(parse(par).unwrap().1).unwrap();
+					assert_eq!((h.k, h.m), (4, 1));
+					blocks += 1;
+					rebuilt.extend(dec.on_parity(parse(par).unwrap().1));
+				}
+			}
+		}
+		assert_eq!(blocks, 4);
+		let got: Vec<u16> = rebuilt.iter().map(|(s, _)| s - 60_000).collect();
+		assert_eq!(got, vec![2, 6, 10, 14]);
+	}
+
+	#[test]
+	fn grouping_stays_within_the_time_span() {
+		// 30 fps: the next frame is 33 ms later — every frame keeps its own block.
+		let mut enc = RsFecEncoder::new(0.15);
+		let mut ks = Vec::new();
+		for f in 0..6u16 {
+			for par in enc.push(f, &rtp(f, f as u32 * 3000, true, 300)) {
+				ks.push(parse_rs_parity(parse(&par).unwrap().1).unwrap().k);
+			}
+		}
+		assert_eq!(ks, vec![1; 5], "each frame's parity leaves when the next frame starts");
+		assert_eq!(enc.flush_pending().len(), 1, "the last one on the idle timer");
+		assert!(enc.flush_pending().is_empty(), "nothing held any more");
+		// 60 fps: two frames (16.7 ms) fit in the 25 ms span, a third does not.
+		let mut enc = RsFecEncoder::new(0.15);
+		let mut ks = Vec::new();
+		for f in 0..6u16 {
+			for par in enc.push(f, &rtp(f, f as u32 * 1500, true, 300)) {
+				ks.push(parse_rs_parity(parse(&par).unwrap().1).unwrap().k);
+			}
+		}
+		assert_eq!(ks, vec![2, 2]);
+		assert_eq!(enc.flush_pending().len(), 1);
+	}
+
+	#[test]
+	fn held_frames_survive_a_gap_and_big_frames_are_not_delayed() {
+		let mut enc = RsFecEncoder::new(0.15);
+		assert!(enc.push(1, &rtp(1, 0, true, 300)).is_empty(), "small frame held");
+		let out = enc.push(5, &rtp(5, T120, true, 300));
+		assert_eq!(out.len(), 1, "a gap flushes the complete held frame");
+		assert_eq!(parse_rs_parity(parse(&out[0]).unwrap().1).unwrap().base_seq, 1);
+		// An open (incomplete) frame is not flushed by the idle timer.
+		let mut enc = RsFecEncoder::new(0.15);
+		assert!(enc.push(1, &rtp(1, 0, false, 900)).is_empty());
+		assert!(enc.flush_pending().is_empty());
+		// A big frame closes at its own marker, as before.
+		let mut enc = RsFecEncoder::new(0.15);
+		for i in 0..9u16 {
+			assert!(enc.push(i, &rtp(i, 0, false, 1100)).is_empty());
+		}
+		let out = enc.push(9, &rtp(9, 0, true, 1100));
+		assert_eq!(out.len(), 2, "10 packets × 15 % → 2 parity at the marker");
+		// A small frame held, then a big one inside the span: one block covers both.
+		let mut enc = RsFecEncoder::new(0.15);
+		assert!(enc.push(20, &rtp(20, 0, true, 300)).is_empty());
+		let mut out = Vec::new();
+		for i in 0..10u16 {
+			out.extend(enc.push(21 + i, &rtp(21 + i, T120, i == 9, 1100)));
+		}
+		let h = parse_rs_parity(parse(&out[0]).unwrap().1).unwrap();
+		assert_eq!((h.base_seq, h.k), (20, 11));
 	}
 }

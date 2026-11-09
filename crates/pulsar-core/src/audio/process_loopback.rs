@@ -1,4 +1,18 @@
-//! Windows **per-process** WASAPI loopback (Phase 4 same-host co-op).
+//! Windows **per-process** WASAPI loopback (Phase 4 same-host co-op, and the host's
+//! whole-desktop audio).
+//!
+//! Two modes ([`ProcessLoopbackMode`]):
+//!
+//! * **Include** — one process tree's audio (a launched game, a picked window).
+//! * **Exclude** — every process EXCEPT one tree: the host passes its own PID, so the client
+//!   gets the whole system mix minus Pulsar's own process tree. (A WebView2 renders outside
+//!   that tree: an Include capture of the app's PID heard nothing of its webview, measured.)
+//!
+//! Both modes tap the app streams **before the endpoint volume and mute**. The
+//! default-endpoint loopback ([`super::loopback`]) taps after them: measured on a Realtek
+//! host muted at 0 %, the endpoint loopback captured pure silence while both process modes
+//! captured a test tone at full level (−14 dBFS). So with these, the host's own volume and
+//! mute no longer decide what the client hears.
 //!
 //! The default-endpoint loopback ([`super::loopback`]) taps the whole system mix, so two
 //! sessions streaming from the SAME host both capture BOTH games' audio → the client plays
@@ -47,6 +61,7 @@ use windows::Win32::Media::Audio::{
 	IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 	AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
 	AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+	PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
 	PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 	WAVEFORMATEX,
 };
@@ -62,6 +77,15 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 // Set on a GetBuffer packet whose data is silence; mirror the default-endpoint loopback and
 // emit zeros for it (its buffer may be uninitialized).
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+
+/// Which audio a process-loopback capture takes, relative to the target process tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessLoopbackMode {
+	/// Only the target process and its children (one app's audio).
+	Include,
+	/// Every process except the target and its children (the system mix minus that tree).
+	Exclude,
+}
 
 /// The fixed format every process-loopback capture delivers. Process-loopback has no real
 /// endpoint to query, so we DICTATE the format at `Initialize`: 48 kHz stereo f32, exactly
@@ -140,7 +164,7 @@ impl Drop for EventHandle {
 ///
 /// Apartment: COM is initialized MTA on the calling thread — the completion handler runs in
 /// the MTA, and the activation operation is an MTA object.
-unsafe fn activate_process_client(pid: u32) -> Result<IAudioClient, String> {
+unsafe fn activate_process_client(pid: u32, mode: ProcessLoopbackMode) -> Result<IAudioClient, String> {
 	let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
 	// AUDIOCLIENT_ACTIVATION_PARAMS describing "loopback the target PID + its process tree".
@@ -149,7 +173,10 @@ unsafe fn activate_process_client(pid: u32) -> Result<IAudioClient, String> {
 		Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
 			ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
 				TargetProcessId: pid,
-				ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+				ProcessLoopbackMode: match mode {
+					ProcessLoopbackMode::Include => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+					ProcessLoopbackMode::Exclude => PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+				},
 			},
 		},
 	};
@@ -254,11 +281,29 @@ fn fixed_waveformat() -> WAVEFORMATEX {
 /// Returns `Ok(())` on a clean stop (pipe broken). Any setup/activation/WASAPI failure is an
 /// `Err(String)` so the caller can fall back to the default-endpoint loopback.
 pub fn run_process_loopback_capture<W: Write>(sink: W, pid: u32) -> Result<(), String> {
-	unsafe { run(sink, pid) }
+	run_process_loopback_capture_mode(sink, pid, ProcessLoopbackMode::Include, || {})
 }
 
-unsafe fn run<W: Write>(mut sink: W, pid: u32) -> Result<(), String> {
-	let client = activate_process_client(pid)?;
+/// [`run_process_loopback_capture`] with an explicit [`ProcessLoopbackMode`]. `started` runs
+/// once the capture is live (activated, initialized, started), before the first read: a
+/// caller that waits for it knows the capture works and can fall back to the
+/// default-endpoint loopback when this returns an `Err` first instead.
+pub fn run_process_loopback_capture_mode<W: Write>(
+	sink: W,
+	pid: u32,
+	mode: ProcessLoopbackMode,
+	started: impl FnOnce(),
+) -> Result<(), String> {
+	unsafe { run(sink, pid, mode, started) }
+}
+
+unsafe fn run<W: Write>(
+	mut sink: W,
+	pid: u32,
+	mode: ProcessLoopbackMode,
+	started: impl FnOnce(),
+) -> Result<(), String> {
+	let client = activate_process_client(pid, mode)?;
 
 	let mut wfx = fixed_waveformat();
 	let block_align = wfx.nBlockAlign as usize;
@@ -293,6 +338,7 @@ unsafe fn run<W: Write>(mut sink: W, pid: u32) -> Result<(), String> {
 	client
 		.Start()
 		.map_err(|e| format!("IAudioClient::Start (process-loopback): {e}"))?;
+	started();
 
 	let outcome = capture_loop(&capture, &mut sink, block_align, audio_event);
 	let _ = client.Stop();
@@ -395,6 +441,37 @@ mod tests {
 		assert_eq!(block as usize, f.block_align());
 		assert_eq!(avg, f.rate * block as u32);
 		assert_eq!(cb, 0); // plain WAVEFORMATEX, not EXTENSIBLE
+	}
+
+	/// Live: capture the system mix minus this test process for ~0.5 s. Needs a Windows audio
+	/// service and an output device, so it is ignored by default (CI runners have neither):
+	/// `cargo test -p pulsar-core exclude_mode -- --ignored`.
+	#[test]
+	#[ignore]
+	fn exclude_mode_starts_and_delivers_frames() {
+		struct Sink(usize);
+		impl Write for Sink {
+			fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+				self.0 += b.len();
+				if self.0 >= 48_000 * 8 / 2 {
+					// ~0.5 s of 48 kHz stereo f32: stop like a closed pipe does.
+					return Err(std::io::ErrorKind::BrokenPipe.into());
+				}
+				Ok(b.len())
+			}
+			fn flush(&mut self) -> std::io::Result<()> {
+				Ok(())
+			}
+		}
+		let mut live = false;
+		let r = run_process_loopback_capture_mode(
+			Sink(0),
+			std::process::id(),
+			ProcessLoopbackMode::Exclude,
+			|| live = true,
+		);
+		assert_eq!(r, Ok(()));
+		assert!(live, "started must run before the capture delivers");
 	}
 
 	#[test]

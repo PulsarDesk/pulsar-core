@@ -25,6 +25,10 @@ pub struct DataHandlers {
 	/// Client reported missing RTP video seqs (media-over-session): re-send them from
 	/// the retransmit ring. Default no-op (host without a media forwarder).
 	pub on_nack: Box<dyn FnMut(Vec<u16>) + Send>,
+	/// Client lost the video packets `first..=last` for good and asks for a recovery without
+	/// a keyframe ([`DataMsg::MediaRfi`]). `None` (default) → handled as a keyframe request
+	/// (`on_nack(vec![0])`, the keyframe sentinel).
+	pub on_rfi: Option<Box<dyn FnMut(u16, u16) + Send>>,
 	/// The client pushed its identity image (PNG bytes, see [`DataMsg::Avatar`]) so
 	/// the host UI can show *who* connected. Default no-op.
 	pub on_avatar: Box<dyn FnMut(Vec<u8>) + Send>,
@@ -72,6 +76,7 @@ impl Default for DataHandlers {
 			}),
 			windows: Box::new(Vec::new),
 			on_nack: Box::new(|_| {}),
+			on_rfi: None,
 			on_avatar: Box::new(|_| {}),
 			on_peer_name: Box::new(|_| {}),
 			on_peer_id: Box::new(|_| {}),
@@ -79,6 +84,47 @@ impl Default for DataHandlers {
 			on_fs: Box::new(|_| {}),
 			on_stats: Box::new(|_| {}),
 		}
+	}
+}
+
+/// The least time between two bandwidth probes on one session.
+const PROBE_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Host: answer a [`DataMsg::ProbeReq`]: the requested packet trains, each spread evenly over
+/// `train_ms`, with `adapt::probe::GAP_MS` between trains. Bounded by the `adapt::probe` limits
+/// whatever the client asked. Sends are batched per wake (timer granularity is ~1 ms, coarser
+/// on Windows): each wake sends what is due by then, so a train's average rate is exact even
+/// when its packets leave in small clumps.
+async fn send_probe(tx: crate::connection::SessionSender, rates_kbps: Vec<u32>, train_ms: u16) {
+	use crate::adapt::probe::{train_packets, Hdr, GAP_MS, MAX_RATE_KBPS, MAX_TRAINS, MAX_TRAIN_MS};
+	let train_ms = train_ms.clamp(20, MAX_TRAIN_MS);
+	let t0 = std::time::Instant::now();
+	for (ti, &rate) in rates_kbps.iter().take(MAX_TRAINS).enumerate() {
+		let rate = rate.clamp(100, MAX_RATE_KBPS);
+		let count = train_packets(rate, train_ms);
+		let start = std::time::Instant::now();
+		let mut idx = 0u16;
+		while idx < count {
+			let due = ((start.elapsed().as_secs_f64() * 1000.0 / train_ms as f64) * count as f64).ceil() as u16;
+			let due = due.clamp(idx + 1, count);
+			while idx < due {
+				let h = Hdr {
+					train: ti as u8,
+					idx,
+					count,
+					send_us: t0.elapsed().as_micros() as u32,
+					rate_kbps: rate,
+				};
+				if tx.send(&media::probe_frame(&h)).await.is_err() {
+					return;
+				}
+				idx += 1;
+			}
+			if idx < count {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(GAP_MS)).await;
 	}
 }
 
@@ -125,6 +171,9 @@ pub async fn serve_with(
 		Restream(Option<StreamReq>),
 	}
 	let mut last_inbound = tokio::time::Instant::now();
+	// The last bandwidth probe this session asked for: one at a time, at most one per
+	// PROBE_COOLDOWN (each costs up to a few MB of padding on the client's own path).
+	let mut last_probe: Option<tokio::time::Instant> = None;
 	loop {
 		// A dead client over UDP never closes the channel, so bound the wait: no
 		// message (not even a keepalive) within `PEER_TIMEOUT` means it's gone.
@@ -192,6 +241,12 @@ pub async fn serve_with(
 				let _ = session.send(&enc(&Msg::Pong)).await;
 			}
 			Some(Msg::Bye) => break, // client said goodbye — tear down immediately
+			// The client is still asking for access on a session we already accepted: our
+			// `Ok` was lost (UDP, a lossy link). Say it again. Only the empty probe — a password
+			// attempt here would be a fresh PAKE run, never answered on an open session.
+			Some(Msg::Auth(pw)) if pw.is_empty() => {
+				let _ = session.send(&enc(&Msg::Ok)).await;
+			}
 			Some(Msg::ListGames) => {
 				let _ = session.send(&enc(&Msg::Games(games()))).await;
 			}
@@ -233,6 +288,16 @@ pub async fn serve_with(
 				DataMsg::DisplayRotation(_) => {} // host→client only; ignore if echoed back
 				DataMsg::ReverseRequest(id) => (data.on_reverse)(id),
 				DataMsg::MediaNack(seqs) => (data.on_nack)(seqs),
+				DataMsg::MediaRfi { first, last } => match data.on_rfi.as_mut() {
+					Some(f) => f(first, last),
+					None => (data.on_nack)(vec![0]),
+				},
+				DataMsg::ProbeReq { rates_kbps, train_ms } => {
+					if last_probe.is_none_or(|t| t.elapsed() >= PROBE_COOLDOWN) {
+						last_probe = Some(tokio::time::Instant::now());
+						tokio::spawn(send_probe(session.sender(), rates_kbps, train_ms));
+					}
+				}
 				DataMsg::Avatar(png) => (data.on_avatar)(png),
 				DataMsg::PeerName(name) => (data.on_peer_name)(name),
 				DataMsg::PeerId(id) => (data.on_peer_id)(id),

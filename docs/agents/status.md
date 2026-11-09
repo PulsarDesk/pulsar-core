@@ -21,3 +21,8 @@ Read it end to end before touching the streaming path. Summary:
   tested: `cargo test --test adapt_scenarios`).
 - **None of it has been tested on a real session yet.** The next step is the maintainer's
   test (procedure in the design doc's "Implementation status"), then fixes from it.
+- **2026-11-09 poor-link pass — LOCAL, unpushed, untested on a real link** (design doc section
+  "2026-11-09 poor-link pass"): controller cautious start/soft pins/goodput cut/floor escape,
+  grouped delay estimator, FEC v2 policy + grouped RS blocks + send counters, path watchdog +
+  NAT rebinding. Mobile `client.rs` builds `adapt::Sample` without `..Default::default()` →
+  breaks on the next core bump; `mobile/src/host.rs` still uses v1 `parity_ratio`.

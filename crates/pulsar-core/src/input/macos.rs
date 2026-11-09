@@ -392,6 +392,10 @@ impl DesktopInput {
 	///
 	/// We do NOT stamp `self.flags` here: the codepoint is already the resolved
 	/// character, so asserting e.g. Shift would risk re-interpreting it.
+	/// Pinch gestures are not injected on this platform (the host doesn't advertise
+	/// `FEAT_PINCH`, so clients send Ctrl + wheel instead).
+	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
+
 	pub fn type_char(&mut self, c: char) {
 		let mut buf = [0u16; 2];
 		let units = c.encode_utf16(&mut buf);

@@ -32,23 +32,76 @@ pub async fn request_games(session: &mut Session) -> Result<Vec<GameInfo>, ConnE
 /// the stream can never disagree) and to gate the session-menu options.
 pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, ConnError> {
 	session.send(&enc(&Msg::QueryStreamCaps)).await?;
-	for _ in 0..MAX_WAIT_MSGS {
-		match tokio::time::timeout(
-			std::time::Duration::from_secs(3),
-			session.recv(),
-		)
-		.await
-		{
+	// The query (or its answer) is one datagram: on a lossy link it can simply be lost, and
+	// the empty default it falls back to means a session without NACK, FEC or the native
+	// path. So ask again every CAPS_RESEND until an answer comes (the host answers each one;
+	// the caller bounds the whole wait).
+	const CAPS_RESEND: std::time::Duration = std::time::Duration::from_millis(400);
+	const CAPS_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(3);
+	let start = std::time::Instant::now();
+	let mut next_send = start + CAPS_RESEND;
+	let mut msgs = 0;
+	while msgs < MAX_WAIT_MSGS && start.elapsed() < CAPS_GIVE_UP {
+		let wait = next_send.saturating_duration_since(std::time::Instant::now());
+		match tokio::time::timeout(wait, session.recv()).await {
 			Ok(Some(bytes)) => {
+				msgs += 1;
 				if let Some(Msg::StreamCaps(caps)) = dec(&bytes) {
 					return Ok(caps);
 				}
 			}
-			// None = session closed, Err(_) = per-message 3 s deadline exceeded
-			Ok(None) | Err(_) => break,
+			// The session closed.
+			Ok(None) => break,
+			// No answer yet: ask again.
+			Err(_) => {
+				session.send(&enc(&Msg::QueryStreamCaps)).await?;
+				next_send = std::time::Instant::now() + CAPS_RESEND;
+			}
 		}
 	}
 	Ok(StreamCaps::default())
+}
+
+/// Client: run the session-start bandwidth probe (`adapt::probe`) — ask the host for packet
+/// trains at `rates_kbps` and measure what arrives. Call before the stream starts, only with a
+/// host advertising [`media::FEAT_PROBE`]. `rtt_ms` bounds how long the tail is waited for.
+/// `None` when nothing usable came back. Anything else that arrives meanwhile is dropped
+/// (nothing else flows before the stream request).
+pub async fn run_probe(
+	session: &mut Session,
+	rates_kbps: Vec<u32>,
+	train_ms: u16,
+	rtt_ms: f32,
+) -> Result<Option<crate::adapt::probe::Estimate>, ConnError> {
+	use crate::adapt::probe::{Hdr, Meter, GAP_MS};
+	let trains = rates_kbps.len();
+	session
+		.send(&enc(&Msg::Data(DataMsg::ProbeReq { rates_kbps, train_ms })))
+		.await?;
+	let send_ms = trains as u64 * (train_ms as u64 + GAP_MS);
+	let deadline = std::time::Instant::now()
+		+ std::time::Duration::from_millis(send_ms + (2.0 * rtt_ms.clamp(0.0, 1000.0)) as u64 + 300);
+	let t0 = std::time::Instant::now();
+	let mut meter = Meter::new();
+	while !meter.complete(trains) {
+		let left = deadline.saturating_duration_since(std::time::Instant::now());
+		if left.is_zero() {
+			break;
+		}
+		match tokio::time::timeout(left, session.recv()).await {
+			Ok(Some(bytes)) => {
+				let arrival_ms = t0.elapsed().as_secs_f64() * 1000.0;
+				if let Some((media::TAG_PROBE, rest)) = media::parse(&bytes) {
+					if let Some(h) = Hdr::parse(rest) {
+						meter.on_packet(&h, bytes.len(), arrival_ms);
+					}
+				}
+			}
+			Ok(None) => break,
+			Err(_) => break,
+		}
+	}
+	Ok(meter.estimate())
 }
 
 /// Client: ask the host for the list of windows it can capture per-window (Phase 2b
