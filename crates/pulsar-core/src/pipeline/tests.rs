@@ -89,6 +89,10 @@ fn ddagrab_filter_format_matches_command_pixfmt_for_all_encoders() {
 		(HwEncoder::Amf, false, true, false),
 		(HwEncoder::Amf, true, true, false),
 		(HwEncoder::Amf, false, false, false),
+		// Media Foundation: CPU-bounce but NV12-only, must degrade to SDR 4:2:0.
+		(HwEncoder::MediaFoundation, true, false, false),
+		(HwEncoder::MediaFoundation, false, true, false),
+		(HwEncoder::MediaFoundation, false, false, false),
 		// Software: CPU-bounce, honors hdr/yuv444.
 		(HwEncoder::Software, true, false, false),
 		(HwEncoder::Software, false, false, false),
@@ -125,7 +129,7 @@ fn ddagrab_filter_format_matches_command_pixfmt_for_all_encoders() {
 /// values must be clamped and no HDR signaling or 10-bit -pix_fmt may appear.
 #[test]
 fn ddagrab_nvenc_qsv_degrade_hdr_yuv444_to_sdr_420() {
-	for enc in [HwEncoder::Nvenc, HwEncoder::Qsv] {
+	for enc in [HwEncoder::Nvenc, HwEncoder::Qsv, HwEncoder::MediaFoundation] {
 		for (hdr, yuv444) in [(true, false), (false, true), (true, true)] {
 			let p = StreamPlan {
 				encoder: enc,
@@ -209,6 +213,26 @@ fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
 		joined.contains("-pix_fmt yuv444p"),
 		"Software ddagrab yuv444: command must have -pix_fmt yuv444p"
 	);
+}
+
+/// Media Foundation on ddagrab: the Qualcomm MFT rejects D3D11 frames and yuv420p, so
+/// the filter must download and end in nv12 (the old default branch sent yuv420p and
+/// every Snapdragon host fell back to libx264).
+#[test]
+fn ddagrab_media_foundation_feeds_nv12() {
+	for codec in [VCodec::H264, VCodec::H265] {
+		let p = StreamPlan {
+			encoder: HwEncoder::MediaFoundation,
+			codec,
+			capture: CaptureMethod::Ddagrab,
+			..plan(HwEncoder::MediaFoundation)
+		};
+		let (_, args) = encode_command(&p);
+		assert_eq!(ddagrab_filter_fmt(&args).as_deref(), Some("nv12"), "{codec:?}");
+		let joined = args.join(" ");
+		assert!(joined.contains("hwdownload"), "{codec:?}: MF needs a system-memory frame");
+		assert!(!joined.contains("yuv420p"), "{codec:?}: yuv420p fails MF format negotiation");
+	}
 }
 
 #[test]

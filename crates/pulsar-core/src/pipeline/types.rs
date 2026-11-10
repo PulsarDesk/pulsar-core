@@ -146,6 +146,15 @@ impl CaptureMethod {
 						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={f}",
 						f = if eff_hdr || eff_yuv444 { cpu_fmt } else { "nv12" }
 					),
+					// Windows Media Foundation (the Qualcomm / ARM hardware MFT): it accepts only
+					// NV12 in system memory — ddagrab's D3D11 frame fails ("failed processing
+					// input") and yuv420p fails format negotiation, which used to drop every
+					// Snapdragon host to libx264. Same minimal CPU bounce as AMF, always nv12:
+					// the QCOM MFT has no 10-bit / 4:4:4 input (measured 2026-11-10, p010le
+					// rejected), so HDR/YUV444 are clamped to SDR 4:2:0 (effective_hdr_yuv444).
+					HwEncoder::MediaFoundation => format!(
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format=nv12"
+					),
 					// Intel QSV: fully on-GPU. scale_qsv only supports nv12 and p010 (QSV
 					// internal 10-bit); yuv444 via QSV on ddagrab is not reliably supported.
 					// HDR/YUV444 degraded to SDR 4:2:0 (eff_hdr/eff_yuv444 false for QSV
@@ -379,9 +388,9 @@ impl StreamPlan {
 	/// **Both `CaptureMethod::input_args` (filter) and `encode_command` (-pix_fmt /
 	/// -profile:v) call this method**, so the two can never disagree.
 	pub fn effective_hdr_yuv444(&self) -> (bool, bool) {
-		// NVENC/QSV Ddagrab GPU paths: clamp to SDR 4:2:0.
+		// NVENC/QSV Ddagrab GPU paths, and Media Foundation (NV12-only MFTs): clamp to SDR 4:2:0.
 		let is_gpu_ddagrab = self.capture == CaptureMethod::Ddagrab
-			&& matches!(self.encoder, HwEncoder::Nvenc | HwEncoder::Qsv);
+			&& matches!(self.encoder, HwEncoder::Nvenc | HwEncoder::Qsv | HwEncoder::MediaFoundation);
 		if is_gpu_ddagrab {
 			(false, false)
 		} else {
