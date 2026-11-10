@@ -22,8 +22,9 @@ pub(crate) mod pake;
 mod wire;
 
 pub use auth::{
-	accept, authenticate, need_password, recv_auth, recv_client_auth, recv_host_auth, reject,
-	send_auth, AuthAttempt, AuthOutcome, ClientAuth, HostAuth,
+	accept, authenticate, need_password, need_totp, recv_auth, recv_client_auth, recv_host_auth,
+	recv_totp, reject, send_auth, send_totp, AuthAttempt, AuthOutcome, ClientAuth, HostAuth,
+	TotpReply,
 };
 pub use client::{
 	decode_data, decode_windows, is_bye, is_pong, query_stream_caps, query_windows, request_games,
@@ -50,6 +51,11 @@ enum Msg {
 	NeedPassword,
 	/// Host → client: rejected; the host will not serve this session.
 	Denied,
+	/// Host → client: the first factor passed and this host has 2FA on — send the 6-digit
+	/// authenticator code (`Totp`). `true` = the previous code was wrong.
+	NeedTotp(bool),
+	/// Client → host: the 2FA (TOTP) code the user typed.
+	Totp(String),
 	ListGames,
 	Games(Vec<GameInfo>),
 	Launch(String),

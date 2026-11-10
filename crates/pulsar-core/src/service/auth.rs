@@ -19,6 +19,9 @@ pub enum AuthOutcome {
 	Denied,
 	/// A password is required; prompt the user and call `authenticate` again.
 	NeedPassword,
+	/// The host has 2FA on: prompt for the authenticator code and [`send_totp`] it
+	/// (`true` = the previous code was wrong), then read the verdict again.
+	NeedTotp(bool),
 }
 
 /// Client: put a password attempt on the wire — `Auth("")` for "no password", a PAKE
@@ -47,6 +50,7 @@ pub async fn authenticate(session: &mut Session, password: &str) -> Result<AuthO
 				Some(Msg::Ok) => return Ok(AuthOutcome::Accepted),
 				Some(Msg::Denied) => return Ok(AuthOutcome::Denied),
 				Some(Msg::NeedPassword) => return Ok(AuthOutcome::NeedPassword),
+				Some(Msg::NeedTotp(retry)) => return Ok(AuthOutcome::NeedTotp(retry)),
 				Some(Msg::AuthPakeReply(r)) => pake::client_on_reply(session, r).await?,
 				_ => continue,
 			},
@@ -142,6 +146,8 @@ pub enum HostAuth {
 	Ok,
 	Denied,
 	NeedPassword,
+	/// The host wants the 2FA code (`true` = the previous one was wrong).
+	NeedTotp(bool),
 	Gone,
 	Other,
 }
@@ -154,6 +160,7 @@ pub async fn recv_host_auth(session: &mut Session) -> HostAuth {
 			Some(Msg::Ok) => return HostAuth::Ok,
 			Some(Msg::Denied) => return HostAuth::Denied,
 			Some(Msg::NeedPassword) => return HostAuth::NeedPassword,
+			Some(Msg::NeedTotp(retry)) => return HostAuth::NeedTotp(retry),
 			Some(Msg::AuthPakeReply(r)) => {
 				if pake::client_on_reply(session, r).await.is_err() {
 					return HostAuth::Gone;
@@ -169,6 +176,40 @@ pub async fn recv_host_auth(session: &mut Session) -> HostAuth {
 /// Fails with [`ConnError::PeerOutdated`] for a non-empty password to an old host.
 pub async fn send_auth(session: &mut Session, password: &str) -> Result<(), ConnError> {
 	send_attempt(session, password).await
+}
+
+/// Client: answer the host's 2FA challenge with the authenticator code.
+pub async fn send_totp(session: &mut Session, code: &str) -> Result<(), ConnError> {
+	session.send(&enc(&Msg::Totp(code.trim().to_string()))).await
+}
+
+/// Host: ask the client for its 2FA (TOTP) code — after the first factor passed. `retry` =
+/// the previous code was wrong (the client shows that).
+pub async fn need_totp(session: &mut Session, retry: bool) -> Result<(), ConnError> {
+	session.send(&enc(&Msg::NeedTotp(retry))).await
+}
+
+/// What the host read while waiting for the 2FA code.
+pub enum TotpReply {
+	/// The code the user typed.
+	Code(String),
+	/// The client repeated its access probe (a lost `NeedTotp`, or it is still waiting):
+	/// ask again.
+	Probe,
+	/// Keepalive / anything else: keep waiting.
+	Other,
+	/// The client went away.
+	Gone,
+}
+
+/// Host: read the client's next message while waiting for its 2FA code.
+pub async fn recv_totp(session: &mut Session) -> TotpReply {
+	match session.recv().await.as_deref().map(dec) {
+		Some(Some(Msg::Totp(code))) => TotpReply::Code(code),
+		Some(Some(Msg::Auth(_) | Msg::AuthPake(_))) => TotpReply::Probe,
+		Some(_) => TotpReply::Other,
+		None => TotpReply::Gone,
+	}
 }
 
 /// Host: tell the client a password is required (it will prompt and retry).

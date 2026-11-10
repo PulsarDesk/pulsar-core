@@ -149,6 +149,17 @@ impl Session {
 			.is_some_and(|s| s.peer_caps & pulsar_proto::CAP_PAKE != 0)
 	}
 
+	/// Whether the peer can answer a host's two-factor (TOTP) challenge (`CAP_TOTP`).
+	pub async fn peer_supports_totp(&self) -> bool {
+		self.node
+			.inner
+			.lock()
+			.await
+			.sessions
+			.get(&self.id)
+			.is_some_and(|s| s.peer_caps & pulsar_proto::CAP_TOTP != 0)
+	}
+
 	/// The secret channel-binding value of this session's key (see
 	/// [`crate::crypto::Session::binding`]). `None` once the session is gone.
 	pub(crate) async fn channel_binding(&self) -> Option<[u8; 32]> {

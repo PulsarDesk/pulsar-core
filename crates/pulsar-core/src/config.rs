@@ -76,6 +76,12 @@ pub struct Config {
 	/// password is a standing secret, so it must not be brute-forceable).
 	#[serde(default)]
 	pub connect_password: String,
+	/// Optional two-factor auth for incoming connections: the base32 TOTP secret shared
+	/// with the owner's authenticator app (empty = 2FA off). When set, a connection let in
+	/// by a password or by unattended access must also send the current 6-digit code
+	/// ([`crate::totp`]); one the host user approves on the Allow/Deny popup does not.
+	#[serde(default)]
+	pub totp_secret: String,
 	/// Stream this host's audio to the client (host → client). When off, the
 	/// session is video-only. See [`crate::audio`] for how game mode overrides this.
 	/// `#[serde(default)]` so configs written before this field still load.
@@ -165,6 +171,7 @@ impl Default for Config {
 			language: Language::Tr,
 			unattended_access: false,
 			connect_password: String::new(),
+			totp_secret: String::new(),
 			transmit_audio: true,
 			mute_host_audio: false,
 			audio_input: String::new(),

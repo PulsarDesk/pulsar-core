@@ -27,7 +27,7 @@ use tokio::time::timeout;
 
 use crate::config::NetworkMode;
 use crate::crypto::{Identity, LocalHs, PeerHs, Role, Session as Crypto};
-use pulsar_proto::CAP_PAKE;
+use pulsar_proto::{CAP_PAKE, CAP_TOTP};
 
 mod handlers;
 mod node;
@@ -138,7 +138,7 @@ const HS_EXT_V1: u8 = 0x01;
 /// Full v1 blob: pubkey(32) || salt(32) || LAN(6) || ver(1) || caps(1) || eph(32).
 const HS_BLOB_LEN: usize = 104;
 /// Capabilities this build advertises in its handshakes.
-pub(crate) const OUR_CAPS: u8 = CAP_PAKE;
+pub(crate) const OUR_CAPS: u8 = CAP_PAKE | CAP_TOTP;
 
 /// Relay-path handshake blob. The LAN slot is ALWAYS written (zeros = none, which
 /// `parse_lan_candidate` reads as absent) so old peers, which read bytes 64..70 as the
