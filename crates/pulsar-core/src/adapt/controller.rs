@@ -26,9 +26,11 @@
 //!   real limit shows itself by repeating there instead of being re-hit at once.
 //!   Climbing back to the ceiling is free (×1.25 per `CLIMB_WINDOWS` clean windows); going
 //!   past it is a probe after `PROBE_WAIT_MIN` clean windows at the ceiling, whose step grows
-//!   with every probe that survives (+10 % → +20 % → +40 % → +80 %) and drops back to +10 %
-//!   on a failure, which also doubles the wait — a link that improved is climbed back in a
-//!   few probes (5 → 15 Mbit ≈ 4 min), one that didn't sees rarer and rarer +10 % probes.
+//!   with every probe that survives (+25 % → +50 % → +80 %) and drops back to +25 % on a
+//!   failure, which also doubles the wait — a link that improved is climbed back in a few
+//!   probes (2 → 15 Mbit ≈ 100 s), one that didn't sees rarer and rarer probes (≤ 8 min).
+//!   (Was a 60 s wait and +10 % first steps: a session that opened on a 2 Mbit dip took ~6
+//!   minutes to reach 15 Mbit once the link had recovered, 10–20 with one failed probe.)
 //!   (Was +10 % per minute for every probe, and a lone loss burst punished the ceiling: a
 //!   mobile link that lost one burst at 12 Mbit then took ~10 minutes to get back.)
 //! * **Startup fast.** For the first `startup_windows` a clean window climbs ×1.5 at once
@@ -109,17 +111,21 @@ pub const RTT_BAD_MS: f32 = 90.0;
 pub const CLEAN_WINDOWS_UP: u32 = 10;
 /// Consecutive clean windows before a ×1.25 climb toward the (known-good) ceiling (8 s).
 pub const CLIMB_WINDOWS: u32 = 4;
-/// Clean windows at the ceiling before a probe past it (60 s; doubles per failed probe).
-pub const PROBE_WAIT_MIN: u32 = 30;
+/// Clean windows at the ceiling before a probe past it (20 s; doubles per failed probe).
+pub const PROBE_WAIT_MIN: u32 = 10;
 /// The first probe's step past the ceiling (%); each surviving probe doubles it up to
 /// `PROBE_STEP_MAX_PCT`, a failed one resets it.
-pub const PROBE_STEP_MIN_PCT: u32 = 10;
+pub const PROBE_STEP_MIN_PCT: u32 = 25;
 pub const PROBE_STEP_MAX_PCT: u32 = 80;
 /// An unconfirmed cut (delay-only overuse, a lone loss burst) that repeats within this many
 /// windows (60 s) is confirmed after all — the link really is at its limit there.
 pub const SOFT_REPEAT_WINDOWS: u32 = 30;
-/// Upper bound for the doubled probe wait (16 min).
-pub const PROBE_WAIT_MAX: u32 = 480;
+/// The probe wait while a known-bad level is fresh (a loss episode's rate, or a host-bound
+/// point): 60 s, the old pace — the fast `PROBE_WAIT_MIN` is for a link that got better, not
+/// for walking back into a limit seen a minute ago.
+pub const PROBE_WAIT_GUARDED: u32 = 30;
+/// Upper bound for the doubled probe wait (8 min).
+pub const PROBE_WAIT_MAX: u32 = 240;
 /// A probe that draws loss/bloat within this many windows counts as failed.
 pub const PROBE_PUNISH_WINDOWS: u32 = 10;
 /// Minimum windows between gentle steps.
@@ -441,6 +447,9 @@ pub struct Controller {
 	/// Clean windows spent at `point_cap`, and the wait before retrying the next heavier one.
 	at_point_cap: u32,
 	point_retry: u32,
+	/// The last ladder step UP: (window, the lighter point it left). A queue cut right after
+	/// it means the host can't encode the heavier point — see `queue_cut`.
+	point_up: Option<(u32, usize)>,
 	/// Windows left in which the host's queue drains after a host-bound step (no queue cuts).
 	drain_left: u32,
 	/// The encoder bitrate last decided (net of FEC).
@@ -690,6 +699,7 @@ impl Controller {
 			point_cap: 0,
 			at_point_cap: 0,
 			point_retry: 0,
+			point_up: None,
 			drain_left: 0,
 			encoder_kbps: 0,
 			fec_overhead: 0.0,
@@ -747,6 +757,16 @@ impl Controller {
 	}
 	pub fn probe_wait(&self) -> u32 {
 		self.probe_wait
+	}
+
+	/// Clean windows at the ceiling before the next probe: the (doubling) wait, held at
+	/// `PROBE_WAIT_GUARDED` or more while a known-bad level is fresh.
+	fn probe_wait_now(&self) -> u32 {
+		if self.bad_rate > 0 || self.point_cap > 0 {
+			self.probe_wait.max(PROBE_WAIT_GUARDED)
+		} else {
+			self.probe_wait
+		}
 	}
 	pub fn noise_loss(&self) -> f32 {
 		self.noise_loss
@@ -915,6 +935,7 @@ impl Controller {
 		self.queue_cuts = 0;
 		self.point_cap = 0;
 		self.at_point_cap = 0;
+		self.point_up = None;
 		self.drain_left = 0;
 		self.clean_at_target = 0;
 		self.clean_at_point = 0;
@@ -973,6 +994,7 @@ impl Controller {
 		// Indices changed: a host-bound cap learned on the old ladder no longer maps.
 		self.point_cap = 0;
 		self.at_point_cap = 0;
+		self.point_up = None;
 		self.point_idx = if self.cfg.ladder { ladder::pick(&self.points, self.want, POINT_MARGIN) } else { 0 };
 		self.point_age = 0;
 		self.clean_at_point = 0;
@@ -1398,7 +1420,7 @@ impl Controller {
 			} else {
 				self.clean = 0;
 				self.at_ceiling += 1;
-				if self.at_ceiling >= self.probe_wait && self.ceiling < self.cap {
+				if self.at_ceiling >= self.probe_wait_now() && self.ceiling < self.cap {
 					self.at_ceiling = 0;
 					// A probe that would reach the last loss episode's rate goes there in a small
 					// step: the growing steps are for a link that improved, not for re-testing a
@@ -1776,6 +1798,31 @@ impl Controller {
 	/// one-off delay readings, but a real limit still stops the climb from sawtoothing.
 	/// Returns whether the ceiling was punished (`false` = an unconfirmed, soft cut).
 	fn queue_cut(&mut self, before: u32, to: u32, confirmed: bool, out: &mut Decision) -> bool {
+		// A queue right after a ladder step up is the heavier point's encode load, not the
+		// path: go back to the lighter point and hold it there for the retry wait. Without this
+		// the step up → two fast cuts → step down cycle repeated every ~13 windows whenever the
+		// rate sat at the cap (fewer cuts than `HOST_BOUND_CUTS`, so never judged host-bound).
+		if let Some((at, lighter)) = self.point_up.take() {
+			if self.windows.saturating_sub(at) <= RAISE_SUSPECT_WINDOWS && lighter > self.point_idx {
+				self.point_retry = if self.point_retry == 0 {
+					POINT_RETRY_WINDOWS
+				} else {
+					(self.point_retry * 2).min(POINT_RETRY_MAX)
+				};
+				self.point_idx = lighter;
+				self.point_cap = self.point_cap.max(lighter);
+				self.at_point_cap = 0;
+				self.point_age = 0;
+				self.clean_at_point = 0;
+				self.point_short = 0;
+				self.retarget();
+				self.drain_left = 2;
+				self.queue_cuts = 0;
+				out.point = Some(self.points[lighter]);
+				out.reason = "queue right after a step up → host can't keep up, back to the lighter point";
+				return true;
+			}
+		}
 		self.queue_cuts += 1;
 		if self.queue_cuts >= HOST_BOUND_CUTS && self.step_down_host_bound(out) {
 			self.queue_cuts = 0;
@@ -1909,7 +1956,9 @@ impl Controller {
 	fn punish(&mut self, bad_rate: u32) {
 		self.ceiling = (bad_rate as u64 * 85 / 100).clamp(FLOOR_KBPS as u64, self.cap as u64) as u32;
 		if self.probe_age.is_some_and(|a| a <= PROBE_PUNISH_WINDOWS) {
-			self.probe_wait = (self.probe_wait * 2).min(PROBE_WAIT_MAX);
+			// The fast 20 s cadence is for a link that keeps proving it has more; the first
+			// failure puts the next probe at the old pace (60 s) and doubling goes on from there.
+			self.probe_wait = (self.probe_wait.max(PROBE_WAIT_GUARDED) * 2).min(PROBE_WAIT_MAX);
 		}
 		self.probe_step_pct = PROBE_STEP_MIN_PCT;
 		self.probe_age = None;
@@ -1927,7 +1976,7 @@ impl Controller {
 	/// step, and a probe's start ran clean for the whole probe wait) — and `rate` becomes the
 	/// known-bad level the next climb / probe approaches in small steps. A failed probe doubles
 	/// the wait before the next one (`punish`), so a limit that stays where it is gets re-tested
-	/// at 1, 2, 4, … minutes (up to `PROBE_WAIT_MAX`), never every few seconds.
+	/// at 20 s, 40 s, 80 s, … (up to `PROBE_WAIT_MAX`), never every few seconds.
 	fn loss_episode(&mut self, rate: u32, held: u32) {
 		self.punish(rate);
 		let at = (rate as u64 * EPISODE_CEILING_PCT as u64 / 100) as u32;
@@ -1997,6 +2046,7 @@ impl Controller {
 			// Not on a probe's rate: a probe that fails a window later would make the step
 			// up an immediate step back down (two encoder restarts for nothing).
 			if want < self.point_idx && self.clean_at_point >= need && self.point_age >= POINT_DEBOUNCE && !self.in_probe() {
+				self.point_up = Some((self.windows, self.point_idx));
 				self.point_idx = want;
 				self.point_age = 0;
 				self.clean_at_point = 0;
@@ -2890,6 +2940,25 @@ mod tests {
 	/// is a loss episode — the lower rate stays, the ceiling drops to ~0.9 × the failed rate and
 	/// the climb back creeps up in small steps without reaching it again. Unmeasured (mobile)
 	/// keeps the old verdict on post-repair loss: the parity change makes it inconclusive.
+	#[test]
+	fn a_link_that_recovered_is_climbed_back_within_two_minutes() {
+		// The session opened on a 2 Mbit dip and the ceiling stayed there; then the link got
+		// better and every window ran clean. It used to take ~6 min (60 s waits, +10 % steps).
+		let mut c = Controller::new(cfg(15_000, false));
+		c.startup_left = 0;
+		c.set_target(2_000);
+		c.ceiling = 2_000;
+		let mut reached = None;
+		for w in 0..60u32 {
+			let s = rwin(&c, 10, 0, 2000);
+			c.tick(&s);
+			if reached.is_none() && c.target_kbps() >= 12_000 {
+				reached = Some(w);
+			}
+		}
+		assert!(matches!(reached, Some(w) if w < 60), "2 → 12 Mbit took {reached:?} windows, target {}", c.target_kbps());
+	}
+
 	#[test]
 	fn a_probe_down_that_cured_the_raw_loss_lowers_the_ceiling_and_stays_down() {
 		let mut c = Controller::new(cfg(15_000, false));
