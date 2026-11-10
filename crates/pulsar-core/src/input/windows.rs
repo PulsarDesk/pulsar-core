@@ -58,7 +58,12 @@ fn send_key(vk: u16, flags: u32) {
 	let ext = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
 	let scan = (ext & 0xFF) as u16;
 	let mut flags = flags;
-	if matches!(ext >> 8, 0xE0 | 0xE1) {
+	// The E0 prefix from MAPVK_VK_TO_VSC_EX is not reliable: on a real host (2026-11-10) it
+	// came back as a bare 0x4D for VK_RIGHT, so the arrows went out WITHOUT the extended flag,
+	// i.e. as the numpad 4/6/8/2 keys — Steam Big Picture scrolled instead of moving the
+	// selection. The extended keys are fixed by the keyboard hardware, so list them (the same
+	// set Sunshine uses) and keep the map's prefix as a second source.
+	if matches!(ext >> 8, 0xE0 | 0xE1) || is_extended_vk(vk) {
 		flags |= KEYEVENTF_EXTENDEDKEY;
 	}
 	let input = INPUT {
@@ -74,6 +79,26 @@ fn send_key(vk: u16, flags: u32) {
 		},
 	};
 	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) };
+}
+
+/// Virtual keys whose scan code carries the E0 prefix on a PC keyboard: right Ctrl/Alt, Win,
+/// Apps, the Ins/Del/Home/End/PgUp/PgDn block, the arrows, numpad /, NumLock, PrintScreen.
+/// (Numpad Enter is extended too but has no VK of its own.) Pure + testable.
+pub(crate) fn is_extended_vk(vk: u16) -> bool {
+	matches!(
+		vk,
+		0xA3 // VK_RCONTROL
+			| 0xA5 // VK_RMENU
+			| 0x5B | 0x5C // VK_LWIN, VK_RWIN
+			| 0x5D // VK_APPS
+			| 0x2D | 0x2E // VK_INSERT, VK_DELETE
+			| 0x24 | 0x23 // VK_HOME, VK_END
+			| 0x21 | 0x22 // VK_PRIOR, VK_NEXT
+			| 0x25..=0x28 // VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN
+			| 0x6F // VK_DIVIDE
+			| 0x90 // VK_NUMLOCK
+			| 0x2C // VK_SNAPSHOT
+	)
 }
 
 /// Map a Linux evdev keycode (what the client sends — see `keymap.ts`) to a
@@ -512,7 +537,19 @@ impl Drop for DesktopInput {
 
 #[cfg(test)]
 mod tests {
-	use super::evdev_to_vk;
+	use super::{evdev_to_vk, is_extended_vk};
+
+	#[test]
+	fn arrows_and_nav_block_are_extended_but_numpad_is_not() {
+		// evdev Left/Up/Right/Down → VK → extended (else they go out as numpad 4/8/6/2).
+		for code in [105, 103, 106, 108, 102, 107, 104, 109, 110, 111] {
+			let vk = evdev_to_vk(code).unwrap();
+			assert!(is_extended_vk(vk), "evdev {code} → vk {vk:#x} must be extended");
+		}
+		for vk in [0x64u16, 0x66, 0x68, 0x62, 0xA2, 0xA4, 0x41, 0x0D] {
+			assert!(!is_extended_vk(vk), "vk {vk:#x} must not be extended");
+		}
+	}
 
 	#[test]
 	fn maps_common_evdev_keys_to_vk() {
