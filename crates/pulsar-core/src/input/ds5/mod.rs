@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod bt_audio;
 pub mod crc;
 pub mod haptics;
+pub mod pad;
 pub mod report;
 pub mod speaker;
 pub mod wire;
