@@ -31,11 +31,15 @@ pub fn frame(tag: u8, rtp: &[u8]) -> Vec<u8> {
 	v
 }
 
+/// DualSense passthrough datagrams (`input::ds5::wire::Ds5Media`), sent only to clients of a
+/// host advertising `FEAT_DS5`.
+pub use crate::input::ds5::wire::TAG_DS5;
+
 /// Parse a session payload as a media frame; `None` for anything else (JSON
 /// control messages, junk). Empty RTP is rejected.
 pub fn parse(payload: &[u8]) -> Option<(u8, &[u8])> {
 	match payload.split_first() {
-		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS | TAG_PROBE), rest)) if !rest.is_empty() => Some((tag, rest)),
+		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS | TAG_PROBE | TAG_DS5), rest)) if !rest.is_empty() => Some((tag, rest)),
 		_ => None,
 	}
 }

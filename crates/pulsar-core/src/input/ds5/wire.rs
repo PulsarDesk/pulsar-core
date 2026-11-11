@@ -278,6 +278,14 @@ mod tests {
 	}
 
 	#[test]
+	fn session_media_parser_accepts_ds5() {
+		let e = Ds5Media::Mic { slot: 0, seq: 1, opus: vec![1, 2, 3] }.encode();
+		let (tag, rest) = crate::service::media::parse(&e).expect("TAG_DS5 must pass media::parse");
+		assert_eq!(tag, TAG_DS5);
+		assert_eq!(rest.len(), e.len() - 1);
+	}
+
+	#[test]
 	fn media_rejects_garbage() {
 		assert_eq!(Ds5Media::decode(&[]), None);
 		assert_eq!(
