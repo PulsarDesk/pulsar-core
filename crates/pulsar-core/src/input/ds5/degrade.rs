@@ -194,6 +194,7 @@ pub struct LinkMonitor {
 	last_input: Instant,
 	gap_max: Duration,
 	inputs: u32,
+	write_max: u64,
 }
 
 impl LinkMonitor {
@@ -204,6 +205,7 @@ impl LinkMonitor {
 			last_input: now,
 			gap_max: Duration::ZERO,
 			inputs: 0,
+			write_max: 0,
 		}
 	}
 
@@ -216,9 +218,11 @@ impl LinkMonitor {
 		self.inputs += 1;
 	}
 
-	/// The finished window once [`WINDOW`] has passed. `stats` = the pad's counters now,
-	/// `max_write_us` = the longest write since the last window (`Pad::take_window_max_write_us`).
+	/// Call often; returns the finished window once [`WINDOW`] has passed. `stats` = the
+	/// pad's counters now, `max_write_us` = the longest write since the previous call
+	/// (`Pad::take_window_max_write_us`).
 	pub fn tick(&mut self, now: Instant, stats: PadStats, max_write_us: u64) -> Option<Window> {
+		self.write_max = self.write_max.max(max_write_us);
 		if now.saturating_duration_since(self.start) < WINDOW {
 			return None;
 		}
@@ -226,7 +230,7 @@ impl LinkMonitor {
 			write_errors: stats.write_errors.saturating_sub(self.base.write_errors),
 			underruns: stats.underruns.saturating_sub(self.base.underruns),
 			overflows: stats.overflows.saturating_sub(self.base.overflows),
-			max_write_us,
+			max_write_us: std::mem::take(&mut self.write_max),
 			inputs: self.inputs,
 			input_gap_max: self
 				.gap_max
@@ -554,7 +558,7 @@ mod tests {
 		m.on_input(t0 + Duration::from_millis(4));
 		m.on_input(t0 + Duration::from_millis(100));
 		assert_eq!(
-			m.tick(t0 + Duration::from_secs(1), PadStats::default(), 0),
+			m.tick(t0 + Duration::from_secs(1), PadStats::default(), 9000),
 			None
 		);
 		let stats = PadStats {
@@ -562,7 +566,7 @@ mod tests {
 			overflows: 1,
 			..Default::default()
 		};
-		let w = m.tick(t0 + WINDOW, stats, 9000).unwrap();
+		let w = m.tick(t0 + WINDOW, stats, 500).unwrap();
 		assert_eq!(w.inputs, 2);
 		assert_eq!(w.write_errors, 2);
 		assert_eq!(w.overflows, 1);
@@ -573,6 +577,7 @@ mod tests {
 		m.on_input(t0 + WINDOW + Duration::from_millis(4));
 		let w2 = m.tick(t0 + WINDOW * 2, stats, 0).unwrap();
 		assert_eq!(w2.write_errors, 0);
+		assert_eq!(w2.max_write_us, 0);
 		assert_eq!(w2.inputs, 1);
 	}
 }
