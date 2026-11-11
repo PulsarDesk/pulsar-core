@@ -24,6 +24,11 @@ pub use types::{
 #[cfg(windows)]
 mod vigem;
 
+/// Windows host-side virtual gamepad via Duo's own controller driver (inside a Duo
+/// multi-seat session) — see [`duo::DuoGamepad`].
+#[cfg(windows)]
+mod duo;
+
 /// Linux host-side uinput backends (virtual gamepad + desktop input).
 #[cfg(target_os = "linux")]
 mod uinput;
@@ -63,7 +68,7 @@ mod desktop_stub;
 pub use uinput::DesktopInput;
 
 #[cfg(windows)]
-pub use windows::{DesktopInput, MonitorRect};
+pub use windows::{evdev_to_raw_key, DesktopInput, MonitorRect};
 
 /// Windows-only per-window input injector (PostMessage). See its docs for the
 /// message-pump-apps-only ceiling. Selected per-session by the host when the

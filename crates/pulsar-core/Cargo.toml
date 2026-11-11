@@ -63,6 +63,7 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 windows-sys = { version = "0.61", features = [
 	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_UI_Input_Pointer", # InjectTouchInput: real two-finger pinch on the host
+	"Win32_UI_Input_XboxController", # vigem.rs: find a virtual pad's real XInput slot (co-op)
 	"Win32_UI_WindowsAndMessaging",
 	"Win32_Foundation",
 	# ClientToScreen (maps the cached client point → screen coords for WM_MOUSEWHEEL,
@@ -71,6 +72,11 @@ windows-sys = { version = "0.61", features = [
 	# GetBestRoute: the default gateway, asked for a NAT-PMP port mapping (connection/portmap.rs).
 	"Win32_NetworkManagement_IpHelper",
 	"Win32_Networking_WinSock",
+	# input/duo.rs: load Duo's DuoController.dll, find its install dir + HID-isolation flag,
+	# tell a Duo/RDP seat from the console session.
+	"Win32_System_LibraryLoader",
+	"Win32_System_Registry",
+	"Win32_System_RemoteDesktop",
 ] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).

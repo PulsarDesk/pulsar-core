@@ -81,6 +81,17 @@ fn send_key(vk: u16, flags: u32) {
 	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) };
 }
 
+/// A client evdev keycode as a full Windows keystroke: `(virtual key, scan code, extended)` —
+/// the same table + scan/E0 resolution the `SendInput` path uses. For injectors that build their
+/// own keyboard events (same-host co-op feeds them to one game instance as raw input).
+pub fn evdev_to_raw_key(code: u32) -> Option<(u16, u16, bool)> {
+	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
+	let vk = evdev_to_vk(code)?;
+	let ext = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
+	let extended = matches!(ext >> 8, 0xE0 | 0xE1) || is_extended_vk(vk);
+	Some((vk, (ext & 0xFF) as u16, extended))
+}
+
 /// Virtual keys whose scan code carries the E0 prefix on a PC keyboard: right Ctrl/Alt, Win,
 /// Apps, the Ins/Del/Home/End/PgUp/PgDn block, the arrows, numpad /, NumLock, PrintScreen.
 /// (Numpad Enter is extended too but has no VK of its own.) Pure + testable.

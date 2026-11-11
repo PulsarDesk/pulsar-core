@@ -187,6 +187,12 @@ pub trait VirtualGamepad: Send {
 	fn rumble_reader(&self) -> Option<Box<dyn RumbleReader>> {
 		None
 	}
+	/// The XInput user index (0..=3) Windows assigned this emulated pad, when it is an XInput
+	/// device (ViGEm Xbox 360). Same-host co-op uses it to tell each game instance which
+	/// XInput slot is its player's. `None` for non-XInput backends.
+	fn xinput_slot(&mut self) -> Option<u32> {
+		None
+	}
 }
 
 /// A test/no-op backend that just records what it was told to apply. The real
@@ -362,6 +368,14 @@ pub fn create_virtual_pad_target(
 	}
 	#[cfg(windows)]
 	{
+		// Inside a Duo multi-seat session a ViGEm pad is hidden from the session's own apps by
+		// Duo's HID isolation; create the pad through Duo's controller driver instead.
+		if super::duo::wanted() {
+			match super::duo::DuoGamepad::new_target(kind, resolved) {
+				Ok(pad) => return Box::new(pad),
+				Err(e) => tracing::warn!("Duo virtual pad unavailable ({e}); trying ViGEm"),
+			}
+		}
 		match super::vigem::ViGEmGamepad::new_target(kind, resolved) {
 			Ok(pad) => return Box::new(pad),
 			Err(e) => {

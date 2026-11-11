@@ -23,6 +23,9 @@ pub struct ViGEmGamepad {
 	/// `ds4_update_ts_and_send`). Incremented from real elapsed time on each apply.
 	ds4_ts: u16,
 	ds4_last: Option<std::time::Instant>,
+	/// The XInput slot this pad was found in (`None` = not measured yet; `Some(None)` = not
+	/// found). Measured once, on demand — see [`ViGEmGamepad::xinput_slot`].
+	slot: Option<Option<u32>>,
 }
 
 impl ViGEmGamepad {
@@ -56,7 +59,7 @@ impl ViGEmGamepad {
 				Backend::Ds4(t)
 			}
 		};
-		Ok(Self { kind, backend, ds4_ts: 0, ds4_last: None })
+		Ok(Self { kind, backend, ds4_ts: 0, ds4_last: None, slot: None })
 	}
 
 	/// Convenience wrapper: create an Xbox 360 target (keeps existing call sites
@@ -67,9 +70,50 @@ impl ViGEmGamepad {
 	}
 }
 
+/// Find which XInput slot (0..=3) shows this virtual pad. ViGEmBus's own "get user index"
+/// answered 0 for every pad on a real host (2026-11-10, two pads in slots 0 and 1), so measure
+/// it: report a signature right-stick X for a moment, see which slot echoes it, then report
+/// neutral again. The host process itself is never hooked, so it sees the real slots. Takes
+/// tens of ms; called once per pad, only when same-host co-op needs it.
+fn find_xinput_slot(t: &mut vigem_client::Xbox360Wired<vigem_client::Client>) -> Option<u32> {
+	use windows_sys::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_STATE};
+	const SIG: i16 = 12345;
+	let g = vigem_client::XGamepad { thumb_rx: SIG, ..Default::default() };
+	t.update(&g).ok()?;
+	let mut found = None;
+	for _ in 0..50 {
+		std::thread::sleep(std::time::Duration::from_millis(10));
+		for i in 0..4u32 {
+			let mut st: XINPUT_STATE = unsafe { std::mem::zeroed() };
+			if unsafe { XInputGetState(i, &mut st) } == 0 && st.Gamepad.sThumbRX == SIG {
+				found = Some(i);
+			}
+		}
+		if found.is_some() {
+			break;
+		}
+	}
+	let _ = t.update(&vigem_client::XGamepad::default());
+	found
+}
+
 impl VirtualGamepad for ViGEmGamepad {
 	fn kind(&self) -> GamepadKind {
 		self.kind
+	}
+
+	fn xinput_slot(&mut self) -> Option<u32> {
+		if let Some(s) = self.slot {
+			return s;
+		}
+		// DS4 is not an XInput device (games read it via DirectInput/HID/SDL).
+		let Backend::Xbox360(t) = &mut self.backend else {
+			self.slot = Some(None);
+			return None;
+		};
+		let found = find_xinput_slot(t);
+		self.slot = Some(found);
+		found
 	}
 
 	fn apply(&mut self, state: &GamepadState) {

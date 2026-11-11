@@ -82,6 +82,12 @@ pub struct Config {
 	/// ([`crate::totp`]); one the host user approves on the Allow/Deny popup does not.
 	#[serde(default)]
 	pub totp_secret: String,
+	/// Same-host co-op input isolation (opt-in, Windows host): when two split panes play two
+	/// instances of the SAME game here, inject the ProtoInput component into each so every
+	/// instance gets only its own player's controller / keyboard / mouse and keeps fake focus.
+	/// Off by default — injection may trip anti-cheat or antivirus.
+	#[serde(default)]
+	pub coop_isolation: bool,
 	/// Stream this host's audio to the client (host → client). When off, the
 	/// session is video-only. See [`crate::audio`] for how game mode overrides this.
 	/// `#[serde(default)]` so configs written before this field still load.
@@ -172,6 +178,7 @@ impl Default for Config {
 			unattended_access: false,
 			connect_password: String::new(),
 			totp_secret: String::new(),
+			coop_isolation: false,
 			transmit_audio: true,
 			mute_host_audio: false,
 			audio_input: String::new(),
