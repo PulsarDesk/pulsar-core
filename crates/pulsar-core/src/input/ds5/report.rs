@@ -179,6 +179,14 @@ impl SetState {
 		}
 	}
 
+	/// Set classic rumble `(heavy/left, light/right)`: rumble emulation on and rumble
+	/// selected over HD haptics (ZerkSense5 `RumbleEngine`).
+	pub fn set_rumble(&mut self, heavy: u8, light: u8) {
+		self.0[0] |= flag::B0_RUMBLE_EMULATION | flag::B0_USE_RUMBLE_NOT_HAPTICS;
+		self.0[RUMBLE_LEFT] = heavy;
+		self.0[RUMBLE_RIGHT] = light;
+	}
+
 	/// True if the game asked for either adaptive trigger.
 	pub fn has_triggers(&self) -> bool {
 		self.0[0] & (flag::B0_RIGHT_TRIGGER | flag::B0_LEFT_TRIGGER) != 0
