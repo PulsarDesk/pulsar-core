@@ -309,6 +309,85 @@ impl StereoConverter {
 	}
 }
 
+/// Fades between the two sources at a switch so the cut doesn't click: the old source fades
+/// out over 5 ms, then the new one fades in from 0. If the old source has stopped writing,
+/// the switch is forced once the new one has offered 30 ms. Interleaved stereo f32.
+#[derive(Clone, Debug)]
+pub struct SwitchFader {
+	active: Source,
+	next: Option<Source>,
+	gain: f32,
+	step: f32,
+	waited: usize,
+	force_after: usize,
+}
+
+impl SwitchFader {
+	pub fn new(rate: u32, start: Source) -> Self {
+		Self {
+			active: start,
+			next: None,
+			gain: 1.0,
+			step: 1.0 / (rate as f32 * 0.005).max(1.0),
+			waited: 0,
+			force_after: (rate as usize * 30) / 1000,
+		}
+	}
+
+	/// The source passing now (the old one until its fade-out ends).
+	pub fn active(&self) -> Source {
+		self.active
+	}
+
+	/// Where the stream is headed (`active` once a switch is done).
+	pub fn wanted(&self) -> Source {
+		self.next.unwrap_or(self.active)
+	}
+
+	pub fn switch_to(&mut self, s: Source) {
+		if s == self.active {
+			self.next = None; // a switch called off mid-fade: fade back in
+		} else if self.next != Some(s) {
+			self.next = Some(s);
+			self.waited = 0;
+		}
+	}
+
+	/// One write from `src`: scales `frames` in place; `true` = pass them on, `false` = drop.
+	pub fn process(&mut self, src: Source, frames: &mut [f32]) -> bool {
+		if src == self.active {
+			let fading_out = self.next.is_some();
+			for fr in frames.chunks_exact_mut(2) {
+				if fading_out {
+					self.gain -= self.step;
+					if self.gain < self.step * 0.5 {
+						self.gain = 0.0;
+					}
+				} else if self.gain < 1.0 {
+					self.gain = (self.gain + self.step).min(1.0);
+				}
+				fr[0] *= self.gain;
+				fr[1] *= self.gain;
+			}
+			if fading_out && self.gain == 0.0 {
+				self.active = self.next.take().unwrap_or(self.active);
+			}
+			return true;
+		}
+		if self.next == Some(src) {
+			self.waited += frames.len() / 2;
+			if self.waited >= self.force_after {
+				// The old source went quiet mid-fade: take over, fading in.
+				self.active = src;
+				self.next = None;
+				self.gain = 0.0;
+				return self.process(src, frames);
+			}
+		}
+		false
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -617,5 +696,51 @@ mod tests {
 		c.convert(&frame, &mut out);
 		let f = |i: usize| f32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
 		assert_eq!((f(0), f(1)), (1.0, -1.0));
+	}
+
+	#[test]
+	fn switch_fades_out_then_in_without_a_step() {
+		let mut f = SwitchFader::new(48_000, Source::Process);
+		let mut out = Vec::new();
+		// Both sources carry full-scale DC; record what passes, in order.
+		let feed = |f: &mut SwitchFader, src, n: usize, out: &mut Vec<f32>| {
+			let mut b = vec![1.0f32; n * 2];
+			if f.process(src, &mut b) {
+				out.extend(b.chunks_exact(2).map(|c| c[0]));
+			}
+		};
+		feed(&mut f, Source::Process, 480, &mut out);
+		f.switch_to(Source::Endpoint);
+		assert_eq!(f.wanted(), Source::Endpoint);
+		for _ in 0..4 {
+			feed(&mut f, Source::Endpoint, 120, &mut out);
+			feed(&mut f, Source::Process, 120, &mut out);
+		}
+		assert_eq!(f.active(), Source::Endpoint, "old source faded out in 5 ms");
+		for _ in 0..4 {
+			feed(&mut f, Source::Process, 120, &mut out);
+			feed(&mut f, Source::Endpoint, 120, &mut out);
+		}
+		let max = out
+			.windows(2)
+			.map(|w| (w[0] - w[1]).abs())
+			.fold(0.0, f32::max);
+		assert!(max <= 1.0 / 240.0 + 1e-6, "step {max}");
+		assert_eq!(*out.last().unwrap(), 1.0, "faded back in");
+	}
+
+	#[test]
+	fn switch_is_forced_when_the_old_source_is_gone() {
+		let mut f = SwitchFader::new(48_000, Source::Endpoint);
+		f.switch_to(Source::Process);
+		let mut b = vec![1.0f32; 480 * 2];
+		assert!(
+			!f.process(Source::Process, &mut b),
+			"10 ms: still waiting for the fade-out"
+		);
+		let mut b = vec![1.0f32; 1000 * 2];
+		assert!(f.process(Source::Process, &mut b), "30 ms: taken over");
+		assert_eq!(f.active(), Source::Process);
+		assert!(b[0] < 0.01 && b[b.len() - 1] == 1.0, "fades in");
 	}
 }
