@@ -270,6 +270,10 @@ pub fn pairing_info(mac: [u8; 6]) -> [u8; 0x13] {
 	b
 }
 
+/// Speaker volume the virtual pad reports before the OS sets one: -20 dB. A new USB audio
+/// device otherwise starts at 0 dB, i.e. the pad speaker at full blast (maintainer test).
+const DEFAULT_SPEAKER_DB: i16 = -20;
+
 #[derive(Debug)]
 struct State {
 	alt: [u8; 4],
@@ -304,7 +308,7 @@ impl Ds5Device {
 			state: Mutex::new(State {
 				alt: [0; 4],
 				mute: [0; 2],
-				volume: [0, 48 * 256],
+				volume: [DEFAULT_SPEAKER_DB * 256, 48 * 256],
 				last_input: neutral_usb_input(),
 				features,
 				haptics: Downsampler::new(haptics_gain),
