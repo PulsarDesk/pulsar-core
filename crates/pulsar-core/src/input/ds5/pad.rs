@@ -78,6 +78,12 @@ pub struct Pad {
 	audio: AudioReports,
 	/// Two frames per report (0x39 / double 0x32): half the BT reports. Default on.
 	pub double: bool,
+	/// Slots buffered before playback starts, and the level the ±3 % trim steers to.
+	/// Default 2 reports' worth (local bridge); a streaming client sets more to absorb
+	/// network jitter ([`Pad::set_jitter_buffer`]).
+	prebuffer: usize,
+	/// FIFO bound in slots; the oldest is dropped when full.
+	max_queued: usize,
 	pending_state: Option<SetState>,
 	last_state: Option<Instant>,
 	fifo: VecDeque<Slot>,
@@ -110,6 +116,8 @@ impl Pad {
 			seq: BtSeq::default(),
 			audio: AudioReports::default(),
 			double: true,
+			prebuffer: 4,
+			max_queued: MAX_QUEUED,
 			pending_state: None,
 			last_state: None,
 			fifo: VecDeque::new(),
@@ -120,6 +128,13 @@ impl Pad {
 		};
 		pad.audio.mic = transport == Ds5Transport::Bt && features.mic;
 		Ok((pad, feats))
+	}
+
+	/// Size the audio FIFO for a jittery source: start after `prebuffer` slots
+	/// (10.667 ms each), steer to that level, drop beyond `max` slots.
+	pub fn set_jitter_buffer(&mut self, prebuffer: usize, max: usize) {
+		self.prebuffer = prebuffer.max(1);
+		self.max_queued = max.max(self.prebuffer + 2);
 	}
 
 	pub fn stats(&self) -> PadStats {
@@ -179,7 +194,7 @@ impl Pad {
 		if haptics.is_none() && speaker.is_none() {
 			return;
 		}
-		if self.fifo.len() >= MAX_QUEUED {
+		if self.fifo.len() >= self.max_queued {
 			self.fifo.pop_front();
 			self.stats.overflows += 1;
 		}
@@ -236,7 +251,7 @@ impl Pad {
 		let n = self.frames_per_report();
 		if !self.playing {
 			// Prebuffer two reports' worth before starting the clock.
-			if self.fifo.len() < 2 * n {
+			if self.fifo.len() < self.prebuffer.max(n) {
 				return Duration::from_millis(50);
 			}
 			self.playing = true;
@@ -257,7 +272,7 @@ impl Pad {
 		// Steady clock with a ±3 % trim so the host's USB clock and our send clock
 		// can't drift the FIFO empty or full; resync after a stall.
 		let left = self.fifo.len();
-		let target = 2 * n;
+		let target = self.prebuffer.max(n);
 		let trim = if left > target {
 			0.97
 		} else if left < n {
