@@ -189,6 +189,40 @@ no haptics/speaker/mic (Duo's device has no audio), so only `Ds5Output` goes to 
   mikrofonu · Işık çubuğu/LED, each `Otomatik | Açık | Kapalı`. A global "DualSense
   özelliklerini kullan" switch turns the whole passthrough off (today's DS4 path).
 
+### Headset jack ("Kolun kulaklık girişi", PS5 gibi)
+
+Headphones in the client pad's 3.5 mm jack: the session's normal audio (what the client
+would play through `native_audio.rs`) plays through the pad's jack instead, mixed with the
+game's own pad-speaker stream. Pulled out: back to the client output.
+
+- **Detection:** input state byte 53 (`status[1]` in `hid-playstation`): bit 0 headphones,
+  bit 1 headset mic (`report::Jack`). Debounced 150 ms (`headset::JackSwitch`). The same
+  byte reaches the host's virtual pad unchanged.
+- **Routing:** while plugged, every pad-speaker frame goes to the jack (BT block 0x16
+  instead of 0x13), and the pad's audio routing is written the way `hid-playstation` does
+  it on plug/unplug (`SetState::merge_jack_route`: OutputPathSelect 0 = L/R to the
+  headphones; unplugged path 3 + speaker volume 0x64 + preamp +6 dB). While the session
+  audio is routed, the host's mute never mutes the headphones (`unmute_headphones`: the
+  host's virtual-pad speaker mute also sets HeadphoneMute).
+- **Mix:** `headset::HeadsetMix` uses the session audio as the clock. Each 512-frame block
+  (squeezed to 480 like the pad speaker stream) becomes one pad slot with the next host
+  slot's haptics and the host pad-speaker PCM mixed in. Host slots without session audio
+  go out alone after 4 slots (43 ms), so haptics don't stall in a silent game.
+- **No sound anywhere else (maintainer, 2026-11-11):** while the route is active the
+  client output is silent (Pulsar has no other UI sounds), nothing plays on the pad's
+  built-in speaker. Auto-degrade sheds the route **last** (speaker → mic → haptics →
+  headset); shed, the session audio goes silent, it does **not** fall back to the client
+  output while the headphones are in. `Kapalı` = the feature is off: the client output
+  plays as before (the host's pad-speaker stream still goes to the jack, like a real pad).
+- **BT budget:** the route needs the 0x39 report (2 haptics + 2 Opus frames, 547 B per
+  21.3 ms, about 25.6 KB/s) all the time, the same as a game using the pad speaker; it
+  is what the pad speaker stream was sized for. Shedding speaker or haptics while the
+  route is on does not shrink that report (the Opus frame carries the session audio
+  anyway); only mic and finally the route itself free airtime.
+- **Latency (estimated, not measured):** client output ≈ 15-25 ms queue + device buffer.
+  Pad jack ≈ framing up to 10.7 ms + jitter buffer (`jitter_ms`, default 64 ms) + BT write
+  and the pad's own buffer (~10-20 ms) ≈ 85-100 ms. Video is not delayed to match.
+
 ### Local bridge mode
 
 The same `VirtualDs5` + `ds5::Pad` pair, wired back-to-back in-process: input → virtual

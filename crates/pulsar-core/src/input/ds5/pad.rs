@@ -57,6 +57,9 @@ pub enum PadInput {
 struct Slot {
 	haptics: Frame,
 	speaker: Option<(SpeakerOut, OpusFrame)>,
+	/// Carries the session's audio for the headset jack (`super::headset`), not the
+	/// game's pad-speaker stream alone.
+	session: bool,
 }
 
 /// Write counters, for the client's auto-degrade policy and the stats log.
@@ -104,6 +107,12 @@ pub struct Pad {
 	fb_at: Option<Instant>,
 	/// The game's own classic rumble, from the latest host state.
 	host_rumble: (u8, u8),
+	/// Headphones are in the pad's jack: speaker audio goes to block 0x16.
+	headphones: bool,
+	/// Jack routing to merge into the next state write (`SetState::merge_jack_route`).
+	route_dirty: Option<bool>,
+	/// The session's audio plays on the jack: keep the headphones unmuted.
+	headset_route: bool,
 }
 
 impl Pad {
@@ -144,6 +153,9 @@ impl Pad {
 			fb_sent: None,
 			fb_at: None,
 			host_rumble: (0, 0),
+			headphones: false,
+			route_dirty: None,
+			headset_route: false,
 		};
 		pad.audio.mic = transport == Ds5Transport::Bt && features.mic;
 		Ok((pad, feats))
@@ -182,10 +194,90 @@ impl Pad {
 			self.mic_dirty = true;
 		}
 		if !f.haptics && !f.speaker {
-			self.fifo.clear();
-			self.playing = false;
+			// Only the headset jack's session audio may still flow.
+			self.fifo.retain_mut(|s| {
+				s.haptics = [0; FRAME_BYTES];
+				s.session
+			});
+			if self.fifo.is_empty() {
+				self.playing = false;
+			}
 		}
 		self.features = f;
+	}
+
+	/// Headphones plugged into / pulled out of the pad's jack (debounced by the caller).
+	/// Plugged: every speaker frame plays on the jack (block 0x16), like a real pad on a
+	/// console, and the pad's audio routing moves to the headphones (written with the next
+	/// state, `SetState::merge_jack_route`). Pulled out: routing back to the speaker, and
+	/// queued session audio (meant for the headphones only) is dropped.
+	pub fn set_headphones(&mut self, plugged: bool) {
+		if self.headphones == plugged {
+			return;
+		}
+		self.headphones = plugged;
+		self.route_dirty = Some(plugged);
+		if !plugged {
+			self.drop_session_audio();
+		}
+	}
+
+	/// The session's audio is (or is no longer) played on the jack.
+	pub fn set_headset_route(&mut self, on: bool) {
+		if self.headset_route != on {
+			self.headset_route = on;
+			if !on {
+				self.drop_session_audio();
+			}
+		}
+	}
+
+	fn drop_session_audio(&mut self) {
+		self.fifo.retain_mut(|s| {
+			if s.session {
+				s.session = false;
+				s.speaker = None;
+			}
+			s.speaker.is_some() || s.haptics != [0; FRAME_BYTES]
+		});
+	}
+
+	/// Queue one headset slot (BT only): the host slot's haptics with the session audio
+	/// (+ the game's pad-speaker audio) as one Opus frame for the jack. Unlike
+	/// [`Pad::push_slot`] the audio does not depend on the `speaker` feature: the headset
+	/// route has its own setting and is shed last.
+	pub fn push_headset_slot(&mut self, haptics: Option<Frame>, opus: Option<Vec<u8>>) {
+		if self.transport != Ds5Transport::Bt || !self.headset_route {
+			return;
+		}
+		if self.fallback && self.features.rumble && !self.features.haptics {
+			if let Some(h) = &haptics {
+				self.fb.feed(h, Instant::now());
+			}
+		}
+		let haptics = if self.features.haptics { haptics } else { None };
+		let speaker = opus.and_then(|v| {
+			let mut f = [0u8; SPEAKER_OPUS_LEN];
+			let n = v.len().min(SPEAKER_OPUS_LEN);
+			f[..n].copy_from_slice(&v[..n]);
+			(n > 0).then_some((SpeakerOut::Headphone, f))
+		});
+		if haptics.is_none() && speaker.is_none() {
+			return;
+		}
+		self.queue(Slot {
+			haptics: haptics.unwrap_or([0; FRAME_BYTES]),
+			session: speaker.is_some(),
+			speaker,
+		});
+	}
+
+	fn queue(&mut self, slot: Slot) {
+		if self.fifo.len() >= self.max_queued {
+			self.fifo.pop_front();
+			self.stats.overflows += 1;
+		}
+		self.fifo.push_back(slot);
 	}
 
 	/// Decode one input report read from the pad.
@@ -237,13 +329,10 @@ impl Pad {
 		if haptics.is_none() && speaker.is_none() {
 			return;
 		}
-		if self.fifo.len() >= self.max_queued {
-			self.fifo.pop_front();
-			self.stats.overflows += 1;
-		}
-		self.fifo.push_back(Slot {
+		self.queue(Slot {
 			haptics: haptics.unwrap_or([0; FRAME_BYTES]),
 			speaker,
+			session: false,
 		});
 	}
 
@@ -259,8 +348,16 @@ impl Pad {
 	/// next call (it should also wake on new input from the host).
 	pub fn poll(&mut self, now: Instant, io: &mut impl HidIo) -> Duration {
 		self.poll_fallback(now);
+		if let Some(h) = self.route_dirty.take() {
+			self.pending_state
+				.get_or_insert_with(SetState::default)
+				.merge_jack_route(h);
+		}
 		// State first: it never waits behind audio.
-		if let Some(s) = self.pending_state {
+		if let Some(mut s) = self.pending_state {
+			if self.headset_route {
+				s.unmute_headphones();
+			}
 			let ready = self
 				.last_state
 				.is_none_or(|t| now.duration_since(t) >= STATE_MIN_GAP);
@@ -376,6 +473,11 @@ impl Pad {
 			.iter()
 			.find_map(|s| s.speaker.map(|(o, _)| o))
 			.unwrap_or(SpeakerOut::Speaker);
+		let out = if self.headphones {
+			SpeakerOut::Headphone
+		} else {
+			out
+		};
 		match (slots.len(), all_speaker) {
 			(2, true) => {
 				let opus = [slots[0].speaker.unwrap().1, slots[1].speaker.unwrap().1];
@@ -578,6 +680,67 @@ mod tests {
 			.unwrap();
 		assert_eq!(a[8], 0xD2, "double haptics-only");
 		assert_eq!(a[10], 2, "slots 0 and 1 were dropped");
+	}
+
+	#[test]
+	fn headphones_route_speaker_and_session_audio_to_the_jack() {
+		let mut io = Mock::default();
+		let mut pad = bt_pad(&mut io);
+		let t0 = Instant::now();
+		pad.poll(t0, &mut io);
+		io.writes.clear();
+		pad.set_headphones(true);
+		pad.poll(t0, &mut io);
+		let st = &io.writes[0];
+		assert_eq!(st[0], 0x31, "routing written as a state report");
+		assert_ne!(st[3] & report::flag::B0_AUDIO_CONTROL, 0);
+		assert_eq!(st[3 + 7] & 0x30, 0, "path 0: L/R to the headphones");
+		// Headset slots need the route; they ignore the speaker feature.
+		pad.push_headset_slot(None, Some(vec![7; SPEAKER_OPUS_LEN]));
+		assert_eq!(pad.fifo.len(), 0, "route not on yet");
+		pad.set_headset_route(true);
+		pad.set_features(Ds5Features {
+			speaker: false,
+			haptics: false,
+			..Ds5Features::all()
+		});
+		for _ in 0..3 {
+			pad.push_headset_slot(Some([1; FRAME_BYTES]), Some(vec![7; SPEAKER_OPUS_LEN]));
+		}
+		// A plain host speaker slot is still masked (speaker off)...
+		pad.push_slot(None, Some((SpeakerOut::Speaker, vec![1; 10])));
+		assert_eq!(pad.fifo.len(), 3);
+		pad.set_features(Ds5Features::all());
+		// ...and with the speaker on, it goes to the jack too.
+		pad.push_slot(None, Some((SpeakerOut::Speaker, vec![1; 10])));
+		io.writes.clear();
+		pad.poll(t0 + Duration::from_millis(10), &mut io);
+		let a = io.writes.iter().find(|w| w[0] == 0x39).unwrap();
+		assert_eq!(a[140], 0xD6, "headphone Opus block");
+		assert_eq!(a[12], 0, "haptics feature was off for these slots");
+		// Unplug: the queued session audio is dropped, the host's speaker slot stays and
+		// goes back to the speaker; routing returns to the speaker.
+		pad.set_headphones(false);
+		assert_eq!(pad.fifo.len(), 1);
+		io.writes.clear();
+		pad.poll(t0 + Duration::from_millis(40), &mut io);
+		let st = io.writes.iter().find(|w| w[0] == 0x31).unwrap();
+		assert_eq!(st[3 + 7] & 0x30, 0x30, "path 3: speaker");
+	}
+
+	#[test]
+	fn headset_route_keeps_the_headphones_unmuted() {
+		let mut io = Mock::default();
+		let mut pad = bt_pad(&mut io);
+		pad.set_headset_route(true);
+		let mut s = SetState::default();
+		s.0[1] = report::flag::B1_AUDIO_MUTE;
+		s.0[9] = 0x60; // host: speaker + headphone mute
+		pad.set_output(s);
+		io.writes.clear();
+		pad.poll(Instant::now(), &mut io);
+		let st = io.writes.iter().find(|w| w[0] == 0x31).unwrap();
+		assert_eq!(st[3 + 9], 0x20, "speaker stays muted, headphones play");
 	}
 
 	#[test]
