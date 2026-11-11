@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use super::usbip::BUS_ID;
+use super::usbip::{trace, BUS_ID};
 
 const STANDARD_PORT: u16 = 3240;
 
@@ -137,9 +137,9 @@ impl Attachment {
 			return;
 		};
 		match run(&self.exe, &["detach".into(), "-p".into(), p.to_string()]) {
-			Ok(o) if o.status.success() => tracing::info!("usbip: detached port {p}"),
-			Ok(o) => tracing::warn!("usbip detach -p {p} failed: {}", text(&o).trim()),
-			Err(e) => tracing::warn!("usbip detach -p {p}: {e}"),
+			Ok(o) if o.status.success() => trace!("usbip: detached port {p}"),
+			Ok(o) => trace!("usbip detach -p {p} failed: {}", text(&o).trim()),
+			Err(e) => trace!("usbip detach -p {p}: {e}"),
 		}
 	}
 }
@@ -158,6 +158,12 @@ pub fn attach(exe: &Path, tcp_port: u16) -> io::Result<Attachment> {
 	}
 	args.extend(["attach", "-r", "127.0.0.1", "-b", BUS_ID].map(String::from));
 	let o = run(exe, &args)?;
+	trace!(
+		"usbip {} -> {}: {}",
+		args.join(" "),
+		o.status,
+		text(&o).trim()
+	);
 	let out = text(&o);
 	if !o.status.success() {
 		return Err(io::Error::other(format!(

@@ -21,7 +21,7 @@ use super::haptics::Downsampler;
 use super::report::{
 	neutral_usb_input, SetState, PID_DUALSENSE, USB_INPUT_LEN, USB_OUTPUT_ID, VID_SONY,
 };
-use super::usbip::{UsbDevice, EPIPE};
+use super::usbip::{trace, UsbDevice, EPIPE};
 use super::virtual_pad::Ds5HostEvent;
 
 pub const ITF_AUDIO_CONTROL: usize = 0;
@@ -399,6 +399,7 @@ impl Ds5Device {
 				let mut st = self.state.lock().unwrap();
 				let was = st.alt[itf];
 				st.alt[itf] = alt;
+				trace!("SET_INTERFACE interface {itf} alt {was} -> {alt}");
 				let vol = Self::volume_event(&st);
 				if itf == ITF_MIC && alt == 0 {
 					st.mic.clear();

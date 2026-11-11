@@ -18,7 +18,7 @@ use super::attach::{self, Attachment};
 use super::device::{Ds5Device, EP_HID_IN};
 use super::haptics;
 use super::report::{neutral_usb_input, SetState, USB_INPUT_LEN};
-use super::usbip::UsbIpServer;
+use super::usbip::{trace, UsbIpServer};
 use crate::input::{ds4_report_fields, GamepadKind, GamepadState, VirtualGamepad};
 
 /// How to start a [`VirtualDs5`].
@@ -159,10 +159,27 @@ impl VirtualDs5 {
 
 impl Drop for VirtualDs5 {
 	fn drop(&mut self) {
-		// Detach first, then the server drops (closes the session, joins accept).
-		if let Some(a) = self.attachment.take() {
+		let Some(a) = self.attachment.take() else {
+			return;
+		};
+		// ZerkSense runs `usbip detach` first and then closes the socket. On the test PC
+		// (usbip-win2 0.9.8.1) that left the devnodes Present after detach, while a
+		// server-side socket close (ZerkSense killed) removed them at once. So by default
+		// close the session first, give vhci a moment, then detach as a cleanup (it may
+		// then report the port as already free). `PULSAR_DS5_DETACH=first` restores the
+		// ZerkSense order for comparison.
+		let detach_first = std::env::var("PULSAR_DS5_DETACH").is_ok_and(|v| v == "first");
+		if detach_first {
+			trace!("ds5: unplug: usbip detach, then close the socket");
+			a.detach();
+			self.server.disconnect();
+		} else {
+			trace!("ds5: unplug: close the socket, then usbip detach");
+			self.server.disconnect();
+			std::thread::sleep(std::time::Duration::from_millis(500));
 			a.detach();
 		}
+		trace!("ds5: unplug done");
 	}
 }
 
@@ -575,6 +592,80 @@ mod tests {
 			std::thread::sleep(Duration::from_millis(10));
 		}
 		assert!(!pad.attached());
+	}
+
+	/// What a UAC1 class driver (usbaudio.sys, snd-usb-audio) does to start rendering,
+	/// inferred from the UAC1 spec and the device's descriptors: probe the feature units,
+	/// select alt 1, set and read back the endpoint sample rate, keep several iso OUT
+	/// URBs in flight (ISO_ASAP), then select alt 0. Everything must be answered.
+	#[test]
+	fn uac1_render_start_sequence() {
+		let (pad, rx) = start();
+		let mut c = Client::import(pad.port());
+
+		for entity in [0x02u8, 0x05] {
+			for ch in [0u8, 1] {
+				for req in [0x81u8, 0x82, 0x83, 0x84] {
+					let r = c.control_in([0xA1, req, ch, 0x02, 0x00, entity, 2, 0]);
+					assert_eq!(
+						(r.status, r.data.len()),
+						(0, 2),
+						"volume {req:#x} fu {entity}"
+					);
+				}
+			}
+			let r = c.control_in([0xA1, 0x81, 0x00, 0x01, 0x00, entity, 1, 0]);
+			assert_eq!((r.status, r.data.len()), (0, 1), "mute GET_CUR");
+		}
+		let r = c.control_in([0xA1, 0x83, 0x00, 0x02, 0x00, 0x02, 2, 0]);
+		assert_eq!(r.data, 0i16.to_le_bytes(), "speaker max 0 dB");
+		let r = c.control_in([0xA1, 0x82, 0x00, 0x02, 0x00, 0x02, 2, 0]);
+		assert_eq!(r.data, (-100i16 * 256).to_le_bytes(), "speaker min -100 dB");
+
+		// SET_INTERFACE(1, 1), sample rate SET_CUR / GET_CUR on EP 0x01.
+		assert_eq!(
+			c.control_out([0x01, 0x0B, 0x01, 0x00, 0x01, 0x00, 0, 0], &[])
+				.status,
+			0
+		);
+		assert_eq!(
+			next_event(&rx, |e| matches!(e, Ds5HostEvent::SpeakerOpen(_))),
+			Ds5HostEvent::SpeakerOpen(true)
+		);
+		let r = c.control_out(
+			[0x22, 0x01, 0x00, 0x01, 0x01, 0x00, 3, 0],
+			&[0x80, 0xBB, 0x00],
+		);
+		assert_eq!((r.status, r.actual), (0, 3));
+		let r = c.control_in([0xA2, 0x81, 0x00, 0x01, 0x01, 0x00, 3, 0]);
+		assert_eq!((r.status, r.data), (0, vec![0x80, 0xBB, 0x00]));
+		// GET_INTERFACE reads back alt 1.
+		let r = c.control_in([0x81, 0x0A, 0, 0, 0x01, 0x00, 1, 0]);
+		assert_eq!(r.data, vec![1]);
+
+		// Three 8-packet URBs in flight, ISO_ASAP, silence: all complete, in order, paced.
+		let pcm = vec![0u8; 8 * 384];
+		let iso: Vec<(u32, u32)> = (0..8).map(|i| (i * 384, 384)).collect();
+		let seqs: Vec<u32> = (0..3)
+			.map(|_| c.submit(DIR_OUT, 1, pcm.len() as u32, [0; 8], &pcm, &iso))
+			.collect();
+		let t0 = Instant::now();
+		for s in &seqs {
+			let r = c.ret(false);
+			assert_eq!((r.cmd, r.seq, r.status, r.packets), (RET_SUBMIT, *s, 0, 8));
+			assert!(r.iso.iter().all(|d| d[2] == 384 && d[3] == 0));
+		}
+		assert!(
+			t0.elapsed() >= Duration::from_millis(15),
+			"24 ms of audio, paced"
+		);
+
+		assert_eq!(
+			c.control_out([0x01, 0x0B, 0x00, 0x00, 0x01, 0x00, 0, 0], &[])
+				.status,
+			0
+		);
+		next_event(&rx, |e| *e == Ds5HostEvent::SpeakerOpen(false));
 	}
 
 	#[test]

@@ -18,11 +18,73 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Wire-level tracing to stderr, on when `PULSAR_DS5_TRACE` is set (and not "0"): every
+/// control request with its answer, SET_INTERFACE, unlinks, the first iso URBs of each
+/// stream, and per-endpoint URB counts once a second. Off, the same lines go to
+/// `tracing::debug!`.
+pub fn trace_enabled() -> bool {
+	static ON: OnceLock<bool> = OnceLock::new();
+	*ON.get_or_init(|| std::env::var("PULSAR_DS5_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// Emit one trace line (see [`trace_enabled`]).
+pub fn trace_line(args: std::fmt::Arguments<'_>) {
+	static T0: OnceLock<Instant> = OnceLock::new();
+	if trace_enabled() {
+		let t = T0.get_or_init(Instant::now).elapsed().as_secs_f64();
+		eprintln!("[{t:9.3}] {args}");
+	} else {
+		tracing::debug!("{args}");
+	}
+}
+
+macro_rules! trace {
+	($($a:tt)*) => {
+		$crate::input::ds5::usbip::trace_line(format_args!($($a)*))
+	};
+}
+pub(crate) use trace;
+
+/// A readable name for a control request, for the trace.
+pub fn request_name(setup: &[u8; 8]) -> &'static str {
+	let (ty, req) = (setup[0], setup[1]);
+	match ((ty >> 5) & 3, ty & 0x1F, req) {
+		(0, _, 0x00) => "GET_STATUS",
+		(0, _, 0x01) => "CLEAR_FEATURE",
+		(0, _, 0x03) => "SET_FEATURE",
+		(0, _, 0x05) => "SET_ADDRESS",
+		(0, _, 0x06) => "GET_DESCRIPTOR",
+		(0, _, 0x08) => "GET_CONFIGURATION",
+		(0, _, 0x09) => "SET_CONFIGURATION",
+		(0, _, 0x0A) => "GET_INTERFACE",
+		(0, _, 0x0B) => "SET_INTERFACE",
+		(1, 1, _) if setup[4] == 3 => match req {
+			0x01 => "HID GET_REPORT",
+			0x02 => "HID GET_IDLE",
+			0x03 => "HID GET_PROTOCOL",
+			0x09 => "HID SET_REPORT",
+			0x0A => "HID SET_IDLE",
+			0x0B => "HID SET_PROTOCOL",
+			_ => "HID ?",
+		},
+		(1, r, _) if r == 1 || r == 2 => match req {
+			0x01 => "UAC SET_CUR",
+			0x81 => "UAC GET_CUR",
+			0x82 => "UAC GET_MIN",
+			0x83 => "UAC GET_MAX",
+			0x84 => "UAC GET_RES",
+			_ => "UAC ?",
+		},
+		_ => "?",
+	}
+}
 
 /// The only bus id this server exports.
 pub const BUS_ID: &str = "1-1";
@@ -156,6 +218,16 @@ impl UsbIpServer {
 		self.shared.session.lock().unwrap().is_some()
 	}
 
+	/// Close the current session's socket and refuse new imports. For usbip-win2 a
+	/// server-side close is what unplugs the device at once (see `VirtualDs5::drop`).
+	pub fn disconnect(&self) {
+		self.shared.stop.store(true, Ordering::SeqCst);
+		if let Some(s) = self.shared.session.lock().unwrap().take() {
+			trace!("usbip: server closing the session");
+			s.close();
+		}
+	}
+
 	/// Complete the oldest pending interrupt IN URB on `ep` with `report`, or keep it as
 	/// the latest report when none is pending. Dropped when no session is open.
 	pub fn push_interrupt_in(&self, ep: u32, report: &[u8]) {
@@ -207,6 +279,7 @@ fn handle_client(mut stream: TcpStream, shared: &Arc<ServerShared>) -> io::Resul
 	let dev = &shared.device;
 	match be16(&hdr, 2) {
 		OP_REQ_DEVLIST => {
+			trace!("usbip: DEVLIST");
 			let mut reply = op_header(OP_REP_DEVLIST, 0).to_vec();
 			reply.extend_from_slice(&1u32.to_be_bytes());
 			reply.extend_from_slice(&device_record(dev.as_ref()));
@@ -227,6 +300,12 @@ fn handle_client(mut stream: TcpStream, shared: &Arc<ServerShared>) -> io::Resul
 					|| slot.is_some()
 					|| shared.stop.load(Ordering::SeqCst)
 				{
+					trace!(
+						"usbip: IMPORT {:?} refused (busy={}, stopping={})",
+						String::from_utf8_lossy(requested),
+						slot.is_some(),
+						shared.stop.load(Ordering::SeqCst)
+					);
 					stream.write_all(&op_header(OP_REP_IMPORT, 1))?;
 					return Ok(());
 				}
@@ -238,8 +317,10 @@ fn handle_client(mut stream: TcpStream, shared: &Arc<ServerShared>) -> io::Resul
 				s
 			};
 			tracing::info!("usbip: virtual DualSense attached");
+			trace!("usbip: IMPORT ok, session started");
 			dev.session_changed(true);
-			session.run(stream);
+			let why = session.run(stream);
+			trace!("usbip: session ended: {why}");
 			{
 				let mut slot = shared.session.lock().unwrap();
 				if slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &session)) {
@@ -268,9 +349,14 @@ struct Urb {
 	/// `(offset, length)` per iso packet.
 	iso: Vec<(u32, u32)>,
 	claimed: AtomicBool,
+	at: Instant,
 }
 
 impl Urb {
+	fn key(&self) -> (u32, u32) {
+		(self.ep, self.dir)
+	}
+
 	/// True for exactly one caller: completion or unlink.
 	fn claim(&self) -> bool {
 		!self.claimed.swap(true, Ordering::SeqCst)
@@ -283,6 +369,19 @@ struct InterruptIn {
 	latest: HashMap<u32, Vec<u8>>,
 }
 
+/// Per `(ep, dir)` URB counters for the once-a-second trace.
+#[derive(Default, Clone, Copy)]
+struct EpStats {
+	submitted: u32,
+	returned: u32,
+	stalled: u32,
+	unlinked: u32,
+	iso_packets: u32,
+	bytes: u64,
+	/// Iso submits traced in full so far (the first few per stream).
+	iso_traced: u32,
+}
+
 struct Session {
 	me: Weak<Session>,
 	writer: Mutex<TcpStream>,
@@ -292,6 +391,7 @@ struct Session {
 	pacer: IsoPacer,
 	control_tx: Mutex<Option<mpsc::Sender<Arc<Urb>>>>,
 	closed: AtomicBool,
+	stats: Mutex<HashMap<(u32, u32), EpStats>>,
 }
 
 impl Session {
@@ -307,6 +407,7 @@ impl Session {
 			pacer: IsoPacer::start(),
 			control_tx: Mutex::new(Some(tx)),
 			closed: AtomicBool::new(false),
+			stats: Mutex::new(HashMap::new()),
 		});
 		let weak = Arc::downgrade(&s);
 		thread::Builder::new()
@@ -317,14 +418,79 @@ impl Session {
 					s.complete_control(&urb);
 				}
 			})?;
+		if trace_enabled() {
+			let weak = Arc::downgrade(&s);
+			thread::Builder::new()
+				.name("usbip-stats".into())
+				.spawn(move || loop {
+					thread::sleep(Duration::from_secs(1));
+					let Some(s) = weak.upgrade() else { return };
+					if s.closed.load(Ordering::SeqCst) {
+						return;
+					}
+					s.trace_stats();
+				})?;
+		}
 		Ok(s)
 	}
 
-	fn run(&self, mut stream: TcpStream) {
+	/// One line per active endpoint: counts over the last second, plus how many URBs
+	/// are still unanswered and the age of the oldest (a stuck URB shows up here).
+	fn trace_stats(&self) {
+		let snap: Vec<_> = {
+			let mut st = self.stats.lock().unwrap();
+			let v = st.iter().map(|(k, v)| (*k, *v)).collect();
+			for e in st.values_mut() {
+				let traced = e.iso_traced;
+				*e = EpStats {
+					iso_traced: traced,
+					..Default::default()
+				};
+			}
+			v
+		};
+		let mut pending: HashMap<(u32, u32), (u32, Duration)> = HashMap::new();
+		for u in self.pending.lock().unwrap().values() {
+			let e = pending.entry(u.key()).or_default();
+			e.0 += 1;
+			e.1 = e.1.max(u.at.elapsed());
+		}
+		let mut keys: Vec<_> = snap.iter().map(|(k, _)| *k).collect();
+		keys.extend(pending.keys().copied());
+		keys.sort();
+		keys.dedup();
+		for k in keys {
+			let s = snap
+				.iter()
+				.find(|(kk, _)| *kk == k)
+				.map(|(_, s)| *s)
+				.unwrap_or_default();
+			let (np, age) = pending.get(&k).copied().unwrap_or_default();
+			if s.submitted == 0 && s.returned == 0 && s.unlinked == 0 && np == 0 {
+				continue;
+			}
+			trace!(
+				"stats ep{} {}: submit {} ret {} stall {} unlink {} iso_pkts {} bytes {} | pending {} oldest {} ms",
+				k.0,
+				if k.1 == DIR_IN { "IN " } else { "OUT" },
+				s.submitted,
+				s.returned,
+				s.stalled,
+				s.unlinked,
+				s.iso_packets,
+				s.bytes,
+				np,
+				age.as_millis()
+			);
+		}
+	}
+
+	/// Returns why the session ended.
+	fn run(&self, mut stream: TcpStream) -> String {
 		let mut hdr = [0u8; URB_HEADER_LEN];
 		while !self.closed.load(Ordering::SeqCst) {
-			if stream.read_exact(&mut hdr).is_err() {
-				break;
+			if let Err(e) = stream.read_exact(&mut hdr) {
+				return format!("read: {e}");
 			}
 			let r = match be32(&hdr, 0) {
 				CMD_SUBMIT => self.read_submit(&hdr, &mut stream),
@@ -332,12 +498,13 @@ impl Session {
 					self.unlink(be32(&hdr, 4), be32(&hdr, 20));
 					Ok(())
 				}
-				_ => break,
+				c => return format!("unknown command {c:#x}, header {hdr:02x?}"),
 			};
-			if r.is_err() {
-				break;
+			if let Err(e) = r {
+				return format!("read payload: {e}");
 			}
 		}
+		"closed".into()
 	}
 
 	fn close(&self) {
@@ -379,7 +546,34 @@ impl Session {
 			data,
 			iso: iso_desc,
 			claimed: AtomicBool::new(false),
+			at: Instant::now(),
 		});
+		let first_iso = {
+			let mut st = self.stats.lock().unwrap();
+			let e = st.entry(urb.key()).or_default();
+			e.submitted += 1;
+			let first = urb.packets.is_some() && e.iso_traced < 3;
+			if first {
+				e.iso_traced += 1;
+			}
+			first
+		};
+		if first_iso || (n != u32::MAX && n > 0 && !iso) {
+			let lens: Vec<u32> = urb.iso.iter().map(|d| d.1).collect();
+			trace!(
+				"iso submit seq {} ep{} dir {} len {} flags {:#x} start_frame {} packets {} interval {} pkt_lens {:?}{}",
+				urb.seq,
+				ep,
+				dir,
+				len,
+				be32(hdr, 20),
+				be32(hdr, 28),
+				n,
+				be32(hdr, 36),
+				lens,
+				if iso { "" } else { " (NOT treated as iso!)" }
+			);
+		}
 		self.pending.lock().unwrap().insert(urb.seq, urb.clone());
 
 		if ep == 0 {
@@ -399,7 +593,13 @@ impl Session {
 				}),
 			);
 		} else if dir == DIR_OUT {
-			self.device.interrupt_out(ep, &urb.data);
+			if catch_unwind(AssertUnwindSafe(|| {
+				self.device.interrupt_out(ep, &urb.data)
+			}))
+			.is_err()
+			{
+				trace!("interrupt OUT handler panicked");
+			}
 			if urb.claim() {
 				self.send_submit(&urb, 0, urb.len, &[], None);
 			}
@@ -429,8 +629,35 @@ impl Session {
 		} else {
 			&[]
 		};
-		let result = self.device.control(&urb.setup, out);
+		// A panicking handler must not kill the control thread: every later EP0 request
+		// would hang (ZerkSense catches and STALLs too).
+		let result = catch_unwind(AssertUnwindSafe(|| self.device.control(&urb.setup, out)))
+			.unwrap_or_else(|_| {
+				trace!("control handler panicked, STALL");
+				Err(-EPIPE)
+			});
+		let s = &urb.setup;
+		let w = |o: usize| u16::from_le_bytes([s[o], s[o + 1]]);
+		let answer = match &result {
+			Ok(d) if urb.dir == DIR_IN => {
+				let n = d.len().min(urb.len as usize);
+				format!("ok IN {n} B {:02x?}", &d[..n.min(16)])
+			}
+			Ok(_) => format!("ok OUT {:02x?}", &out[..out.len().min(16)]),
+			Err(e) => format!("STALL ({e})"),
+		};
+		trace!(
+			"ctl seq {} {:<17} bmRequestType {:#04x} bRequest {:#04x} wValue {:#06x} wIndex {:#06x} wLength {} -> {answer}",
+			urb.seq,
+			request_name(s),
+			s[0],
+			s[1],
+			w(2),
+			w(4),
+			w(6)
+		);
 		if !urb.claim() {
+			trace!("ctl seq {} was unlinked before completion", urb.seq);
 			return;
 		}
 		match result {
@@ -459,7 +686,9 @@ impl Session {
 				actual.push(len);
 				total += len;
 			}
-			self.device.iso_out(urb.ep, &slices);
+			if catch_unwind(AssertUnwindSafe(|| self.device.iso_out(urb.ep, &slices))).is_err() {
+				trace!("iso OUT handler panicked");
+			}
 			self.send_submit(urb, 0, total, &[], Some(&actual));
 		} else {
 			let want = self.device.iso_in_packet_size(urb.ep);
@@ -504,10 +733,26 @@ impl Session {
 
 	fn unlink(&self, seq: u32, victim: u32) {
 		let urb = self.pending.lock().unwrap().remove(&victim);
-		let status = match urb {
-			Some(u) if u.claim() => -ECONNRESET,
-			_ => 0,
+		let (status, what) = match &urb {
+			Some(u) if u.claim() => (-ECONNRESET, format!("ep{} dir {} pending", u.ep, u.dir)),
+			Some(u) => (0, format!("ep{} dir {} already completing", u.ep, u.dir)),
+			None => (0, "not pending".into()),
 		};
+		if let Some(u) = &urb {
+			if status != 0 {
+				self.stats
+					.lock()
+					.unwrap()
+					.entry(u.key())
+					.or_default()
+					.unlinked += 1;
+			}
+			if u.ep == 0 || status == 0 || !(1..=4).contains(&u.ep) {
+				trace!("unlink seq {seq} victim {victim}: {what} -> {status}");
+			}
+		} else {
+			trace!("unlink seq {seq} victim {victim}: {what} -> {status}");
+		}
 		let mut b = [0u8; URB_HEADER_LEN];
 		put32(&mut b, 0, RET_UNLINK);
 		put32(&mut b, 4, seq);
@@ -517,6 +762,14 @@ impl Session {
 
 	fn send_submit(&self, urb: &Urb, status: i32, actual: u32, data: &[u8], iso: Option<&[u32]>) {
 		self.pending.lock().unwrap().remove(&urb.seq);
+		{
+			let mut st = self.stats.lock().unwrap();
+			let e = st.entry(urb.key()).or_default();
+			e.returned += 1;
+			e.stalled += (status != 0) as u32;
+			e.iso_packets += urb.packets.unwrap_or(0);
+			e.bytes += actual as u64;
+		}
 		let np = urb.packets.unwrap_or(0) as usize;
 		let mut b = vec![0u8; URB_HEADER_LEN + data.len() + 16 * np];
 		put32(&mut b, 0, RET_SUBMIT);
@@ -551,7 +804,8 @@ impl Session {
 			return;
 		}
 		let r = self.writer.lock().unwrap().write_all(b);
-		if r.is_err() {
+		if let Err(e) = r {
+			trace!("usbip: write failed ({e}), closing");
 			self.close();
 		}
 	}
@@ -670,7 +924,9 @@ fn pacer_loop(s: &PacerShared) {
 			Some(e) if e.due <= now => {
 				let job = st.queue.pop().unwrap().job;
 				drop(st);
-				job();
+				if catch_unwind(AssertUnwindSafe(job)).is_err() {
+					trace!("iso completion panicked");
+				}
 				st = s.state.lock().unwrap();
 				continue;
 			}

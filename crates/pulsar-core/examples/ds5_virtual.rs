@@ -10,14 +10,28 @@
 //! Then open "Set up USB game controllers" (joy.cpl), the Windows sound settings, or a
 //! game. The device is detached when the run ends; press Ctrl+C only as a last resort
 //! (it skips the detach: then run `usbip detach -p <port>` by hand).
+//!
+//! Everything goes to stderr with timestamps. The wire trace (`PULSAR_DS5_TRACE`) is on
+//! by default here: every control request and its answer, SET_INTERFACE, unlinks, the
+//! first iso URBs per stream and per-endpoint URB counts each second. Set
+//! `PULSAR_DS5_TRACE=0` to silence it, `PULSAR_DS5_DETACH=first` to unplug in
+//! ZerkSense's order (`usbip detach` before closing the socket).
 
 use std::time::{Duration, Instant};
 
+use pulsar_core::input::ds5::usbip::trace_line;
 use pulsar_core::input::ds5::virtual_pad::{
 	idle_input, Ds5HostEvent, VirtualDs5, VirtualDs5Config,
 };
 
+macro_rules! log {
+	($($a:tt)*) => { trace_line(format_args!($($a)*)) };
+}
+
 fn main() -> std::io::Result<()> {
+	if std::env::var_os("PULSAR_DS5_TRACE").is_none() {
+		std::env::set_var("PULSAR_DS5_TRACE", "1");
+	}
 	let mut args = std::env::args().skip(1);
 	let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
 	let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -26,7 +40,7 @@ fn main() -> std::io::Result<()> {
 		port,
 		..Default::default()
 	})?;
-	println!(
+	log!(
 		"virtual DualSense on 127.0.0.1:{} attached={} — running {secs} s",
 		pad.port(),
 		pad.attached()
@@ -49,7 +63,7 @@ fn main() -> std::io::Result<()> {
 			Ok(Ds5HostEvent::Output(s)) => {
 				outputs += 1;
 				if outputs <= 20 || outputs % 100 == 0 {
-					println!("output #{outputs}: {:02x?}", &s.0[..47]);
+					log!("output #{outputs}: {:02x?}", &s.0[..47]);
 				}
 			}
 			Ok(Ds5HostEvent::Haptics(f)) => {
@@ -64,12 +78,12 @@ fn main() -> std::io::Result<()> {
 					speaker_peak = speaker_peak.max(v.abs());
 				}
 			}
-			Ok(e) => println!("{e:?}"),
+			Ok(e) => log!("event {e:?}"),
 			Err(_) => {}
 		}
 		if last_stats.elapsed() >= Duration::from_secs(1) {
 			if haptic_frames > 0 || speaker_samples > 0 {
-				println!(
+				log!(
 					"last 1 s: haptics {haptic_frames} frames (peak {haptic_peak}/127), \
 					 speaker {} frames (peak {speaker_peak:.3})",
 					speaker_samples / 2
@@ -79,7 +93,7 @@ fn main() -> std::io::Result<()> {
 			last_stats = Instant::now();
 		}
 	}
-	println!("done; detaching");
+	log!("done; detaching");
 	drop(pad);
 	Ok(())
 }
