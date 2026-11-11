@@ -113,6 +113,31 @@ no haptics/speaker/mic (Duo's device has no audio), so only `Ds5Output` goes to 
   `shm[1]` with 46 bytes (WriteFile; the lightbar's blue byte is lost). Without the section
   it falls back to the callback rumble. Hardware check: `examples/duo_ds5.rs`.
 
+### Leftover pads of a dead host (`input/pad_registry.rs` + `input/pad_cleanup.rs`)
+
+A host killed without unwinding never runs the pads' `Drop`. On 2026-11-12 a force-killed
+Pulsar in a Duo seat left a present `HID\…&DUOCONTROLLER&…` device whose ROOT parent was
+gone; Steam and the game picked it first, so pad input did nothing. A USB/IP pad leaves
+usbip-win2 re-attach attempts behind (~2 h). So, at host start (desktop `bring_online`, once
+per process) and at most every 30 s before a pad is created (`before_create()` in
+`DuoGamepad::new_target`, `DuoDs5::start`, `VirtualDs5::start`):
+
+- **Orphans:** every present Duo HID devnode whose parent is missing, the tree root, not
+  present, or has a "being removed" problem code is removed (`DIF_REMOVE`), whichever seat
+  made it. A present non-Duo parent is left alone.
+- **Dead owners:** every pad Pulsar plugs in is recorded in `%ProgramData%\Pulsar\duo-pads.json`
+  (Duo ROOT instance id, or USB/IP server + vhci port; creator pid + process start time; owner
+  Administrators, SYSTEM + Administrators only, exclusive open as the lock). A record whose
+  creator is gone (or whose pid now belongs to a newer process) is acted on: Duo → `DIF_REMOVE`
+  of the ROOT devnode (only ids matching `ROOT\…&DUOCONTROLLER&…`); USB/IP → `usbip detach -p`
+  if the port still imports that server, then `usbip attach --stop`. The pad's `PadLease`
+  removes its record after the pad unplugged itself.
+- Duo's DLL doesn't say which devnode it made: the ROOT id is the only new, untaken Duo ROOT
+  devnode within 6 s of `CreateController` (DualSense: the parent found for its section). Two
+  new ones at once (another seat) = ambiguous, nothing recorded (logged).
+- Not elevated: nothing is recorded or removed (logged once). Windows only; Linux vhci-hcd
+  unplugs by itself when the server socket dies.
+
 ### Client: `ds5::Pad` (pulsar-core `input/ds5/pad.rs`, used by desktop `controllers.rs`)
 
 - Opens the physical pad with hidapi (SDL3's `SDL_hid_*`, so no second HID library). It
