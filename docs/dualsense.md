@@ -1,6 +1,11 @@
 # DualSense passthrough — design
 
-Status: **design, nothing implemented** (2026-11-11). Branch `feat/dualsense`.
+Status (2026-11-11, branch `feat/dualsense`, local only): **implemented and verified in a
+real session** — Windows host (x64, usbip-win2) ⇄ Windows ARM64 client with a Bluetooth
+DualSense: adaptive triggers, lightbar, HD haptics and the pad speaker work; local bridge mode
+(`pulsar --ds5-bridge`) verified too. Not done: pad mic (needs a host→client mic-open
+message), USB-pad audio on the client, settings UI + auto-degrade, installer bundling,
+Linux host/client, Duo backend. Untested: Linux, macOS.
 Protocol reference: see "Protocol notes" below and the sources it lists.
 
 ## Goal
@@ -190,6 +195,18 @@ its MPL notice per file; MPL-2.0 files are GPL-compatible. No Sony SDK code or f
    auto-degrade, settings UI in Turkish).
 7. Installer: usbip-win2 per arch; Linux module/udev/helper.
 8. Maintainer test in a real session (Windows host + this PC / Pi client), then push.
+
+## Lessons from the first real session (2026-11-11)
+
+- Debug builds cap the link (~14 Mbit, periodic 300-500 ms stalls): always test release.
+- The session media parser has an allow-list (`media::parse`); new tags must be added there.
+- WAN jitter: the client pad needs a jitter buffer (~64 ms start, 256 ms cap).
+- Plugging the virtual pad at session start raced the host's audio-capture activation; the
+  host now plugs it 3 s after the first report, off the serve loop.
+- Wi-Fi on the client matters more than the protocol: 2.4 GHz shares the radio with BT, and a
+  laptop on battery runs WLAN power saving (1.5 s stalls). Worth a client-side warning.
+- Identify the virtual pad's audio endpoints by devnode, never by name ("DualSense" also
+  matches a real cabled pad).
 
 ## Open questions
 
