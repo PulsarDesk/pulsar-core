@@ -3,15 +3,19 @@
 //! Standard CRC-32 (IEEE 802.3, reflected poly `0xEDB88320`, init `!0`, final xor `!0`)
 //! computed over a one-byte **seed** followed by the report bytes, excluding the trailing
 //! 4 CRC bytes. The CRC is stored little-endian in the last 4 bytes of the report.
-//! The seed is the Bluetooth HID transaction header: input `0xA1`, output `0xA2`,
-//! feature `0xA3` (same scheme as Linux `hid-playstation`).
+//! The seed is the Bluetooth HID transaction header: input `0xA1`, every output report
+//! (0x31..0x39) `0xA2`, feature GET responses `0xA3`, feature SET `0x53` (Linux
+//! `hid-playstation` verifies with the first three; ZerkSense5 / DS5Dongle send SET with 0x53).
+//! The header byte is never in the OS buffer (hidraw / `WriteFile`), but it is in the CRC.
 
 /// HIDP header for DATA | INPUT.
 pub const SEED_INPUT: u8 = 0xA1;
 /// HIDP header for DATA | OUTPUT.
 pub const SEED_OUTPUT: u8 = 0xA2;
-/// HIDP header for SET/GET FEATURE.
+/// HIDP header for DATA | FEATURE (GET_REPORT responses).
 pub const SEED_FEATURE: u8 = 0xA3;
+/// HIDP header for SET_REPORT | FEATURE.
+pub const SEED_FEATURE_SET: u8 = 0x53;
 
 const fn table() -> [u32; 256] {
 	let mut t = [0u32; 256];
@@ -20,7 +24,11 @@ const fn table() -> [u32; 256] {
 		let mut c = i as u32;
 		let mut k = 0;
 		while k < 8 {
-			c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+			c = if c & 1 != 0 {
+				0xEDB8_8320 ^ (c >> 1)
+			} else {
+				c >> 1
+			};
 			k += 1;
 		}
 		t[i] = c;
@@ -79,9 +87,21 @@ mod tests {
 	}
 
 	#[test]
+	fn seed_values_match_zlib() {
+		// crc32([hdr]) as published by ZerkSense5 / DS5Dongle and re-checked with zlib.
+		assert_eq!(crc32(&[SEED_INPUT]), 0x73D3_7CF3);
+		assert_eq!(crc32(&[SEED_OUTPUT]), 0xEADA_2D49);
+		assert_eq!(crc32(&[SEED_FEATURE]), 0x9DDD_1DDF);
+		assert_eq!(crc32(&[SEED_FEATURE_SET]), 0x2060_EFC3);
+	}
+
+	#[test]
 	fn seed_is_a_prefix_byte() {
 		let data = [0x31u8, 0x10, 0x00, 0x7F];
-		assert_eq!(crc32_seeded(SEED_OUTPUT, &data), crc32(&[0xA2, 0x31, 0x10, 0x00, 0x7F]));
+		assert_eq!(
+			crc32_seeded(SEED_OUTPUT, &data),
+			crc32(&[0xA2, 0x31, 0x10, 0x00, 0x7F])
+		);
 	}
 
 	#[test]
