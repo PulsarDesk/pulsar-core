@@ -5,7 +5,7 @@ real session** — Windows host (x64, usbip-win2) ⇄ Windows ARM64 client with 
 DualSense: adaptive triggers, lightbar, HD haptics and the pad speaker work; local bridge mode
 (`pulsar --ds5-bridge`) verified too. Not done: pad mic (needs a host→client mic-open
 message), USB-pad audio on the client, settings UI + auto-degrade, installer bundling,
-Linux host/client, Duo backend. Untested: Linux, macOS.
+Linux host/client. Duo backend (HID only) written, untested on hardware. Untested: Linux, macOS.
 Protocol reference: see "Protocol notes" below and the sources it lists.
 
 ## Goal
@@ -91,6 +91,25 @@ ds5::Pad (hidapi owner)                  Windows/Linux USB stack
 - Selected when the client sends `kind = Ds5` with `target = Ds5` (new `EmulationTarget::Ds5`)
   or `Auto` **and** the host has the backend available; otherwise today's DS4/X360 ViGEm path
   (unchanged fallback). `ResolvedTarget::Ds5` is added.
+
+### Host inside a Duo seat: `DuoDs5` (pulsar-core `input/duo.rs` + `input/ds5/duo.rs`)
+
+Inside a Duo multi-seat (non-console WinStation) session a USB/IP pad is a system-wide
+"console" device that Duo's HID isolation hides from the seat, so the host (desktop
+`ds5/host_duo.rs`) creates the DualSense through Duo's `DuoController.dll` instead (type 2;
+same detection as the other pads: `duo_pads_wanted()`, `PULSAR_PAD_BACKEND=duo|vigem`).
+No USB/IP fallback inside a Duo seat. HID only: triggers, LEDs, rumble, gyro, touchpad;
+no haptics/speaker/mic (Duo's device has no audio), so only `Ds5Output` goes to the client.
+
+- Input: `SendReport(handle, *mut [u8; 63])` = USB input 0x01 without the id; the DLL
+  rewrites seq (`[6]`), both sensor timestamps (`0x1b`, `0x30`) and zero battery bytes.
+- Output: the DLL's callback carries only the motors, so a reader thread maps the driver's
+  4 KiB section `Global\Duo_<parent ROOT devnode id, '\'→'_'>_output` (event
+  `<same>_event`, polled every 8 ms too). The parent id comes from `CM_Get_Parent` of the
+  pad's HID interface (`pid_0ce6&duocontroller`), polled up to 5 s after create. Layout:
+  `shm[0]==0x02 && shm[1]==0x02` → body at `shm[2]` (HidD_SetOutputReport), else body at
+  `shm[1]` with 46 bytes (WriteFile; the lightbar's blue byte is lost). Without the section
+  it falls back to the callback rumble. Hardware check: `examples/duo_ds5.rs`.
 
 ### Client: `ds5::Pad` (pulsar-core `input/ds5/pad.rs`, used by desktop `controllers.rs`)
 
