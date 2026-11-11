@@ -49,6 +49,10 @@ pub struct DataHandlers {
 	/// ([`ClientStats`] JSON in a [`DataMsg::Stats`]). Default no-op; the desktop host logs
 	/// it, a host-side controller may act on it (Phase 2.4).
 	pub on_stats: Box<dyn FnMut(ClientStats) + Send>,
+	/// DualSense passthrough messages from the client (`Ds5Caps`, `Ds5Feature`) for the
+	/// host's virtual wired DualSense (`input::ds5`). Default no-op: a host without the
+	/// backend never advertises `FEAT_DS5`, so a client never sends them.
+	pub on_ds5: Box<dyn FnMut(DataMsg) + Send>,
 	/// Host-initiated re-stream injection. When the host detects its OWN display mode changed
 	/// mid-session (resolution / refresh rate), a watcher re-sends the last [`StreamReq`] here so
 	/// the capture restarts at the new geometry — the ffmpeg (x11grab/gdigrab/avfoundation) and
@@ -83,6 +87,7 @@ impl Default for DataHandlers {
 			on_cursor_label: Box::new(|_| {}),
 			on_fs: Box::new(|_| {}),
 			on_stats: Box::new(|_| {}),
+			on_ds5: Box::new(|_| {}),
 		}
 	}
 }
@@ -307,6 +312,8 @@ pub async fn serve_with(
 				// Cursor side-channel + rumble are host→client only; ignore if echoed back.
 				DataMsg::CursorPos { .. } | DataMsg::CursorShape { .. } | DataMsg::CursorHidden | DataMsg::PointerLock(_) => {}
 				DataMsg::Rumble { .. } => {}
+				m @ (DataMsg::Ds5Caps { .. } | DataMsg::Ds5Feature { .. }) => (data.on_ds5)(m),
+				DataMsg::Ds5Output { .. } => {} // host→client only; ignore if echoed back
 			},
 			_ => {}
 		}

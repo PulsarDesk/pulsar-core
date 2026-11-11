@@ -77,6 +77,11 @@ pub enum InputEvent {
 	/// [`crate::service::media::FEAT_PINCH`]; every other host gets the Windows-style
 	/// Ctrl + wheel the client falls back to.
 	Pinch { phase: u8, scale: f64 },
+	/// Raw DualSense input state for the pad at `slot` (gyro, touchpad, every button), in
+	/// the USB 0x01 layout. Sent instead of `GamepadSlot` for a DualSense whose host
+	/// advertises [`FEAT_DS5`](crate::input::ds5::wire::FEAT_DS5); the host replays it on
+	/// its virtual wired DualSense. Additive new→new variant; old hosts drop it.
+	Ds5Input { slot: u8, report: crate::input::ds5::wire::Ds5Report },
 }
 
 /// How the client wants the host to bias the encode: minimize latency, balance,
@@ -526,6 +531,9 @@ enum DataMsgWire {
 	MediaRfi { first: u16, last: u16 },
 	ProbeReq { rates_kbps: Vec<u32>, train_ms: u16 },
 	PointerLock(bool),
+	Ds5Output { slot: u8, report: Vec<u8> },
+	Ds5Caps { slot: u8, transport: crate::input::ds5::wire::Ds5Transport, features: crate::input::ds5::Ds5Features },
+	Ds5Feature { slot: u8, id: u8, data: Vec<u8> },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -560,6 +568,11 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::MediaRfi { first, last } => DataMsg::MediaRfi { first, last },
 			DataMsgWire::ProbeReq { rates_kbps, train_ms } => DataMsg::ProbeReq { rates_kbps, train_ms },
 			DataMsgWire::PointerLock(on) => DataMsg::PointerLock(on),
+			DataMsgWire::Ds5Output { slot, report } => DataMsg::Ds5Output { slot, report },
+			DataMsgWire::Ds5Caps { slot, transport, features } => {
+				DataMsg::Ds5Caps { slot, transport, features }
+			}
+			DataMsgWire::Ds5Feature { slot, id, data } => DataMsg::Ds5Feature { slot, id, data },
 		}
 	}
 }
@@ -731,6 +744,24 @@ pub enum DataMsg {
 	/// spin a raw-input game's camera without end. Appended for additive wire compat (an old
 	/// client ignores it).
 	PointerLock(bool),
+	/// Host → client: the game's DualSense output state (SetStateData, the 63 bytes after
+	/// USB report id 0x02: adaptive triggers, lightbar, player/mic LEDs, rumble, audio
+	/// routing) for the pad at `slot`. Sent on change plus a 500 ms refresh, because
+	/// session datagrams can be lost and this is state. The client masks what its user
+	/// turned off (`SetState::mask`) and writes it as USB 0x02 or BT 0x31.
+	Ds5Output { slot: u8, report: Vec<u8> },
+	/// Client → host: how the DualSense at `slot` is connected and which features the
+	/// client lets through, so the host can skip work (e.g. no haptics resampling when
+	/// haptics are off). Sent when the pad appears and whenever a setting changes.
+	Ds5Caps {
+		slot: u8,
+		transport: crate::input::ds5::wire::Ds5Transport,
+		features: crate::input::ds5::Ds5Features,
+	},
+	/// Client → host: one of the physical pad's feature reports (0x05 calibration,
+	/// 0x09 pairing/MAC, 0x20 firmware), so the host's virtual pad answers a game's
+	/// GET_REPORT with the real values instead of synthesized defaults.
+	Ds5Feature { slot: u8, id: u8, data: Vec<u8> },
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1151,6 +1182,13 @@ mod tests {
 			DataMsg::MediaRfi { first: 65530, last: 4 },
 			DataMsg::ProbeReq { rates_kbps: vec![2_500, 5_000, 10_000], train_ms: 150 },
 			DataMsg::PointerLock(true),
+			DataMsg::Ds5Output { slot: 1, report: vec![0x0C, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0x21] },
+			DataMsg::Ds5Caps {
+				slot: 0,
+				transport: crate::input::ds5::wire::Ds5Transport::Bt,
+				features: crate::input::ds5::Ds5Features { speaker: false, ..Default::default() },
+			},
+			DataMsg::Ds5Feature { slot: 0, id: 0x09, data: vec![0x09, 1, 2, 3, 4, 5, 6] },
 		];
 
 		for msg in cases {

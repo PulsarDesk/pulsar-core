@@ -13,6 +13,7 @@ pub mod crc;
 pub mod haptics;
 pub mod report;
 pub mod speaker;
+pub mod wire;
 
 /// Which DualSense features the client lets through to its physical pad. The host also
 /// uses it to skip work for features the client turned off.
