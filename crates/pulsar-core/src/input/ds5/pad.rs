@@ -18,6 +18,7 @@ use super::haptics::{Frame, FRAME_BYTES};
 use super::report::{
 	parse_bt_input, BtInput, BtSeq, SetState, SET_STATE_USED, USB_INPUT_ID, USB_INPUT_LEN,
 };
+use super::rumble::HapticsRumble;
 use super::wire::Ds5Transport;
 use super::Ds5Features;
 
@@ -39,6 +40,8 @@ const FRAME: Duration = Duration::from_micros(10_667);
 const MAX_QUEUED: usize = 8;
 /// Least gap between two state writes (coalescing; games may write 0x02 at 1 kHz).
 const STATE_MIN_GAP: Duration = Duration::from_millis(4);
+/// Least gap between two rumble-fallback updates (ZerkSense5 sends rumble ≤ 1 per 10 ms).
+const FALLBACK_GAP: Duration = Duration::from_millis(10);
 
 /// What a physical pad reported.
 #[derive(Debug, PartialEq, Eq)]
@@ -91,6 +94,16 @@ pub struct Pad {
 	next_due: Option<Instant>,
 	mic_dirty: bool,
 	stats: PadStats,
+	/// Longest write since the last [`Pad::take_window_max_write_us`].
+	win_max_write_us: u64,
+	/// Haptics shed: drive the classic rumble motors from the haptics energy.
+	fallback: bool,
+	fb: HapticsRumble,
+	/// Last rumble the fallback wrote (None = the host's own rumble is in charge).
+	fb_sent: Option<(u8, u8)>,
+	fb_at: Option<Instant>,
+	/// The game's own classic rumble, from the latest host state.
+	host_rumble: (u8, u8),
 }
 
 impl Pad {
@@ -125,6 +138,12 @@ impl Pad {
 			next_due: None,
 			mic_dirty: transport == Ds5Transport::Bt,
 			stats: PadStats::default(),
+			win_max_write_us: 0,
+			fallback: false,
+			fb: HapticsRumble::default(),
+			fb_sent: None,
+			fb_at: None,
+			host_rumble: (0, 0),
 		};
 		pad.audio.mic = transport == Ds5Transport::Bt && features.mic;
 		Ok((pad, feats))
@@ -139,6 +158,20 @@ impl Pad {
 
 	pub fn stats(&self) -> PadStats {
 		self.stats
+	}
+
+	/// The longest write since the last call (per-window maximum for auto-degrade).
+	pub fn take_window_max_write_us(&mut self) -> u64 {
+		std::mem::take(&mut self.win_max_write_us)
+	}
+
+	/// Haptics were shed: play the haptics stream as classic rumble instead (BT only;
+	/// needs the `rumble` feature). Turning it off hands the motors back to the game.
+	pub fn set_rumble_fallback(&mut self, on: bool) {
+		if self.fallback != on {
+			self.fallback = on;
+			self.fb.reset();
+		}
 	}
 
 	/// Change which features reach the pad (a setting changed, or auto-degrade).
@@ -172,6 +205,11 @@ impl Pad {
 	/// The host's latest output state; written on the next [`Pad::poll`] (coalesced).
 	pub fn set_output(&mut self, mut s: SetState) {
 		s.mask(&self.features);
+		if let Some(r) = s.rumble() {
+			self.host_rumble = r;
+			// The game set the motors itself: the fallback re-merges on the next poll.
+			self.fb_sent = None;
+		}
 		self.pending_state = Some(s);
 	}
 
@@ -179,6 +217,11 @@ impl Pad {
 	pub fn push_slot(&mut self, haptics: Option<Frame>, speaker: Option<(SpeakerOut, Vec<u8>)>) {
 		if self.transport != Ds5Transport::Bt {
 			return;
+		}
+		if self.fallback && self.features.rumble && !self.features.haptics {
+			if let Some(h) = &haptics {
+				self.fb.feed(h, Instant::now());
+			}
 		}
 		let haptics = if self.features.haptics { haptics } else { None };
 		let speaker = if self.features.speaker {
@@ -215,6 +258,7 @@ impl Pad {
 	/// Do whatever is due at `now`. Returns how long the caller may sleep before the
 	/// next call (it should also wake on new input from the host).
 	pub fn poll(&mut self, now: Instant, io: &mut impl HidIo) -> Duration {
+		self.poll_fallback(now);
 		// State first: it never waits behind audio.
 		if let Some(s) = self.pending_state {
 			let ready = self
@@ -245,6 +289,42 @@ impl Pad {
 			_ => Duration::from_millis(50),
 		};
 		state_wait.min(self.poll_audio(now, io))
+	}
+
+	/// Merge the haptics-energy rumble into the next state write when it changed.
+	fn poll_fallback(&mut self, now: Instant) {
+		let active = self.fallback && self.features.rumble && !self.features.haptics;
+		if !active && self.fb_sent.is_none() {
+			return;
+		}
+		let want = if active {
+			let (h, l) = self.fb.level(now);
+			(h.max(self.host_rumble.0), l.max(self.host_rumble.1))
+		} else {
+			self.host_rumble
+		};
+		if self.fb_sent == Some(want) {
+			return;
+		}
+		if self.pending_state.is_none()
+			&& self
+				.fb_at
+				.is_some_and(|t| now.saturating_duration_since(t) < FALLBACK_GAP)
+		{
+			return;
+		}
+		let s = self.pending_state.get_or_insert_with(SetState::default);
+		if active {
+			s.set_rumble(want.0, want.1);
+			self.fb_sent = Some(want);
+		} else {
+			// Back to the game's rumble (and its HD haptics selection).
+			s.0[0] |= super::report::flag::B0_RUMBLE_EMULATION;
+			s.0[2] = want.1;
+			s.0[3] = want.0;
+			self.fb_sent = None;
+		}
+		self.fb_at = Some(now);
 	}
 
 	fn poll_audio(&mut self, now: Instant, io: &mut impl HidIo) -> Duration {
@@ -334,6 +414,7 @@ impl Pad {
 		}
 		let us = t.elapsed().as_micros() as u64;
 		self.stats.max_write_us = self.stats.max_write_us.max(us);
+		self.win_max_write_us = self.win_max_write_us.max(us);
 	}
 }
 
@@ -509,5 +590,47 @@ mod tests {
 		let r = report::neutral_usb_input();
 		assert_eq!(pad.on_input(&r), Some(PadInput::State(r)));
 		assert_eq!(pad.on_input(&[0x31; 78]), None);
+	}
+
+	#[test]
+	fn shed_haptics_fall_back_to_rumble_and_hand_back() {
+		let mut io = Mock::default();
+		let mut pad = bt_pad(&mut io);
+		let t0 = Instant::now();
+		pad.poll(t0, &mut io);
+		io.writes.clear();
+		pad.set_features(Ds5Features {
+			haptics: false,
+			speaker: false,
+			..Ds5Features::all()
+		});
+		pad.set_rumble_fallback(true);
+		let mut loud = [0u8; FRAME_BYTES];
+		for (i, b) in loud.iter_mut().enumerate() {
+			*b = if i % 2 == 0 { 120 } else { 0 };
+		}
+		pad.push_slot(Some(loud), None);
+		pad.poll(Instant::now(), &mut io);
+		let st: Vec<_> = io.writes.iter().filter(|w| w[0] == 0x31).collect();
+		assert_eq!(st.len(), 1, "one rumble state write, no audio");
+		let w = st[0];
+		assert_eq!(w[3] & 0x03, 0x03, "rumble emulation + rumble over haptics");
+		assert!(w[3 + 3] > 200, "heavy motor from the left channel");
+		assert_eq!(w[3 + 2], 0, "right channel silent");
+		assert!(io.writes.iter().all(|w| w[0] != 0x32), "haptics not sent");
+		// Restored: one write hands the motors back to the game's rumble (none).
+		pad.set_features(Ds5Features::all());
+		pad.set_rumble_fallback(false);
+		io.writes.clear();
+		pad.poll(Instant::now() + Duration::from_millis(20), &mut io);
+		let w = &io.writes[0];
+		assert_eq!(w[0], 0x31);
+		assert_eq!((w[3 + 2], w[3 + 3]), (0, 0));
+		assert_eq!(w[3] & 0x02, 0, "HD haptics selected again");
+		io.writes.clear();
+		pad.poll(Instant::now() + Duration::from_millis(40), &mut io);
+		assert!(io.writes.is_empty(), "nothing more to send");
+		assert!(pad.take_window_max_write_us() < 1_000_000);
+		assert_eq!(pad.take_window_max_write_us(), 0);
 	}
 }
