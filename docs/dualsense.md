@@ -208,6 +208,15 @@ game's own pad-speaker stream. Pulled out: back to the client output.
   (squeezed to 480 like the pad speaker stream) becomes one pad slot with the next host
   slot's haptics and the host pad-speaker PCM mixed in. Host slots without session audio
   go out alone after 4 slots (43 ms), so haptics don't stall in a silent game.
+- **Several pads:** every pad of the session with its headphones in gets the session
+  audio, each with its own host haptics/pad-speaker mix and level; the client stays
+  silent while any of them is routed, and unplugging one leaves the others routed.
+- **Volume (per pad uuid, 0-100, default 100):** a software gain on the pad's mix
+  (1 % = -40 dB … 100 % = 0 dB, 0 = mute, ramped per 10 ms block), not the pad's
+  headphone volume field: it acts on exactly what the pad plays, the same on BT and USB,
+  and does not fight the host's virtual-pad volume merged into every state report. Set
+  from the in-session menu's bars (renderer Root hub, `hpvol` lines) or Settings →
+  Kumandalar; persisted by the UI (`ui.headsetVolume`).
 - **No sound anywhere else (maintainer, 2026-11-11):** while the route is active the
   client output is silent (Pulsar has no other UI sounds), nothing plays on the pad's
   built-in speaker. Auto-degrade sheds the route **last** (speaker → mic → haptics →

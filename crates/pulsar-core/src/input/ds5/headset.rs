@@ -7,7 +7,7 @@
 //!
 //! Pure parts only (the app owns the codecs, the audio device and the pad thread):
 //! - [`JackSwitch`]: debounced jack state + the routing decision.
-//! - [`HeadsetMix`]: pairs session audio blocks with host pad slots (haptics + decoded
+//! - [`HeadsetMix`] (one per pad): pairs session audio blocks with that pad's host slots (haptics + decoded
 //!   pad-speaker PCM) into pad slots on the session audio's clock.
 //!
 //! Policy (maintainer, 2026-11-11): while the headset route is active Pulsar makes no sound
