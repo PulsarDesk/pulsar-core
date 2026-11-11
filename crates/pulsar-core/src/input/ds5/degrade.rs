@@ -50,6 +50,9 @@ pub struct Ds5Prefs {
 	pub mic: Mode,
 	pub leds: Mode,
 	pub rumble: Mode,
+	/// "Kolun kulaklık girişi": the session's audio plays through headphones plugged into
+	/// the pad instead of the client output (`super::headset`). Shed last.
+	pub headset: Mode,
 	/// Shed `Auto` features while the Bluetooth link is weak.
 	pub auto_degrade: bool,
 	/// Haptics/speaker jitter buffer on the client, in milliseconds.
@@ -69,6 +72,7 @@ impl Default for Ds5Prefs {
 			mic: Mode::Auto,
 			leds: Mode::Auto,
 			rumble: Mode::Auto,
+			headset: Mode::Auto,
 			auto_degrade: true,
 			jitter_ms: DEFAULT_JITTER_MS,
 		}
@@ -93,6 +97,7 @@ impl Ds5Prefs {
 			Shed::Speaker => self.speaker,
 			Shed::Mic => self.mic,
 			Shed::Haptics => self.haptics,
+			Shed::Headset => self.headset,
 		}
 	}
 
@@ -110,10 +115,14 @@ pub enum Shed {
 	Speaker,
 	Mic,
 	Haptics,
+	/// Session audio through the pad's headset jack. Last: the maintainer wants it kept
+	/// ahead of every other feature; shed, the session audio goes silent (it does not move
+	/// back to the client output while the headphones are in, see `super::headset`).
+	Headset,
 }
 
-/// Shedding order: the most expensive for the least loss first.
-pub const SHED_ORDER: [Shed; 3] = [Shed::Speaker, Shed::Mic, Shed::Haptics];
+/// Shedding order: the most expensive for the least loss first; the headset route last.
+pub const SHED_ORDER: [Shed; 4] = [Shed::Speaker, Shed::Mic, Shed::Haptics, Shed::Headset];
 
 impl Shed {
 	fn clear(self, f: &mut Ds5Features) {
@@ -121,14 +130,17 @@ impl Shed {
 			Shed::Speaker => f.speaker = false,
 			Shed::Mic => f.mic = false,
 			Shed::Haptics => f.haptics = false,
+			// Not a pad feature: see `Degrader::headset`.
+			Shed::Headset => {}
 		}
 	}
 
-	fn get(self, f: &Ds5Features) -> bool {
+	fn get(self, f: &Ds5Features, headset: bool) -> bool {
 		match self {
 			Shed::Speaker => f.speaker,
 			Shed::Mic => f.mic,
 			Shed::Haptics => f.haptics,
+			Shed::Headset => headset,
 		}
 	}
 }
@@ -284,6 +296,18 @@ impl Degrader {
 		f
 	}
 
+	/// What the settings and shedding allow for the headset route.
+	pub fn headset(&self, prefs: &Ds5Prefs) -> super::headset::Route {
+		use super::headset::Route;
+		if !prefs.headset.enabled() {
+			Route::Off
+		} else if self.shed.contains(&Shed::Headset) {
+			Route::Shed
+		} else {
+			Route::Allowed
+		}
+	}
+
 	/// The settings changed: forget sheds that no longer apply (the feature is no longer
 	/// `Auto`, or auto-degrade was turned off). Silent: the user made the change.
 	pub fn reconcile(&mut self, prefs: &Ds5Prefs) {
@@ -299,6 +323,17 @@ impl Degrader {
 	/// Judge one window. `live` = features actually in use on this pad (a feature that
 	/// isn't flowing, like a closed mic, is skipped: shedding it would gain nothing).
 	pub fn on_window(&mut self, w: &Window, prefs: &Ds5Prefs, live: Ds5Features) -> Option<Change> {
+		self.on_window_with_headset(w, prefs, live, false)
+	}
+
+	/// [`Degrader::on_window`] with `headset` = session audio is flowing to the pad's jack.
+	pub fn on_window_with_headset(
+		&mut self,
+		w: &Window,
+		prefs: &Ds5Prefs,
+		live: Ds5Features,
+		headset: bool,
+	) -> Option<Change> {
 		if let Some(n) = self.since_restore.as_mut() {
 			*n += 1;
 		}
@@ -314,9 +349,9 @@ impl Degrader {
 				return None;
 			}
 			self.bad = 0;
-			let next = SHED_ORDER
-				.into_iter()
-				.find(|s| prefs.mode(*s) == Mode::Auto && s.get(&live) && !self.shed.contains(s))?;
+			let next = SHED_ORDER.into_iter().find(|s| {
+				prefs.mode(*s) == Mode::Auto && s.get(&live, headset) && !self.shed.contains(s)
+			})?;
 			if self.since_restore.is_some_and(|n| n <= FLAP_WINDOWS) {
 				self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
 			}
@@ -385,6 +420,7 @@ mod tests {
 		assert_eq!(j.speaker, Mode::Off);
 		assert_eq!(j.haptics, Mode::On);
 		assert_eq!(j.mic, Mode::Auto, "missing fields default");
+		assert_eq!(j.headset, Mode::Auto);
 		assert_eq!(j.jitter_ms, DEFAULT_JITTER_MS);
 		assert!(!j.features().speaker);
 		assert_eq!(Ds5Prefs::default().jitter_slots(), (6, 24));
@@ -439,6 +475,46 @@ mod tests {
 		// Nothing left to shed.
 		d.on_window(&bad(), &p, all_live());
 		assert_eq!(d.on_window(&bad(), &p, all_live()), None);
+	}
+
+	#[test]
+	fn headset_is_shed_last_and_restored_first() {
+		use super::super::headset::Route;
+		let p = Ds5Prefs::default();
+		let mut d = Degrader::new();
+		assert_eq!(d.headset(&p), Route::Allowed);
+		let mut order = Vec::new();
+		for _ in 0..10 {
+			if let Some(c) = d.on_window_with_headset(&bad(), &p, all_live(), true) {
+				order.push(c.feature);
+			}
+		}
+		assert_eq!(order, SHED_ORDER.to_vec());
+		assert_eq!(d.headset(&p), Route::Shed);
+		assert_eq!(
+			d.features(&p),
+			Ds5Features {
+				speaker: false,
+				mic: false,
+				haptics: false,
+				..Ds5Features::all()
+			}
+		);
+		for _ in 0..GOOD_WINDOWS {
+			d.on_window_with_headset(&good(), &p, all_live(), false);
+		}
+		assert_eq!(d.headset(&p), Route::Allowed, "last shed comes back first");
+		// Not flowing: never shed. Kapalı: Off.
+		let mut d = Degrader::new();
+		for _ in 0..10 {
+			d.on_window(&bad(), &p, all_live());
+		}
+		assert_eq!(d.headset(&p), Route::Allowed);
+		let off = Ds5Prefs {
+			headset: Mode::Off,
+			..p
+		};
+		assert_eq!(d.headset(&off), Route::Off);
 	}
 
 	#[test]

@@ -116,6 +116,15 @@ const RUMBLE_RIGHT: usize = 2;
 const RUMBLE_LEFT: usize = 3;
 const AUDIO_ROUTING: usize = 7;
 const NOISE_CANCEL: u8 = 1 << 3;
+/// OutputPathSelect, bits 4-5 of the audio routing byte.
+const OUTPUT_PATH: u8 = 0x30;
+const HEADPHONE_VOLUME: usize = 4;
+const SPEAKER_VOLUME: usize = 5;
+const MUTE_BITS: usize = 9;
+const HEADPHONE_MUTE: u8 = 1 << 6;
+const AUDIO_CONTROL2: usize = 37;
+/// Headphone volume used when a game enabled the field but left it at 0 (max 0x7F).
+pub const DEFAULT_HEADPHONE_VOLUME: u8 = 0x50;
 const RIGHT_TRIGGER: std::ops::Range<usize> = 10..21;
 const LEFT_TRIGGER: std::ops::Range<usize> = 21..32;
 const PLAYER_LEDS: usize = 43;
@@ -215,6 +224,64 @@ impl SetState {
 		seq.finish(&mut r);
 		r
 	}
+
+	/// Merge the audio routing for the headset jack into this state, the way Linux
+	/// `hid-playstation` does on a plug/unplug (`dualsense_output_worker`): plugged = route
+	/// L+R to the headphones and leave the internal speaker unrouted (OutputPathSelect 0);
+	/// unplugged = headphones unrouted, the R channel to the speaker (path 3) at speaker
+	/// volume 0x64 with +6 dB preamp. NoiseCancel stays set (the [`SetState::mask`] quirk).
+	/// Other fields are left alone, so this can ride on a pending game state.
+	pub fn merge_jack_route(&mut self, headphones: bool) {
+		use flag::*;
+		let s = &mut self.0;
+		s[0] |= B0_AUDIO_CONTROL;
+		// Keep MicSelect / echo cancel / input path; replace the output path.
+		s[AUDIO_ROUTING] = (s[AUDIO_ROUTING] & !OUTPUT_PATH) | NOISE_CANCEL;
+		if !headphones {
+			s[AUDIO_ROUTING] |= 3 << 4;
+			s[0] |= B0_SPEAKER_VOLUME;
+			s[SPEAKER_VOLUME] = 0x64;
+			s[1] |= B1_AUDIO_CONTROL2;
+			s[AUDIO_CONTROL2] = (s[AUDIO_CONTROL2] & !0x07) | 0x02;
+		}
+	}
+
+	/// While Pulsar plays the session's audio through the headphones: never let the host's
+	/// mute (its virtual pad's speaker mute also sets HeadphoneMute, `ds5::audio::Volume`)
+	/// silence the jack, and give the headphones a volume when the game set none.
+	pub fn unmute_headphones(&mut self) {
+		use flag::*;
+		let s = &mut self.0;
+		if s[1] & B1_AUDIO_MUTE != 0 {
+			s[MUTE_BITS] &= !HEADPHONE_MUTE;
+		}
+		if s[0] & B0_HEADPHONE_VOLUME != 0 && s[HEADPHONE_VOLUME] == 0 {
+			s[HEADPHONE_VOLUME] = DEFAULT_HEADPHONE_VOLUME;
+		}
+	}
+}
+
+/// Headset jack state from the pad's input report (USB 0x01 layout; a BT 0x31 report is
+/// converted to it by [`parse_bt_input`]). Input state byte 53 (`status[1]` in
+/// `hid-playstation`): bit 0 headphones (`DS_STATUS1_HP_DETECT`), bit 1 headset mic
+/// (`DS_STATUS1_MIC_DETECT`). A headset with a mic sets both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Jack {
+	pub headphones: bool,
+	pub mic: bool,
+}
+
+/// USB input offset of the jack status byte (state offset 53 + the report id).
+pub const JACK_STATUS: usize = 1 + 53;
+
+impl Jack {
+	pub fn from_usb_input(r: &[u8; USB_INPUT_LEN]) -> Self {
+		let b = r[JACK_STATUS];
+		Self {
+			headphones: b & 0x01 != 0,
+			mic: b & 0x02 != 0,
+		}
+	}
 }
 
 #[cfg(test)]
@@ -298,6 +365,66 @@ mod tests {
 		assert!(s.0[2..].iter().all(|&b| b == 0));
 		assert_eq!(s.usb_report()[..3], short);
 		assert_eq!(SetState::from_usb_output(&[0x05, 1]), None);
+	}
+
+	#[test]
+	fn jack_bits_from_usb_and_bt_input() {
+		let mut st = [0u8; STATE_LEN];
+		st[53] = 0x01;
+		let BtInput::State(u) = parse_bt_input(&bt_input(&st, 0), true).unwrap() else {
+			panic!("state")
+		};
+		assert_eq!(
+			Jack::from_usb_input(&u),
+			Jack {
+				headphones: true,
+				mic: false
+			}
+		);
+		let mut r = neutral_usb_input();
+		assert_eq!(Jack::from_usb_input(&r), Jack::default());
+		r[JACK_STATUS] = 0x03 | 0x04; // headset with mic, mic muted bit ignored
+		assert_eq!(
+			Jack::from_usb_input(&r),
+			Jack {
+				headphones: true,
+				mic: true
+			}
+		);
+	}
+
+	#[test]
+	fn jack_route_matches_hid_playstation() {
+		let mut s = SetState::default();
+		s.0[0] = flag::B0_RIGHT_TRIGGER;
+		s.0[7] = 0x01 | 0x30; // internal mic selected, speaker path
+		s.merge_jack_route(true);
+		assert_eq!(s.0[0], flag::B0_RIGHT_TRIGGER | flag::B0_AUDIO_CONTROL);
+		assert_eq!(s.0[7], 0x01 | NOISE_CANCEL, "path 0 = L/R to headphones");
+		assert_eq!(s.0[5], 0, "speaker volume untouched");
+		let mut s = SetState::default();
+		s.merge_jack_route(false);
+		assert_eq!(s.0[7], NOISE_CANCEL | 0x30, "path 3 = R to speaker");
+		assert_eq!(s.0[0], flag::B0_AUDIO_CONTROL | flag::B0_SPEAKER_VOLUME);
+		assert_eq!(
+			(s.0[5], s.0[1], s.0[37]),
+			(0x64, flag::B1_AUDIO_CONTROL2, 0x02)
+		);
+	}
+
+	#[test]
+	fn headphones_stay_unmuted_while_routed() {
+		let mut s = SetState::default();
+		s.0[0] = flag::B0_HEADPHONE_VOLUME;
+		s.0[1] = flag::B1_AUDIO_MUTE;
+		s.0[9] = 0x70; // mic + speaker + headphone mute
+		s.unmute_headphones();
+		assert_eq!(s.0[9], 0x30, "only the headphone mute cleared");
+		assert_eq!(s.0[4], DEFAULT_HEADPHONE_VOLUME);
+		let mut quiet = SetState::default();
+		quiet.0[9] = 0x40;
+		quiet.unmute_headphones();
+		assert_eq!(quiet.0[9], 0x40, "mute byte not enabled: left alone");
 	}
 
 	#[test]

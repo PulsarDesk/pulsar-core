@@ -15,6 +15,7 @@ pub mod degrade;
 pub mod device;
 pub mod duo;
 pub mod haptics;
+pub mod headset;
 pub mod mic;
 pub mod pad;
 pub mod report;
