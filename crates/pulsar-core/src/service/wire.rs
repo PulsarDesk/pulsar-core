@@ -534,6 +534,7 @@ enum DataMsgWire {
 	Ds5Output { slot: u8, report: Vec<u8> },
 	Ds5Caps { slot: u8, transport: crate::input::ds5::wire::Ds5Transport, features: crate::input::ds5::Ds5Features },
 	Ds5Feature { slot: u8, id: u8, data: Vec<u8> },
+	Ds5Mic { slot: u8, on: bool },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -573,6 +574,7 @@ impl From<DataMsgWire> for DataMsg {
 				DataMsg::Ds5Caps { slot, transport, features }
 			}
 			DataMsgWire::Ds5Feature { slot, id, data } => DataMsg::Ds5Feature { slot, id, data },
+			DataMsgWire::Ds5Mic { slot, on } => DataMsg::Ds5Mic { slot, on },
 		}
 	}
 }
@@ -762,6 +764,15 @@ pub enum DataMsg {
 	/// 0x09 pairing/MAC, 0x20 firmware), so the host's virtual pad answers a game's
 	/// GET_REPORT with the real values instead of synthesized defaults.
 	Ds5Feature { slot: u8, id: u8, data: Vec<u8> },
+	/// Host → client: a game opened (`on = true`) or closed the virtual DualSense's mic at
+	/// `slot`. While it is on, the client streams the pad's mic as `TAG_DS5`
+	/// [`Ds5Media::Mic`](crate::input::ds5::wire::Ds5Media::Mic) datagrams (a BT pad only
+	/// sends mic packets while asked to, and that costs input rate). The host repeats `on`
+	/// every [`MIC_REFRESH`](crate::input::ds5::mic::MIC_REFRESH) because datagrams can
+	/// drop; a client that hears nothing for
+	/// [`MIC_TIMEOUT`](crate::input::ds5::mic::MIC_TIMEOUT) turns the mic off. Appended for
+	/// additive wire compat (sent only to clients that sent `Ds5Caps`).
+	Ds5Mic { slot: u8, on: bool },
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1189,6 +1200,8 @@ mod tests {
 				features: crate::input::ds5::Ds5Features { speaker: false, ..Default::default() },
 			},
 			DataMsg::Ds5Feature { slot: 0, id: 0x09, data: vec![0x09, 1, 2, 3, 4, 5, 6] },
+			DataMsg::Ds5Mic { slot: 2, on: true },
+			DataMsg::Ds5Mic { slot: 0, on: false },
 		];
 
 		for msg in cases {

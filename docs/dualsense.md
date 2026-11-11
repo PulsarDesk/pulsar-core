@@ -3,10 +3,11 @@
 Status (2026-11-11, branch `feat/dualsense`, local only): **implemented and verified in a
 real session** — Windows host (x64, usbip-win2) ⇄ Windows ARM64 client with a Bluetooth
 DualSense: adaptive triggers, lightbar, HD haptics and the pad speaker work; local bridge mode
-(`pulsar --ds5-bridge`) verified too. Not done: pad mic (needs a host→client mic-open
-message), USB-pad audio on the client, settings UI + auto-degrade, installer bundling,
-Duo backend (HID only, written, untested on hardware). Linux host: virtual pad attach +
-haptics verified on an Orange Pi (no game yet). Untested: Linux client (BT pad), macOS.
+(`pulsar --ds5-bridge`) verified too. Linux host: virtual pad attach + haptics verified on an
+Orange Pi (no game yet). Implemented but not yet tested on hardware: pad mic (both ways),
+USB-pad audio on the client, settings UI + auto-degrade (haptics → rumble fallback), installer
+bundling of usbip-win2 (desktop repo), Duo backend (HID only), Linux client (BT pad). Untested:
+macOS.
 Protocol reference: see "Protocol notes" below and the sources it lists.
 
 ## Goal
@@ -155,7 +156,22 @@ no haptics/speaker/mic (Duo's device has no audio), so only `Ds5Output` goes to 
   resamples 48 kHz → 3 kHz once (a low-pass FIR, ported from ZerkSense5 `AudioHaptics`).
 - Speaker: reuse the Opus/RTP path with a second SSRC per slot (the "pad speaker" stream),
   mono or stereo as the game sends it.
-- Mic: client → host Opus/RTP (PT 97, pad-mic SSRC) → decoded into the virtual mic iso IN.
+- Mic (implemented, untested on hardware): the host sends `DataMsg::Ds5Mic { slot, on }`
+  when a game opens/closes the virtual mic and the client's `Ds5Caps` allow it, refreshed
+  every 1 s while on (`input/ds5/mic.rs` `MicAnnouncer`); the client treats 3 s of silence
+  as off (`MicGate`). While on, a BT pad streams its own Opus mic packets, a USB pad's mic
+  endpoint is captured and encoded (10 ms mono 48 kHz, 32 kbit/s); both go client → host
+  as `TAG_DS5` `Ds5Media::Mic` session payloads (`DataHandlers::on_ds5_media` on the
+  host), are decoded there and fed to the virtual mic behind a 40 ms prebuffer
+  (`VirtualDs5::set_mic_prebuffer`).
+- USB pad on the client (implemented, untested on hardware): host slots play on the pad's
+  own 4-channel audio device through SDL3 (`input/ds5/usb_audio.rs`: haptics 3 → 48 kHz
+  on ch 3/4, speaker Opus decoded and stretched 480 → 512 on ch 1/2, 64 ms prebuffer,
+  256 ms cap). The endpoint is matched to the HID device by identity, never by name:
+  Windows = CfgMgr `DEVPKEY_Device_ContainerId` of the HID devnode vs the MMDevice endpoint
+  devnodes, then the SDL device with that endpoint's exact friendly name; Linux = sysfs
+  (hidraw → USB device → `sound/cardK`), accepted only while that is the only DualSense
+  card; macOS = only with exactly one USB DualSense. Desktop `ds5/endpoint.rs`.
 - `DataMsg::Ds5Caps { slot, transport: Bt|Usb, features: u32 }`: client → host, so the
   host can skip work the client turned off (for example no haptics resampling when
   haptics are off).

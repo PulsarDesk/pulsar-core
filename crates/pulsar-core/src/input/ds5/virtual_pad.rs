@@ -147,6 +147,12 @@ impl VirtualDs5 {
 		self.device.push_mic(pcm48_stereo_s16);
 	}
 
+	/// Jitter buffer for [`Self::push_mic`]: iso IN waits until `ms` is queued (and again
+	/// after the queue ran dry). For a mic that comes over the network; default 0.
+	pub fn set_mic_prebuffer(&self, ms: u32) {
+		self.device.set_mic_prebuffer(ms);
+	}
+
 	/// The server's TCP port on 127.0.0.1.
 	pub fn port(&self) -> u16 {
 		self.server.port()
