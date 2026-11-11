@@ -1,5 +1,5 @@
 //! The host-side virtual wired DualSense: a USB/IP server exporting [`Ds5Device`],
-//! attached to the local USB stack with the `usbip` CLI.
+//! attached to the local USB stack (usbip CLI on Windows, vhci-hcd sysfs on Linux).
 //!
 //! Ported from ZerkSense5 (MIT, florinp93), `Core/BridgeService.cs` (`PlugIn` /
 //! `Unplug`) and `Core/VirtualDualSense.cs`. Design: `docs/dualsense.md`.
@@ -30,12 +30,13 @@ pub struct VirtualDs5Config {
 	/// (most significant octet first). Keep it stable per client and locally
 	/// administered (see [`local_mac`]): `hid-playstation` rejects duplicate MACs.
 	pub mac: [u8; 6],
-	/// The usbip tool; `None` searches the default locations.
+	/// The usbip tool; `None` searches the default locations (Windows) or uses vhci-hcd's
+	/// sysfs files directly (Linux, no CLI needed).
 	pub usbip_exe: Option<PathBuf>,
 	/// Haptics gain before quantising to s8 (ZerkSense allows 1.0..=2.0).
 	pub haptics_gain: f32,
-	/// Run `usbip attach` (needs admin / root). Off = server only, for tests or when an
-	/// outside helper attaches.
+	/// Plug the device in (Windows: admin; Linux: root or the `pulsar-vhci` group).
+	/// Off = server only, for tests or when an outside helper attaches.
 	pub attach: bool,
 }
 
@@ -100,10 +101,10 @@ pub struct VirtualDs5 {
 }
 
 impl VirtualDs5 {
-	/// Start the server and, if `cfg.attach`, plug the device in with `usbip attach`.
+	/// Start the server and, if `cfg.attach`, plug the device in (see [`attach::method`]).
 	pub fn start(cfg: VirtualDs5Config) -> io::Result<(Self, Receiver<Ds5HostEvent>)> {
-		let exe = if cfg.attach {
-			Some(attach::locate(cfg.usbip_exe.as_deref())?)
+		let method = if cfg.attach {
+			Some(attach::method(cfg.usbip_exe.as_deref())?)
 		} else {
 			None
 		};
@@ -118,8 +119,8 @@ impl VirtualDs5 {
 			epoch: Instant::now(),
 		};
 		pad.set_input(&idle_input());
-		if let Some(exe) = exe {
-			pad.attachment = Some(attach::attach(&exe, pad.server.port())?);
+		if let Some(method) = method {
+			pad.attachment = Some(attach::attach_with(&method, pad.server.port())?);
 			tracing::info!(
 				"ds5: virtual wired DualSense plugged in (port {})",
 				pad.port()

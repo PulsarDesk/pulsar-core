@@ -18,6 +18,7 @@ pub mod pad;
 pub mod report;
 pub mod speaker;
 pub mod usbip;
+pub mod vhci;
 pub mod virtual_pad;
 pub mod wire;
 
