@@ -4,10 +4,11 @@
 //!
 //! - **Windows:** usbip-win2 (`usbip.exe`, looked up as `%ProgramFiles%\USBip\usbip.exe`,
 //!   then on `PATH`). Needs an elevated process.
-//! - **Linux:** the kernel's `usbip` tool with the `vhci-hcd` module loaded
-//!   (`modprobe vhci-hcd`); needs root (or `CAP_SYS_ADMIN` via a privileged helper).
+//! - **Linux:** by default no CLI at all: [`super::vhci`] writes vhci-hcd's sysfs
+//!   `attach`/`detach` files directly (root, or the `pulsar-vhci` group via Pulsar's udev
+//!   rule). An explicit `usbip` path still uses the CLI (e.g. a wrapper the admin set up).
 //!
-//! `usbip [--tcp-port N] attach -r 127.0.0.1 -b 1-1`, then `usbip detach -p <port>`.
+//! CLI: `usbip [--tcp-port N] attach -r 127.0.0.1 -b 1-1`, then `usbip detach -p <port>`.
 //! `--tcp-port` is omitted for the standard port 3240.
 
 use std::io;
@@ -162,10 +163,33 @@ pub fn stop_attach_attempts(exe: &Path, tcp_port: u16) {
 	}
 }
 
-/// A live `usbip attach`; [`Attachment::detach`] (or drop) unplugs it.
+/// How the device gets plugged in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Method {
+	/// The `usbip` CLI at this path.
+	Cli(PathBuf),
+	/// Linux: vhci-hcd's sysfs files, in-process ([`super::vhci`]).
+	Sysfs,
+}
+
+/// Pick the attach method: `explicit` CLI if given; on Linux the sysfs path; elsewhere the
+/// located `usbip` tool. The error says what is missing (tool, module or permission).
+pub fn method(explicit: Option<&Path>) -> io::Result<Method> {
+	if explicit.is_some() || !cfg!(target_os = "linux") {
+		return locate(explicit).map(Method::Cli);
+	}
+	super::vhci::check().map(|()| Method::Sysfs)
+}
+
+/// Whether this machine can plug a virtual pad in right now (see [`method`]).
+pub fn available() -> bool {
+	method(None).is_ok()
+}
+
+/// A live attach; [`Attachment::detach`] (or drop) unplugs it.
 #[derive(Debug)]
 pub struct Attachment {
-	exe: PathBuf,
+	method: Method,
 	tcp_port: u16,
 	vhci_port: Option<u32>,
 }
@@ -176,18 +200,22 @@ impl Attachment {
 		self.vhci_port
 	}
 
-	/// The usbip tool this attachment uses.
-	pub fn exe(&self) -> &Path {
-		&self.exe
+	/// How this attachment was made.
+	pub fn method(&self) -> &Method {
+		&self.method
 	}
 
-	/// `usbip detach -p <port>`. Returns whether the tool reported success. Safe to call
-	/// more than once (later calls do nothing).
+	/// `usbip detach -p <port>` (or the sysfs `detach` write). Returns whether it
+	/// succeeded. Safe to call more than once (later calls do nothing).
 	pub fn detach(&mut self) -> bool {
 		let Some(p) = self.vhci_port.take() else {
 			return false;
 		};
-		match run(&self.exe, &["detach".into(), "-p".into(), p.to_string()]) {
+		let exe = match &self.method {
+			Method::Cli(exe) => exe,
+			Method::Sysfs => return sysfs_detach(p),
+		};
+		match run(exe, &["detach".into(), "-p".into(), p.to_string()]) {
 			Ok(o) if o.status.success() => {
 				trace!("usbip: detached port {p}: {}", text(&o).trim());
 				true
@@ -205,7 +233,9 @@ impl Attachment {
 
 	/// See [`stop_attach_attempts`].
 	pub fn stop_reattach(&self) {
-		stop_attach_attempts(&self.exe, self.tcp_port);
+		if let Method::Cli(exe) = &self.method {
+			stop_attach_attempts(exe, self.tcp_port);
+		}
 	}
 
 	fn do_detach(&mut self) {
@@ -219,6 +249,37 @@ impl Attachment {
 impl Drop for Attachment {
 	fn drop(&mut self) {
 		self.do_detach();
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn sysfs_detach(port: u32) -> bool {
+	match super::vhci::detach(port) {
+		Ok(()) => true,
+		Err(e) => {
+			trace!("vhci: detach {port}: {e}");
+			false
+		}
+	}
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sysfs_detach(_port: u32) -> bool {
+	false
+}
+
+/// Plug our server on 127.0.0.1:`tcp_port` in with `method`.
+pub fn attach_with(method: &Method, tcp_port: u16) -> io::Result<Attachment> {
+	match method {
+		Method::Cli(exe) => attach(exe, tcp_port),
+		#[cfg(target_os = "linux")]
+		Method::Sysfs => Ok(Attachment {
+			method: Method::Sysfs,
+			tcp_port,
+			vhci_port: Some(super::vhci::attach(tcp_port, BUS_ID)?),
+		}),
+		#[cfg(not(target_os = "linux"))]
+		Method::Sysfs => super::vhci::check().map(|()| unreachable!()),
 	}
 }
 
@@ -255,7 +316,7 @@ pub fn attach(exe: &Path, tcp_port: u16) -> io::Result<Attachment> {
 		);
 	}
 	Ok(Attachment {
-		exe: exe.to_path_buf(),
+		method: Method::Cli(exe.to_path_buf()),
 		tcp_port,
 		vhci_port,
 	})

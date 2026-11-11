@@ -1,7 +1,8 @@
 //! Plug in a virtual wired DualSense over USB/IP, feed it idle input, and print what the
 //! OS / game sends back (output reports, haptics, speaker, stream and volume changes).
 //!
-//! Needs usbip-win2 (Windows) or usbip + vhci-hcd (Linux), and an elevated / root shell:
+//! Needs usbip-win2 and an elevated shell (Windows), or vhci-hcd loaded (Linux:
+//! `sudo modprobe vhci-hcd`) and root or the `pulsar-vhci` group (no usbip CLI needed):
 //!
 //! ```text
 //! cargo run -p pulsar-core --example ds5_virtual -- [seconds=60] [port=0]
@@ -9,7 +10,8 @@
 //!
 //! Then open "Set up USB game controllers" (joy.cpl), the Windows sound settings, or a
 //! game. The device is detached when the run ends; press Ctrl+C only as a last resort
-//! (it skips the detach: then run `usbip detach -p <port>` by hand).
+//! (it skips the detach: then run `usbip detach -p <port>` by hand, or on Linux
+//! `echo <port> | sudo tee /sys/devices/platform/vhci_hcd.0/detach`).
 //!
 //! Everything goes to stderr with timestamps. The wire trace (`PULSAR_DS5_TRACE`) is on
 //! by default here: every control request and its answer, SET_INTERFACE, unlinks, the
