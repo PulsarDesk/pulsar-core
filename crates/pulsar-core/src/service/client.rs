@@ -232,3 +232,45 @@ pub fn decode_data(bytes: &[u8]) -> Option<DataMsg> {
 		_ => None,
 	}
 }
+
+/// How long [`request_pair`] waits for the host's answer: the host may show its user a
+/// pairing popup (which auto-denies itself after 30 s), plus slack for a lossy link.
+pub const PAIR_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Client: send a pairing message (`PairRequest` / `Unpair`) on an accepted session and wait
+/// for the host's [`DataMsg::PairResult`] — `Some((paired, reason))`, or `None` when no answer
+/// came within `give_up` (an old host ignores the request). The request is one datagram, so it
+/// is repeated every 2 s (the host keeps one decision per session and re-sends it); a `Ping`
+/// rides along so the host's serve loop doesn't time this idle session out while its user
+/// decides.
+pub async fn pair_exchange(
+	session: &mut Session,
+	msg: DataMsg,
+	give_up: std::time::Duration,
+) -> Result<Option<(bool, String)>, ConnError> {
+	const RESEND: std::time::Duration = std::time::Duration::from_secs(2);
+	let start = std::time::Instant::now();
+	loop {
+		session.send(&enc(&Msg::Data(msg.clone()))).await?;
+		session.send(&enc(&Msg::Ping)).await?;
+		let next = std::time::Instant::now() + RESEND;
+		loop {
+			let left = next.saturating_duration_since(std::time::Instant::now());
+			if left.is_zero() {
+				break;
+			}
+			match tokio::time::timeout(left, session.recv()).await {
+				Ok(Some(bytes)) => {
+					if let Some(Msg::Data(DataMsg::PairResult { paired, reason })) = dec(&bytes) {
+						return Ok(Some((paired, reason)));
+					}
+				}
+				Ok(None) => return Ok(None),
+				Err(_) => break,
+			}
+		}
+		if start.elapsed() >= give_up {
+			return Ok(None);
+		}
+	}
+}

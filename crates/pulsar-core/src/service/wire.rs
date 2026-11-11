@@ -535,6 +535,16 @@ enum DataMsgWire {
 	Ds5Caps { slot: u8, transport: crate::input::ds5::wire::Ds5Transport, features: crate::input::ds5::Ds5Features },
 	Ds5Feature { slot: u8, id: u8, data: Vec<u8> },
 	Ds5Mic { slot: u8, on: bool },
+	PairRequest {
+		#[serde(default)]
+		name: String,
+	},
+	Unpair,
+	PairResult {
+		paired: bool,
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -575,6 +585,9 @@ impl From<DataMsgWire> for DataMsg {
 			}
 			DataMsgWire::Ds5Feature { slot, id, data } => DataMsg::Ds5Feature { slot, id, data },
 			DataMsgWire::Ds5Mic { slot, on } => DataMsg::Ds5Mic { slot, on },
+			DataMsgWire::PairRequest { name } => DataMsg::PairRequest { name },
+			DataMsgWire::Unpair => DataMsg::Unpair,
+			DataMsgWire::PairResult { paired, reason } => DataMsg::PairResult { paired, reason },
 		}
 	}
 }
@@ -773,6 +786,30 @@ pub enum DataMsg {
 	/// [`MIC_TIMEOUT`](crate::input::ds5::mic::MIC_TIMEOUT) turns the mic off. Appended for
 	/// additive wire compat (sent only to clients that sent `Ds5Caps`).
 	Ds5Mic { slot: u8, on: bool },
+	/// Client → host: pair this client — the host trusts the client's STATIC X25519 public key
+	/// (`Session::peer_pubkey`, the same no-MITM-safe identity as same-device pre-auth), so a
+	/// later connection from that key skips the password and the Allow/Deny popup (the host's
+	/// 2FA still applies). Sent only on an ACCEPTED session. The host authorizes it once: a
+	/// session that proved a password / one-time password pairs at once; any other (approved on
+	/// the popup, pre-authorized, unattended) gets a pairing-specific Allow/Deny popup first.
+	/// `name` labels the host's paired-devices list. Repeating it is safe (one decision per
+	/// session; a repeat re-sends it). Answered with [`DataMsg::PairResult`]. Appended for
+	/// additive wire compat: an old host ignores it, so the client times out ("unsupported").
+	PairRequest {
+		#[serde(default)]
+		name: String,
+	},
+	/// Client → host: forget this client's pairing (only the key of THIS session). Answered with
+	/// `PairResult { paired: false }`. An old host ignores it.
+	Unpair,
+	/// Host → client: the pairing state after a `PairRequest` / `Unpair`. `paired` = the host now
+	/// trusts this client's key. `reason` is a short token when a request was refused
+	/// (`"denied"` on the popup, `"timeout"`, `"unsupported"`); empty otherwise.
+	PairResult {
+		paired: bool,
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1202,6 +1239,10 @@ mod tests {
 			DataMsg::Ds5Feature { slot: 0, id: 0x09, data: vec![0x09, 1, 2, 3, 4, 5, 6] },
 			DataMsg::Ds5Mic { slot: 2, on: true },
 			DataMsg::Ds5Mic { slot: 0, on: false },
+			DataMsg::PairRequest { name: "Salon PC'si".into() },
+			DataMsg::Unpair,
+			DataMsg::PairResult { paired: true, reason: String::new() },
+			DataMsg::PairResult { paired: false, reason: "denied".into() },
 		];
 
 		for msg in cases {
@@ -1217,6 +1258,17 @@ mod tests {
 				"DataMsg::{msg:?} roundtrip mismatch (From<DataMsgWire> bug?)"
 			);
 		}
+	}
+
+	/// Pairing messages tolerate missing optional fields (a minimal / future peer).
+	#[test]
+	fn pair_messages_missing_fields_default() {
+		let m: DataMsg = serde_json::from_str(r#"{"PairRequest":{}}"#).unwrap();
+		assert_eq!(m, DataMsg::PairRequest { name: String::new() });
+		let m: DataMsg = serde_json::from_str(r#"{"PairResult":{"paired":true}}"#).unwrap();
+		assert_eq!(m, DataMsg::PairResult { paired: true, reason: String::new() });
+		let m: DataMsg = serde_json::from_str(r#""Unpair""#).unwrap();
+		assert_eq!(m, DataMsg::Unpair);
 	}
 
 	/// Locks the additive wire contract for the new `target` field in `GamepadSlot`:

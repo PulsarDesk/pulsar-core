@@ -27,9 +27,9 @@ pub use auth::{
 	TotpReply,
 };
 pub use client::{
-	decode_data, decode_windows, is_bye, is_pong, query_stream_caps, query_windows, request_games,
+	decode_data, decode_windows, is_bye, is_pong, pair_exchange, query_stream_caps, query_windows, request_games,
 	request_launch, request_stream, run_probe, send_bye, send_bye_via, send_data, send_data_via, send_input,
-	send_input_via, send_keepalive, send_query_windows,
+	send_input_via, send_keepalive, send_query_windows, PAIR_WAIT,
 };
 pub use host::{serve, serve_with, DataHandlers};
 pub use pake::{norm_otp, Credential};
