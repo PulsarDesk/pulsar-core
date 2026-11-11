@@ -121,7 +121,7 @@ pub fn check() -> io::Result<()> {
 		return Err(io::Error::new(
 			io::ErrorKind::NotFound,
 			"vhci-hcd is not loaded (sudo modprobe vhci-hcd; Pulsar's package loads it at boot \
-			 via /etc/modules-load.d/pulsar.conf)",
+			 via /usr/lib/modules-load.d/pulsar.conf)",
 		));
 	}
 	for f in ["attach", "detach"] {
