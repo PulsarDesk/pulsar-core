@@ -8,12 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod attach;
 pub mod bt_audio;
 pub mod crc;
+pub mod device;
 pub mod haptics;
 pub mod pad;
 pub mod report;
 pub mod speaker;
+pub mod usbip;
+pub mod virtual_pad;
 pub mod wire;
 
 /// Which DualSense features the client lets through to its physical pad. The host also
