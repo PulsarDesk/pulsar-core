@@ -154,9 +154,14 @@ pub const MAX_BACKOFF: u32 = 8;
 const FLAP_WINDOWS: u32 = 30;
 
 /// Thresholds for a bad window. The real session measured max BT writes of ~13 ms with
-/// the mic streaming; input arrives every 4 ms on a healthy link.
+/// the mic streaming. Input nominally arrives every 4 ms, but a healthy Windows BT link
+/// with audio streaming runs at ~140 Hz with single gaps of 60-75 ms (2026-11-11 session:
+/// a 60 ms limit shed speaker and haptics within 10 s on a good link), so only a gap
+/// long enough to be felt counts.
 pub const BAD_WRITE_US: u64 = 25_000;
-pub const BAD_INPUT_GAP: Duration = Duration::from_millis(60);
+pub const BAD_INPUT_GAP: Duration = Duration::from_millis(150);
+/// Windows ignored at the start of a pad's session (connection setup stalls the link).
+pub const WARMUP_WINDOWS: u32 = 3;
 pub const BAD_OVERFLOWS: u64 = 3;
 /// Underruns mostly mean the network stream was late, not the pad link; only a lot of
 /// them counts.
@@ -399,7 +404,9 @@ mod tests {
 		assert!(!w(|x| x.underruns = 2));
 		assert!(w(|x| x.max_write_us = 30_000));
 		assert!(!w(|x| x.max_write_us = 13_000));
-		assert!(w(|x| x.input_gap_max = Duration::from_millis(80)));
+		// A healthy Windows BT link with audio shows single 60-75 ms gaps.
+		assert!(!w(|x| x.input_gap_max = Duration::from_millis(75)));
+		assert!(w(|x| x.input_gap_max = Duration::from_millis(200)));
 	}
 
 	#[test]
