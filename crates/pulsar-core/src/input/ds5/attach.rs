@@ -115,10 +115,58 @@ pub fn parse_port_list(out: &str, tcp_port: u16) -> Option<u32> {
 	None
 }
 
+/// Every `Port NN:` in `usbip port` output (both usbip-win2 and Linux print that).
+pub fn parse_imported_ports(out: &str) -> Vec<u32> {
+	out.lines()
+		.filter_map(|l| l.trim_start().strip_prefix("Port "))
+		.filter_map(|rest| rest.split(':').next()?.trim().parse().ok())
+		.collect()
+}
+
+/// The vhci ports currently imported, from `usbip port`.
+pub fn imported_ports(exe: &Path) -> io::Result<Vec<u32>> {
+	let o = run(exe, &["port".into()])?;
+	Ok(parse_imported_ports(&text(&o)))
+}
+
+fn global_args(tcp_port: u16) -> Vec<String> {
+	if tcp_port == STANDARD_PORT {
+		vec![]
+	} else {
+		vec!["--tcp-port".into(), tcp_port.to_string()]
+	}
+}
+
+/// Cancel usbip-win2's automatic re-attach attempts to our server
+/// (`usbip --tcp-port N attach -r 127.0.0.1 -b 1-1 --stop`).
+///
+/// usbip-win2 re-attaches on ANY network error after a successful attach (the
+/// maintainer, issue #175): a server-side socket close starts attempts after 30 s,
+/// backing off to 8 min, 20 times (~2 h). Only `attach --stop` or `detach -p` while the
+/// device is still plugged prevent them. Linux usbip has no such attempts; there the
+/// command fails harmlessly.
+pub fn stop_attach_attempts(exe: &Path, tcp_port: u16) {
+	if !cfg!(windows) {
+		return;
+	}
+	let mut args = global_args(tcp_port);
+	args.extend(["attach", "-r", "127.0.0.1", "-b", BUS_ID, "--stop"].map(String::from));
+	match run(exe, &args) {
+		Ok(o) => trace!(
+			"usbip {} -> {}: {}",
+			args.join(" "),
+			o.status,
+			text(&o).trim()
+		),
+		Err(e) => trace!("usbip {}: {e}", args.join(" ")),
+	}
+}
+
 /// A live `usbip attach`; [`Attachment::detach`] (or drop) unplugs it.
 #[derive(Debug)]
 pub struct Attachment {
 	exe: PathBuf,
+	tcp_port: u16,
 	vhci_port: Option<u32>,
 }
 
@@ -128,18 +176,42 @@ impl Attachment {
 		self.vhci_port
 	}
 
-	pub fn detach(mut self) {
-		self.do_detach();
+	/// The usbip tool this attachment uses.
+	pub fn exe(&self) -> &Path {
+		&self.exe
+	}
+
+	/// `usbip detach -p <port>`. Returns whether the tool reported success. Safe to call
+	/// more than once (later calls do nothing).
+	pub fn detach(&mut self) -> bool {
+		let Some(p) = self.vhci_port.take() else {
+			return false;
+		};
+		match run(&self.exe, &["detach".into(), "-p".into(), p.to_string()]) {
+			Ok(o) if o.status.success() => {
+				trace!("usbip: detached port {p}: {}", text(&o).trim());
+				true
+			}
+			Ok(o) => {
+				trace!("usbip detach -p {p} failed: {}", text(&o).trim());
+				false
+			}
+			Err(e) => {
+				trace!("usbip detach -p {p}: {e}");
+				false
+			}
+		}
+	}
+
+	/// See [`stop_attach_attempts`].
+	pub fn stop_reattach(&self) {
+		stop_attach_attempts(&self.exe, self.tcp_port);
 	}
 
 	fn do_detach(&mut self) {
-		let Some(p) = self.vhci_port.take() else {
-			return;
-		};
-		match run(&self.exe, &["detach".into(), "-p".into(), p.to_string()]) {
-			Ok(o) if o.status.success() => trace!("usbip: detached port {p}"),
-			Ok(o) => trace!("usbip detach -p {p} failed: {}", text(&o).trim()),
-			Err(e) => trace!("usbip detach -p {p}: {e}"),
+		if self.vhci_port.is_some() {
+			self.detach();
+			self.stop_reattach();
 		}
 	}
 }
@@ -152,10 +224,7 @@ impl Drop for Attachment {
 
 /// Run `usbip attach` against our server on 127.0.0.1:`tcp_port`.
 pub fn attach(exe: &Path, tcp_port: u16) -> io::Result<Attachment> {
-	let mut args = Vec::new();
-	if tcp_port != STANDARD_PORT {
-		args.extend(["--tcp-port".to_string(), tcp_port.to_string()]);
-	}
+	let mut args = global_args(tcp_port);
 	args.extend(["attach", "-r", "127.0.0.1", "-b", BUS_ID].map(String::from));
 	let o = run(exe, &args)?;
 	trace!(
@@ -187,6 +256,7 @@ pub fn attach(exe: &Path, tcp_port: u16) -> io::Result<Attachment> {
 	}
 	Ok(Attachment {
 		exe: exe.to_path_buf(),
+		tcp_port,
 		vhci_port,
 	})
 }
@@ -217,6 +287,26 @@ mod tests {
 		assert_eq!(parse_port_list(out, 50123), Some(1));
 		assert_eq!(parse_port_list(out, 3240), Some(0));
 		assert_eq!(parse_port_list(out, 4000), None);
+		assert_eq!(parse_imported_ports(out), vec![0, 1]);
+	}
+
+	#[test]
+	fn parses_windows_port_list() {
+		let out = "Imported USB devices
+====================
+			Port 01: device in use at Full Speed(12Mbps)
+			         Sony Corp. : DualSense wireless controller (PS5) (054c:0ce6)
+			           -> usbip://127.0.0.1:50123/1-1
+			           -> remote bus/dev: 001/001
+";
+		assert_eq!(parse_imported_ports(out), vec![1]);
+		assert_eq!(parse_port_list(out, 50123), Some(1));
+		assert!(parse_imported_ports(
+			"Imported USB devices
+====================
+"
+		)
+		.is_empty());
 	}
 
 	#[test]

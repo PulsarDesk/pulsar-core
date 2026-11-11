@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::attach::{self, Attachment};
 use super::device::{Ds5Device, EP_HID_IN};
@@ -158,27 +158,29 @@ impl VirtualDs5 {
 }
 
 impl Drop for VirtualDs5 {
+	/// ZerkSense's order: `usbip detach` while our server still answers (PLUGOUT
+	/// without reattach; the vhci cancels its URBs and closes the socket itself), then
+	/// close our side. Closing the socket FIRST is not harmless on usbip-win2: after a
+	/// successful attach any network error makes it plug the device out and re-attach
+	/// later (every 30 s to 8 min, ~2 h; maintainer in issue #175). So we also run
+	/// `usbip attach --stop` for our server at the end, which cancels such attempts if
+	/// the session dropped early.
 	fn drop(&mut self) {
-		let Some(a) = self.attachment.take() else {
+		let Some(mut a) = self.attachment.take() else {
 			return;
 		};
-		// ZerkSense runs `usbip detach` first and then closes the socket. On the test PC
-		// (usbip-win2 0.9.8.1) that left the devnodes Present after detach, while a
-		// server-side socket close (ZerkSense killed) removed them at once. So by default
-		// close the session first, give vhci a moment, then detach as a cleanup (it may
-		// then report the port as already free). `PULSAR_DS5_DETACH=first` restores the
-		// ZerkSense order for comparison.
-		let detach_first = std::env::var("PULSAR_DS5_DETACH").is_ok_and(|v| v == "first");
-		if detach_first {
-			trace!("ds5: unplug: usbip detach, then close the socket");
-			a.detach();
-			self.server.disconnect();
-		} else {
-			trace!("ds5: unplug: close the socket, then usbip detach");
-			self.server.disconnect();
-			std::thread::sleep(std::time::Duration::from_millis(500));
-			a.detach();
+		trace!("ds5: unplug vhci port {:?}", a.vhci_port());
+		let detached = a.detach();
+		let deadline = Instant::now() + Duration::from_secs(3);
+		while self.server.attached() && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(20));
 		}
+		trace!(
+			"ds5: usbip detach ok={detached}, session still open={}",
+			self.server.attached()
+		);
+		self.server.disconnect();
+		a.stop_reattach();
 		trace!("ds5: unplug done");
 	}
 }

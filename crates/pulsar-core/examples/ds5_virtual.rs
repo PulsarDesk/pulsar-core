@@ -14,8 +14,7 @@
 //! Everything goes to stderr with timestamps. The wire trace (`PULSAR_DS5_TRACE`) is on
 //! by default here: every control request and its answer, SET_INTERFACE, unlinks, the
 //! first iso URBs per stream and per-endpoint URB counts each second. Set
-//! `PULSAR_DS5_TRACE=0` to silence it, `PULSAR_DS5_DETACH=first` to unplug in
-//! ZerkSense's order (`usbip detach` before closing the socket).
+//! `PULSAR_DS5_TRACE=0` to silence it.
 
 use std::time::{Duration, Instant};
 
