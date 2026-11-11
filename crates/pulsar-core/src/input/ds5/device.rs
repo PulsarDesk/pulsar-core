@@ -285,6 +285,10 @@ struct State {
 	features: HashMap<u8, Vec<u8>>,
 	haptics: Downsampler,
 	mic: VecDeque<i16>,
+	/// Mic samples to queue before iso IN starts taking them, and again after the queue ran
+	/// dry (0 = none: the local bridge's pad mic arrives evenly; a session's does not).
+	mic_prebuffer: usize,
+	mic_primed: bool,
 }
 
 /// The emulated DualSense the USB/IP server exposes.
@@ -313,6 +317,8 @@ impl Ds5Device {
 				features,
 				haptics: Downsampler::new(haptics_gain),
 				mic: VecDeque::new(),
+				mic_prebuffer: 0,
+				mic_primed: false,
 			}),
 			events: Mutex::new(events),
 		}
@@ -346,6 +352,14 @@ impl Ds5Device {
 			v.resize(n, 0);
 		}
 		self.state.lock().unwrap().features.insert(id, v);
+	}
+
+	/// Hold back iso IN until `ms` of mic audio is queued (a jitter buffer for a mic that
+	/// comes over the network), and again after every underrun. 0 turns it off.
+	pub fn set_mic_prebuffer(&self, ms: u32) {
+		let mut st = self.state.lock().unwrap();
+		st.mic_prebuffer = (ms as usize * 48 * 2).min(MIC_FIFO_MAX / 2);
+		st.mic_primed = false;
 	}
 
 	/// Queue client mic audio: 48 kHz interleaved stereo s16. Oldest samples are dropped
@@ -407,6 +421,7 @@ impl Ds5Device {
 				let vol = Self::volume_event(&st);
 				if itf == ITF_MIC && alt == 0 {
 					st.mic.clear();
+					st.mic_primed = false;
 				}
 				drop(st);
 				if itf == ITF_SPEAKER && (was != 0) != (alt != 0) {
@@ -629,9 +644,20 @@ impl UsbDevice for Ds5Device {
 	fn iso_in(&self, _ep: u32, packet: &mut [u8]) {
 		let mut st = self.state.lock().unwrap();
 		let muted = st.mute[1] != 0;
+		if !st.mic_primed {
+			if st.mic.len() < st.mic_prebuffer.max(1) {
+				packet.fill(0);
+				return;
+			}
+			st.mic_primed = true;
+		}
 		for s in packet.chunks_exact_mut(2) {
 			let v = st.mic.pop_front().unwrap_or(0);
 			s.copy_from_slice(&if muted { 0i16 } else { v }.to_le_bytes());
+		}
+		if st.mic_prebuffer > 0 && st.mic.is_empty() {
+			// Ran dry: prebuffer again before the next packet.
+			st.mic_primed = false;
 		}
 	}
 
@@ -651,6 +677,7 @@ impl UsbDevice for Ds5Device {
 		let (spk, mic) = (st.alt[ITF_SPEAKER] != 0, st.alt[ITF_MIC] != 0);
 		st.alt = [0; 4];
 		st.mic.clear();
+		st.mic_primed = false;
 		drop(st);
 		if spk {
 			self.emit(Ds5HostEvent::SpeakerOpen(false));
@@ -736,5 +763,27 @@ mod tests {
 		edge[21] = 0x44;
 		dev.set_feature(0x20, &edge);
 		assert_eq!(&get(0x20)[1..4], b"Jul", "Edge firmware report ignored");
+	}
+
+	#[test]
+	fn mic_prebuffer_holds_until_filled_and_after_underrun() {
+		let (tx, _rx) = std::sync::mpsc::channel();
+		let dev = Ds5Device::new([2, 0, 0, 0, 0, 1], 1.0, tx);
+		// SET_INTERFACE(mic, alt 1).
+		dev.control(&[0x01, 0x0B, 0x01, 0x00, ITF_MIC as u8, 0, 0, 0], &[]).unwrap();
+		dev.set_mic_prebuffer(2); // 2 ms = 2 packets
+		let mut pkt = [0u8; MIC_PACKET_BYTES];
+		let one_ms: Vec<i16> = vec![7; MIC_PACKET_BYTES / 2];
+		dev.push_mic(&one_ms);
+		dev.iso_in(EP_MIC_IN, &mut pkt);
+		assert!(pkt.iter().all(|&b| b == 0), "1 ms queued < 2 ms prebuffer");
+		dev.push_mic(&one_ms);
+		dev.iso_in(EP_MIC_IN, &mut pkt);
+		assert_eq!(i16::from_le_bytes([pkt[0], pkt[1]]), 7, "primed");
+		dev.iso_in(EP_MIC_IN, &mut pkt);
+		assert_eq!(i16::from_le_bytes([pkt[0], pkt[1]]), 7, "last ms still played");
+		dev.push_mic(&one_ms);
+		dev.iso_in(EP_MIC_IN, &mut pkt);
+		assert!(pkt.iter().all(|&b| b == 0), "ran dry → prebuffer again");
 	}
 }

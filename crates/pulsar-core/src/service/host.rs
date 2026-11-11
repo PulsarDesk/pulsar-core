@@ -53,6 +53,9 @@ pub struct DataHandlers {
 	/// host's virtual wired DualSense (`input::ds5`). Default no-op: a host without the
 	/// backend never advertises `FEAT_DS5`, so a client never sends them.
 	pub on_ds5: Box<dyn FnMut(DataMsg) + Send>,
+	/// DualSense audio-rate datagrams from the client (a whole `TAG_DS5` session payload,
+	/// tag included: `Ds5Media::Mic`, the pad mic). Default no-op, like `on_ds5`.
+	pub on_ds5_media: Box<dyn FnMut(&[u8]) + Send>,
 	/// Host-initiated re-stream injection. When the host detects its OWN display mode changed
 	/// mid-session (resolution / refresh rate), a watcher re-sends the last [`StreamReq`] here so
 	/// the capture restarts at the new geometry — the ffmpeg (x11grab/gdigrab/avfoundation) and
@@ -88,6 +91,7 @@ impl Default for DataHandlers {
 			on_fs: Box::new(|_| {}),
 			on_stats: Box::new(|_| {}),
 			on_ds5: Box::new(|_| {}),
+			on_ds5_media: Box::new(|_| {}),
 		}
 	}
 }
@@ -240,6 +244,11 @@ pub async fn serve_with(
 				continue;
 			}
 		};
+		// Client → host DualSense media (pad mic): binary, never JSON (`{`).
+		if bytes.first() == Some(&crate::service::media::TAG_DS5) {
+			(data.on_ds5_media)(&bytes);
+			continue;
+		}
 		match dec(&bytes) {
 			Some(Msg::Ping) => {
 				// Keepalive — refreshes the timeout; reply so the client can time RTT.
@@ -313,7 +322,8 @@ pub async fn serve_with(
 				DataMsg::CursorPos { .. } | DataMsg::CursorShape { .. } | DataMsg::CursorHidden | DataMsg::PointerLock(_) => {}
 				DataMsg::Rumble { .. } => {}
 				m @ (DataMsg::Ds5Caps { .. } | DataMsg::Ds5Feature { .. }) => (data.on_ds5)(m),
-				DataMsg::Ds5Output { .. } => {} // host→client only; ignore if echoed back
+				// host→client only; ignore if echoed back
+				DataMsg::Ds5Output { .. } | DataMsg::Ds5Mic { .. } => {}
 			},
 			_ => {}
 		}

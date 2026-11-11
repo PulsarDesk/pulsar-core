@@ -93,3 +93,71 @@ async fn side_channels_round_trip() {
 	.expect("client must receive the host reply");
 	assert_eq!(reply, "hosttan-cevap");
 }
+
+/// DualSense: the host's `Ds5Mic` reaches the client, and the client's pad-mic media
+/// (`TAG_DS5`, binary) reaches the host's `on_ds5_media` instead of the JSON decoder.
+#[tokio::test]
+async fn ds5_mic_round_trip() {
+	use pulsar_core::input::ds5::wire::Ds5Media;
+	let relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+	let relay_addr: SocketAddr = relay.local_addr().unwrap();
+	tokio::spawn(relay.run());
+	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	host.register().await.unwrap();
+	client.register().await.unwrap();
+	let host_id = host.self_id().await.unwrap();
+
+	let media = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+	let (out_tx, out_rx) = mpsc::channel::<DataMsg>(8);
+	{
+		let host = host.clone();
+		let media = media.clone();
+		tokio::spawn(async move {
+			if let Some(session) = host.next_incoming().await {
+				let handlers = DataHandlers {
+					outbound: Some(out_rx),
+					on_ds5_media: Box::new(move |p| media.lock().unwrap().push(p.to_vec())),
+					..Default::default()
+				};
+				serve_with(session, Vec::new, |_| {}, |_, _| {}, |_| {}, handlers).await;
+			}
+		});
+	}
+	let mut sess = client.connect(host_id).await.unwrap();
+	out_tx.send(DataMsg::Ds5Mic { slot: 1, on: true }).await.unwrap();
+	let got = timeout(Duration::from_secs(2), async {
+		loop {
+			match sess.recv().await {
+				Some(b) => {
+					if let Some(m @ DataMsg::Ds5Mic { .. }) = decode_data(&b) {
+						return Some(m);
+					}
+				}
+				None => return None,
+			}
+		}
+	})
+	.await
+	.ok()
+	.flatten();
+	assert_eq!(got, Some(DataMsg::Ds5Mic { slot: 1, on: true }));
+
+	let pkt = Ds5Media::Mic { slot: 1, seq: 7, opus: vec![0xF8, 1, 2, 3] }.encode();
+	sess.send(&pkt).await.unwrap();
+	let ok = timeout(Duration::from_secs(2), async {
+		loop {
+			if !media.lock().unwrap().is_empty() {
+				return;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await;
+	assert!(ok.is_ok(), "host must route TAG_DS5 media to on_ds5_media");
+	assert_eq!(Ds5Media::decode(&media.lock().unwrap()[0]), Ds5Media::decode(&pkt));
+}
