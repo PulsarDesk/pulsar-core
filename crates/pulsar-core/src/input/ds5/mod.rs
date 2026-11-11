@@ -12,6 +12,7 @@ pub mod attach;
 pub mod bt_audio;
 pub mod crc;
 pub mod device;
+pub mod duo;
 pub mod haptics;
 pub mod pad;
 pub mod report;

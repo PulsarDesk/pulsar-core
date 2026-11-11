@@ -31,6 +31,9 @@ mod vigem;
 /// multi-seat session) — see [`duo::DuoGamepad`].
 #[cfg(windows)]
 mod duo;
+/// DualSense through Duo's driver (DualSense passthrough host inside a Duo seat).
+#[cfg(windows)]
+pub use duo::{duo_available, duo_ds5_interfaces, duo_pads_wanted, DuoDs5};
 
 /// Linux host-side uinput backends (virtual gamepad + desktop input).
 #[cfg(target_os = "linux")]

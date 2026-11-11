@@ -18,6 +18,8 @@
 //!   `DuoController.inf` next to the DLL. The device belongs to the session of the process
 //!   that loaded the DLL.
 //! - `DuoController_SendReport(handle, report*)` — a per-type struct (not a raw HID report).
+//!   DualSense/Edge take the raw 63-byte USB input state (report 0x01 minus its id), which the
+//!   DLL rewrites in place (seq, sensor timestamps, default battery) — see [`DuoDs5`].
 //! - `DuoController_RemoveController(handle)`.
 //! - Feedback: `cb(handle, const u8 fb[8], ctx)` on a DLL thread; fb[3] = strong, fb[4] = weak.
 //!
@@ -28,6 +30,11 @@ use std::ffi::c_void;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
+use super::ds5::duo::{
+	duo_wanted, event_name, is_duo_ds5_hid_path, parse_output, pick_new_parent, rumble_state,
+	section_name, SECTION_PREFIX,
+};
+use super::ds5::virtual_pad::Ds5HostEvent;
 use super::{ds4_report_fields, button, GamepadKind, GamepadState, ResolvedTarget, RumbleReader, VirtualGamepad};
 
 type Hresult = i32;
@@ -149,15 +156,26 @@ fn in_remote_session() -> bool {
 /// only inside a non-console session of a machine with Duo installed and its HID isolation on
 /// (in the console session Duo's shim DENIES `DUOCONTROLLER` devices, so ViGEm stays right there).
 pub(crate) fn wanted() -> bool {
-	match std::env::var("PULSAR_PAD_BACKEND").ok().as_deref() {
-		Some("duo") => return true,
-		Some("vigem") => return false,
-		_ => {}
+	let force = std::env::var("PULSAR_PAD_BACKEND").ok();
+	match force.as_deref() {
+		Some("duo") | Some("vigem") => duo_wanted(force.as_deref(), false, false, None),
+		_ => duo_wanted(
+			None,
+			duo_dir().is_some(),
+			in_remote_session(),
+			reg_dword(r"SOFTWARE\Duo", "HostHidIsolation"),
+		),
 	}
-	if duo_dir().is_none() || !in_remote_session() {
-		return false;
-	}
-	reg_dword(r"SOFTWARE\Duo", "HostHidIsolation").unwrap_or(1) != 0
+}
+
+/// Public form of [`wanted`]: pads (incl. DualSense) should be Duo controllers here.
+pub fn duo_pads_wanted() -> bool {
+	wanted()
+}
+
+/// `DuoController.dll` is installed, exports the expected API and initialized.
+pub fn duo_available() -> bool {
+	api().is_some()
 }
 
 fn api() -> Option<&'static Api> {
@@ -364,6 +382,379 @@ impl Drop for DuoGamepad {
 			tracing::info!(hr = format!("{hr:#010x}"), "duo pad: removed");
 		}
 	}
+}
+
+/// Wait this long for a new Duo DualSense's devnode + output section after
+/// `CreateController` (the device appears ~1.5 s later).
+const DS5_DISCOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The output-section reader re-reads at least this often even without an event (the
+/// event may be auto-reset and consumed by the DLL's own feedback thread).
+const DS5_POLL: u32 = 8;
+/// Serializes DS5 create + devnode discovery, so two pads never pick each other's devnode.
+static DS5_DISCOVER: Mutex<()> = Mutex::new(());
+/// Parent devnode ids owned by live [`DuoDs5`] pads.
+static DS5_CLAIMED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A virtual DualSense (or Edge) created through Duo's driver, for the DualSense
+/// passthrough host inside a Duo seat. HID only: input state in, the game's output state
+/// (triggers, LEDs, rumble) out as [`Ds5HostEvent::Output`]; no haptics, speaker or mic
+/// (Duo's DualSense has no audio interface).
+///
+/// Output comes from Duo's shared output section (see `ds5::duo`); if that can't be found,
+/// from the DLL's rumble callback only. Dropping it removes the device.
+pub struct DuoDs5 {
+	handle: *mut c_void,
+	parent: Option<String>,
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	reader: Option<std::thread::JoinHandle<()>>,
+}
+
+// Opaque DLL object pointer; every DLL call is serialized by `CALL`.
+unsafe impl Send for DuoDs5 {}
+unsafe impl Sync for DuoDs5 {}
+
+impl DuoDs5 {
+	/// Create the controller (type 2, or 3 for `edge`) and start the output reader. Blocks
+	/// up to ~5 s while the device appears.
+	pub fn start(edge: bool) -> std::io::Result<(Self, mpsc::Receiver<Ds5HostEvent>)> {
+		use std::io::{Error, ErrorKind};
+		let api =
+			api().ok_or_else(|| Error::new(ErrorKind::NotFound, "DuoController unavailable"))?;
+		let ty = if edge { 3u32 } else { 2u32 };
+		let _d = DS5_DISCOVER.lock().unwrap_or_else(|e| e.into_inner());
+		let before = duo_ds5_parents(edge);
+		let mut h: *mut c_void = std::ptr::null_mut();
+		let hr = {
+			let _g = CALL.lock().unwrap_or_else(|e| e.into_inner());
+			unsafe { (api.create)(ty, Some(on_feedback), std::ptr::null_mut(), &mut h) }
+		};
+		if hr < 0 || h.is_null() {
+			return Err(Error::other(format!(
+				"DuoController_CreateController({ty}) failed hr={hr:#010x}"
+			)));
+		}
+		let (rumble_tx, rumble_rx) = mpsc::sync_channel(16);
+		rumble_map()
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.insert(h as usize, rumble_tx);
+		let mut pad = Self {
+			handle: h,
+			parent: None,
+			stop: Default::default(),
+			reader: None,
+		};
+		// No report yet: SendReport waits up to 1 s for the device's input section and
+		// fails until it exists; the caller's first state follows right after `start`.
+		let section = Ds5Section::discover(&before, edge);
+		if let Some(s) = &section {
+			DS5_CLAIMED
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.push(s.parent.clone());
+			pad.parent = Some(s.parent.clone());
+			tracing::info!(parent = %s.parent, "duo ds5: created; reading the game's output report from Duo's section");
+		} else {
+			tracing::warn!("duo ds5: created, but its output section wasn't found; rumble only (no triggers/LEDs)");
+		}
+		drop(_d);
+		let (tx, rx) = mpsc::channel();
+		let stop = pad.stop.clone();
+		pad.reader = std::thread::Builder::new()
+			.name("duo-ds5-out".into())
+			.spawn(move || ds5_reader(section, rumble_rx, tx, stop))
+			.ok();
+		Ok((pad, rx))
+	}
+
+	/// Send one input state: the raw USB input report 0x01 without its id byte. The DLL
+	/// rewrites the sequence byte, both sensor timestamps and zero battery bytes in place.
+	pub fn send_raw(&self, state: &mut [u8; super::ds5::report::STATE_LEN]) -> bool {
+		let Some(api) = api() else { return false };
+		let hr = {
+			let _g = CALL.lock().unwrap_or_else(|e| e.into_inner());
+			unsafe { (api.send)(self.handle, state.as_mut_ptr()) }
+		};
+		if hr < 0 {
+			use std::sync::Once;
+			static WARN: Once = Once::new();
+			WARN.call_once(|| {
+				tracing::warn!(hr = format!("{hr:#010x}"), "duo ds5: SendReport failed")
+			});
+		}
+		hr >= 0
+	}
+
+	/// The controller's ROOT devnode instance id, if found.
+	pub fn parent_instance_id(&self) -> Option<&str> {
+		self.parent.as_deref()
+	}
+}
+
+impl Drop for DuoDs5 {
+	fn drop(&mut self) {
+		self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+		// Ends the reader's rumble channel too.
+		rumble_map()
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.remove(&(self.handle as usize));
+		if let Some(t) = self.reader.take() {
+			let _ = t.join();
+		}
+		if let Some(api) = api() {
+			let _g = CALL.lock().unwrap_or_else(|e| e.into_inner());
+			let hr = unsafe { (api.remove)(self.handle) };
+			tracing::info!(hr = format!("{hr:#010x}"), "duo ds5: removed");
+		}
+		if let Some(p) = &self.parent {
+			DS5_CLAIMED
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.retain(|c| c != p);
+		}
+	}
+}
+
+/// Duo's mapped output section for one controller.
+struct Ds5Section {
+	parent: String,
+	map: windows_sys::Win32::Foundation::HANDLE,
+	view: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+	/// `<section>_event`, or null (then the reader only polls).
+	event: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// Plain kernel handles + a read-only view; used by one thread at a time.
+unsafe impl Send for Ds5Section {}
+
+impl Ds5Section {
+	/// Find the new controller's devnode (not in `before`, not claimed) and open its
+	/// section, retrying until [`DS5_DISCOVER_TIMEOUT`].
+	fn discover(before: &[String], edge: bool) -> Option<Self> {
+		let deadline = std::time::Instant::now() + DS5_DISCOVER_TIMEOUT;
+		let mut parent: Option<String> = None;
+		loop {
+			if parent.is_none() {
+				let claimed = DS5_CLAIMED
+					.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.clone();
+				parent = pick_new_parent(before, &duo_ds5_parents(edge), &claimed);
+			}
+			if let Some(p) = &parent {
+				if let Some(s) = Self::open(p) {
+					return Some(s);
+				}
+			}
+			if std::time::Instant::now() >= deadline {
+				tracing::warn!(parent = ?parent, "duo ds5: no output section within {DS5_DISCOVER_TIMEOUT:?}");
+				return None;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+	}
+
+	fn open(parent: &str) -> Option<Self> {
+		use windows_sys::Win32::Foundation::CloseHandle;
+		use windows_sys::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, FILE_MAP_READ};
+		use windows_sys::Win32::System::Threading::OpenEventW;
+		const SYNCHRONIZE: u32 = 0x0010_0000;
+		let name = wide(&section_name(parent));
+		let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
+		if map.is_null() {
+			return None;
+		}
+		let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, SECTION_PREFIX) };
+		if view.Value.is_null() {
+			unsafe { CloseHandle(map) };
+			return None;
+		}
+		let ev = wide(&event_name(parent));
+		let event = unsafe { OpenEventW(SYNCHRONIZE, 0, ev.as_ptr()) };
+		if event.is_null() {
+			tracing::debug!("duo ds5: output event not openable; polling the section");
+		}
+		Some(Self {
+			parent: parent.to_string(),
+			map,
+			view,
+			event,
+		})
+	}
+
+	/// A consistent copy of the section's first bytes (re-read until two reads agree, so
+	/// a write in progress isn't taken half-done).
+	fn snapshot(&self) -> [u8; SECTION_PREFIX] {
+		let p = self.view.Value as *const u8;
+		let read = || {
+			let mut b = [0u8; SECTION_PREFIX];
+			for (i, x) in b.iter_mut().enumerate() {
+				*x = unsafe { std::ptr::read_volatile(p.add(i)) };
+			}
+			b
+		};
+		let mut a = read();
+		for _ in 0..4 {
+			let b = read();
+			if a == b {
+				break;
+			}
+			a = b;
+		}
+		a
+	}
+
+	/// Wait for the driver's event, at most [`DS5_POLL`] ms.
+	fn wait(&self) {
+		use windows_sys::Win32::System::Threading::WaitForSingleObject;
+		if self.event.is_null() {
+			std::thread::sleep(std::time::Duration::from_millis(DS5_POLL as u64));
+		} else {
+			unsafe { WaitForSingleObject(self.event, DS5_POLL) };
+		}
+	}
+}
+
+impl Drop for Ds5Section {
+	fn drop(&mut self) {
+		use windows_sys::Win32::Foundation::CloseHandle;
+		use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+		unsafe {
+			UnmapViewOfFile(self.view);
+			CloseHandle(self.map);
+			if !self.event.is_null() {
+				CloseHandle(self.event);
+			}
+		}
+	}
+}
+
+/// Turns the output section (or, without it, the DLL's rumble callback) into
+/// `Ds5HostEvent::Output` on change. Ends on `stop` or when the receiver is gone.
+fn ds5_reader(
+	section: Option<Ds5Section>,
+	rumble: mpsc::Receiver<(u8, u8)>,
+	tx: mpsc::Sender<Ds5HostEvent>,
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+	use std::sync::atomic::Ordering;
+	let mut last: Option<[u8; SECTION_PREFIX]> = None;
+	while !stop.load(Ordering::Relaxed) {
+		match &section {
+			Some(s) => {
+				s.wait();
+				// The section carries the rumble too; the callback's copy would double it.
+				while rumble.try_recv().is_ok() {}
+				let snap = s.snapshot();
+				if last == Some(snap) {
+					continue;
+				}
+				last = Some(snap);
+				if let Some(state) = parse_output(&snap) {
+					if tx.send(Ds5HostEvent::Output(state)).is_err() {
+						return;
+					}
+				}
+			}
+			None => match rumble.recv_timeout(std::time::Duration::from_millis(50)) {
+				Ok((strong, weak)) => {
+					if tx
+						.send(Ds5HostEvent::Output(rumble_state(strong, weak)))
+						.is_err()
+					{
+						return;
+					}
+				}
+				Err(mpsc::RecvTimeoutError::Timeout) => {}
+				Err(mpsc::RecvTimeoutError::Disconnected) => return,
+			},
+		}
+	}
+}
+
+/// Parent (ROOT) devnode ids of every present Duo DualSense HID interface.
+fn duo_ds5_parents(edge: bool) -> Vec<String> {
+	duo_ds5_interfaces(edge).into_iter().map(|(_, parent)| parent).collect()
+}
+
+/// Every present Duo DualSense (`edge`: Edge) HID interface as `(device path, parent ROOT
+/// devnode instance id)`. For tools and tests that talk to the pad's HID side directly.
+pub fn duo_ds5_interfaces(edge: bool) -> Vec<(String, String)> {
+	use windows_sys::core::GUID;
+	use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
+	// GUID_DEVINTERFACE_HID.
+	const HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
+	let mut out = Vec::new();
+	unsafe {
+		let set = SetupDiGetClassDevsW(
+			&HID,
+			std::ptr::null(),
+			std::ptr::null_mut(),
+			DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+		);
+		if set as isize == -1 || set as isize == 0 {
+			return out;
+		}
+		let mut i = 0;
+		loop {
+			let mut ifd: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
+			ifd.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+			if SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &HID, i, &mut ifd) == 0 {
+				break;
+			}
+			i += 1;
+			let mut need = 0u32;
+			SetupDiGetDeviceInterfaceDetailW(
+				set,
+				&ifd,
+				std::ptr::null_mut(),
+				0,
+				&mut need,
+				std::ptr::null_mut(),
+			);
+			if need == 0 {
+				continue;
+			}
+			// u32-aligned buffer for SP_DEVICE_INTERFACE_DETAIL_DATA_W.
+			let mut buf = vec![0u32; (need as usize).div_ceil(4) + 2];
+			let det = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+			(*det).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+			let mut dev: SP_DEVINFO_DATA = std::mem::zeroed();
+			dev.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+			if SetupDiGetDeviceInterfaceDetailW(
+				set,
+				&ifd,
+				det,
+				need,
+				std::ptr::null_mut(),
+				&mut dev,
+			) == 0
+			{
+				continue;
+			}
+			let p = (*det).DevicePath.as_ptr();
+			let mut n = 0;
+			while *p.add(n) != 0 {
+				n += 1;
+			}
+			let path = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+			if !is_duo_ds5_hid_path(&path, edge) {
+				continue;
+			}
+			let mut parent = 0u32;
+			if CM_Get_Parent(&mut parent, dev.DevInst, 0) != CR_SUCCESS {
+				continue;
+			}
+			let mut id = [0u16; 512];
+			if CM_Get_Device_IDW(parent, id.as_mut_ptr(), id.len() as u32, 0) == CR_SUCCESS {
+				let n = id.iter().position(|c| *c == 0).unwrap_or(id.len());
+				out.push((path, String::from_utf16_lossy(&id[..n])));
+			}
+		}
+		SetupDiDestroyDeviceInfoList(set);
+	}
+	out
 }
 
 struct DuoRumble {

@@ -77,6 +77,11 @@ windows-sys = { version = "0.61", features = [
 	"Win32_System_LibraryLoader",
 	"Win32_System_Registry",
 	"Win32_System_RemoteDesktop",
+	# input/duo.rs DualSense: find the Duo pad's devnode (SetupDi + CM_Get_Parent) and read
+	# its shared output section (OpenFileMappingW/MapViewOfFile, OpenEventW/WaitForSingleObject).
+	"Win32_Devices_DeviceAndDriverInstallation",
+	"Win32_System_Memory",
+	"Win32_System_Threading",
 ] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).
