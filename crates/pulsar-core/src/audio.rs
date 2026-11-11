@@ -34,6 +34,8 @@ mod command;
 // DualSense-aware host capture: source decision + endpoint-loopback PCM work (pure), and the
 // Windows default-endpoint volume/mute watch it reads.
 mod endpoint_route;
+// Jitter buffer + drift-correcting resampler for the host-silent virtual sink's loopback.
+mod jitter;
 #[cfg(windows)]
 mod endpoint_watch;
 #[cfg(windows)]
@@ -60,8 +62,9 @@ pub use command::{
 pub use endpoint_route::{
 	compensation_gain, downmix_frame, is_dualsense_name, Action as RouteAction, Capture as RouteCapture,
 	Decision as RouteDecision, EndpointObservation, GainSmoother, RouteInput, Router as SourceRouter,
-	Source as AudioSource, StereoConverter, MAX_COMPENSATION_DB,
+	Source as AudioSource, StereoConverter, SwitchFader, MAX_COMPENSATION_DB,
 };
+pub use jitter::{DriftResampler, JitterStats};
 #[cfg(windows)]
 pub use endpoint_watch::DefaultRenderWatch;
 #[cfg(windows)]

@@ -130,12 +130,17 @@ pub fn run_loopback_capture_tracking<W: std::io::Write>(
 /// The capture stays on `device_id` even after the default moves elsewhere (a loopback
 /// client is bound to its device); a removed device is retried within the re-init budget
 /// and then fails with an `Err`.
+///
+/// `fill_silence`: write 10 ms of silence on every idle poll, as the other entry points do.
+/// `false` for a consumer that paces the stream itself (the jitter buffer behind a
+/// non-real-time virtual sink): filler there would be mixed into the bursts.
 pub fn run_device_loopback_capture<W: std::io::Write>(
 	sink: W,
 	device_id: &str,
 	expected: LoopbackFormat,
+	fill_silence: bool,
 ) -> Result<Option<LoopbackFormat>, String> {
-	win_loopback::run(sink, Some(device_id), false, Some(expected))
+	win_loopback::run_fill(sink, Some(device_id), false, Some(expected), fill_silence)
 }
 
 /// Windows system-audio capture via **WASAPI loopback** on the default render endpoint
@@ -322,12 +327,23 @@ mod win_loopback {
 	}
 
 	pub fn run<W: Write>(
+		sink: W,
+		pinned_default: Option<&str>,
+		reassert: bool,
+		expected: Option<LoopbackFormat>,
+	) -> Result<Option<LoopbackFormat>, String> {
+		run_fill(sink, pinned_default, reassert, expected, true)
+	}
+
+	pub fn run_fill<W: Write>(
 		mut sink: W,
 		pinned_default: Option<&str>,
 		// `false` = `pinned_default` is only the device to open, never re-asserted as
 		// the OS default (`run_device_loopback_capture`).
 		reassert: bool,
 		expected: Option<LoopbackFormat>,
+		// Write silence on idle polls (see `run_device_loopback_capture`).
+		fill_silence: bool,
 	) -> Result<Option<LoopbackFormat>, String> {
 		// Outer re-init loop: a device-invalidated / default-endpoint-change ends the
 		// inner capture but we re-open the new default endpoint and resume, so host
@@ -351,7 +367,7 @@ mod win_loopback {
 			if reassert {
 				reassert_pinned_default(pinned_default);
 			}
-			match run_once(&mut sink, pinned_default, expected, reopen) {
+			match run_once(&mut sink, pinned_default, expected, reopen, fill_silence) {
 				CaptureEnd::PipeBroken => return Ok(None),
 				CaptureEnd::Fatal(e) => return Err(e),
 				// A re-opened endpoint has a format ffmpeg can't parse — hand the new
@@ -409,6 +425,7 @@ mod win_loopback {
 		device_id: Option<&str>,
 		expected: Option<LoopbackFormat>,
 		reopen: bool,
+		fill_silence: bool,
 	) -> CaptureEnd {
 		unsafe {
 			// Classify a SETUP failure (no capture cycle ran yet → not productive): a
@@ -535,7 +552,7 @@ mod win_loopback {
 			let period_frames = (fmt.rate / 100).max(1) as usize;
 			let silence = vec![0u8; period_frames * block_align];
 
-			let outcome = capture_loop(&capture, sink, block_align, &silence);
+			let outcome = capture_loop(&capture, sink, block_align, fill_silence.then_some(&silence[..]));
 			let _ = client.Stop();
 			outcome
 		}
@@ -545,7 +562,7 @@ mod win_loopback {
 		capture: &IAudioCaptureClient,
 		sink: &mut W,
 		block_align: usize,
-		silence: &[u8],
+		silence: Option<&[u8]>,
 	) -> CaptureEnd {
 		// A WASAPI call failed mid-capture (a live cycle ran → productive): re-init on
 		// device-invalidated, else fatal.
@@ -587,7 +604,7 @@ mod win_loopback {
 				}
 				wrote_any = true;
 			}
-			if !wrote_any {
+			if let (false, Some(silence)) = (wrote_any, silence) {
 				// Host silent this tick → keep the timeline moving with one period of silence.
 				if sink.write_all(silence).is_err() {
 					return CaptureEnd::PipeBroken;
