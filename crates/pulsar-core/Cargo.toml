@@ -82,6 +82,14 @@ windows-sys = { version = "0.61", features = [
 	"Win32_Devices_DeviceAndDriverInstallation",
 	"Win32_System_Memory",
 	"Win32_System_Threading",
+	# input/pad_cleanup.rs: remove a dead Pulsar's leftover pads (DIF_REMOVE, process probe)
+	# and keep their record in an admin-only %ProgramData%\Pulsar file (SDDL, owner check,
+	# SHGetKnownFolderPath).
+	"Win32_Security",
+	"Win32_Security_Authorization",
+	"Win32_Storage_FileSystem",
+	"Win32_System_Com",
+	"Win32_UI_Shell",
 ] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).

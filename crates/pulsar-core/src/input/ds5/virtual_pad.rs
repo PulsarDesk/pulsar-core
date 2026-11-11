@@ -93,6 +93,9 @@ pub enum Ds5HostEvent {
 /// A virtual wired DualSense. Dropping it detaches the device and stops every thread.
 pub struct VirtualDs5 {
 	attachment: Option<Attachment>,
+	/// This pad's entry in the leftover-pad record (`input/pad_cleanup.rs`), dropped after
+	/// the detach in `Drop`.
+	_lease: crate::input::pad_cleanup::PadLease,
 	server: UsbIpServer,
 	device: Arc<Ds5Device>,
 	/// For [`VirtualGamepad::apply`]: report counter and sensor clock.
@@ -108,11 +111,16 @@ impl VirtualDs5 {
 		} else {
 			None
 		};
+		if method.is_some() {
+			// A dead Pulsar's leftover pads / usbip-win2 re-attach attempts (pad_cleanup.rs).
+			crate::input::pad_cleanup::before_create();
+		}
 		let (tx, rx) = mpsc::channel();
 		let device = Arc::new(Ds5Device::new(cfg.mac, cfg.haptics_gain, tx));
 		let server = UsbIpServer::start(cfg.port, device.clone())?;
 		let mut pad = Self {
 			attachment: None,
+			_lease: crate::input::pad_cleanup::PadLease::none(),
 			server,
 			device,
 			seq: AtomicU8::new(0),
@@ -120,7 +128,14 @@ impl VirtualDs5 {
 		};
 		pad.set_input(&idle_input());
 		if let Some(method) = method {
-			pad.attachment = Some(attach::attach_with(&method, pad.server.port())?);
+			let a = attach::attach_with(&method, pad.server.port())?;
+			// Only usbip-win2 leaves state behind a dead process (re-attach attempts);
+			// Linux vhci-hcd unplugs by itself when the server socket dies.
+			if cfg!(windows) {
+				pad._lease =
+					crate::input::pad_cleanup::PadLease::usbip(pad.server.port(), a.vhci_port());
+			}
+			pad.attachment = Some(a);
 			tracing::info!(
 				"ds5: virtual wired DualSense plugged in (port {})",
 				pad.port()

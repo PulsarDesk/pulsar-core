@@ -124,10 +124,55 @@ pub fn parse_imported_ports(out: &str) -> Vec<u32> {
 		.collect()
 }
 
+/// `(vhci port, server tcp port)` of every import from 127.0.0.1 in `usbip port` output
+/// (`-> usbip://127.0.0.1:<tcp>/1-1` under its `Port NN:` line). Imports from other hosts
+/// are left out.
+pub fn parse_port_targets(out: &str) -> Vec<(u32, u16)> {
+	let needle = "usbip://127.0.0.1:";
+	let mut found = Vec::new();
+	let mut current = None;
+	for line in out.lines() {
+		let t = line.trim_start();
+		if let Some(rest) = t.strip_prefix("Port ") {
+			current = rest.split(':').next().and_then(|n| n.trim().parse().ok());
+		} else if let (Some(port), Some(i)) = (current, t.find(needle)) {
+			let tail = &t[i + needle.len()..];
+			let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+			if let Ok(tcp) = digits.parse() {
+				found.push((port, tcp));
+				current = None;
+			}
+		}
+	}
+	found
+}
+
+/// The raw `usbip port` listing.
+pub fn port_listing(exe: &Path) -> io::Result<String> {
+	Ok(text(&run(exe, &["port".into()])?))
+}
+
 /// The vhci ports currently imported, from `usbip port`.
 pub fn imported_ports(exe: &Path) -> io::Result<Vec<u32>> {
-	let o = run(exe, &["port".into()])?;
-	Ok(parse_imported_ports(&text(&o)))
+	Ok(parse_imported_ports(&port_listing(exe)?))
+}
+
+/// `usbip detach -p <port>`; whether it succeeded.
+pub fn detach_port(exe: &Path, p: u32) -> bool {
+	match run(exe, &["detach".into(), "-p".into(), p.to_string()]) {
+		Ok(o) if o.status.success() => {
+			trace!("usbip: detached port {p}: {}", text(&o).trim());
+			true
+		}
+		Ok(o) => {
+			trace!("usbip detach -p {p} failed: {}", text(&o).trim());
+			false
+		}
+		Err(e) => {
+			trace!("usbip detach -p {p}: {e}");
+			false
+		}
+	}
 }
 
 fn global_args(tcp_port: u16) -> Vec<String> {
@@ -215,20 +260,7 @@ impl Attachment {
 			Method::Cli(exe) => exe,
 			Method::Sysfs => return sysfs_detach(p),
 		};
-		match run(exe, &["detach".into(), "-p".into(), p.to_string()]) {
-			Ok(o) if o.status.success() => {
-				trace!("usbip: detached port {p}: {}", text(&o).trim());
-				true
-			}
-			Ok(o) => {
-				trace!("usbip detach -p {p} failed: {}", text(&o).trim());
-				false
-			}
-			Err(e) => {
-				trace!("usbip detach -p {p}: {e}");
-				false
-			}
-		}
+		detach_port(exe, p)
 	}
 
 	/// See [`stop_attach_attempts`].
@@ -349,6 +381,7 @@ mod tests {
 		assert_eq!(parse_port_list(out, 3240), Some(0));
 		assert_eq!(parse_port_list(out, 4000), None);
 		assert_eq!(parse_imported_ports(out), vec![0, 1]);
+		assert_eq!(parse_port_targets(out), vec![(0, 3240), (1, 50123)]);
 	}
 
 	#[test]
@@ -362,6 +395,11 @@ mod tests {
 ";
 		assert_eq!(parse_imported_ports(out), vec![1]);
 		assert_eq!(parse_port_list(out, 50123), Some(1));
+		assert_eq!(parse_port_targets(out), vec![(1, 50123)]);
+		assert!(
+			parse_port_targets("Port 02: in use\n  -> usbip://10.0.0.5:3240/1-1\n").is_empty(),
+			"a remote import is not ours"
+		);
 		assert!(parse_imported_ports(
 			"Imported USB devices
 ====================

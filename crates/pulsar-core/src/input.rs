@@ -23,6 +23,11 @@ pub use types::{
 	VirtualGamepad,
 };
 
+/// Leftover virtual pads of a dead Pulsar: the pad record + pure cleanup decisions.
+pub mod pad_registry;
+/// Removing those leftovers (Windows SetupAPI/CfgMgr32) and recording live pads.
+pub mod pad_cleanup;
+
 /// Windows host-side virtual gamepad via **ViGEmBus** — see [`vigem::ViGEmGamepad`].
 #[cfg(windows)]
 mod vigem;

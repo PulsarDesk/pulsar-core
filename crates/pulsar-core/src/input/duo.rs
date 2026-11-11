@@ -35,6 +35,7 @@ use super::ds5::duo::{
 	section_name, SECTION_PREFIX,
 };
 use super::ds5::virtual_pad::Ds5HostEvent;
+use super::pad_cleanup::{self, PadLease};
 use super::{ds4_report_fields, button, GamepadKind, GamepadState, ResolvedTarget, RumbleReader, VirtualGamepad};
 
 type Hresult = i32;
@@ -318,6 +319,8 @@ pub struct DuoGamepad {
 	xbox: bool,
 	handle: *mut c_void,
 	rumble_rx: Mutex<Option<mpsc::Receiver<(u8, u8)>>>,
+	/// This controller's entry in the leftover-pad record (dropped after `RemoveController`).
+	_lease: PadLease,
 }
 
 // The handle is an opaque DLL object pointer; every use is serialized by `CALL`.
@@ -330,6 +333,9 @@ impl DuoGamepad {
 			ResolvedTarget::Xbox360 => (0u32, true),
 			ResolvedTarget::Ds4 => (1u32, false),
 		};
+		// A dead Pulsar's leftover pad would be picked over this one (pad_cleanup.rs).
+		pad_cleanup::before_create();
+		let before = pad_cleanup::duo_root_ids();
 		let mut h: *mut c_void = std::ptr::null_mut();
 		let hr = {
 			let _g = CALL.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,7 +347,7 @@ impl DuoGamepad {
 		let (tx, rx) = mpsc::sync_channel(16);
 		rumble_map().lock().unwrap_or_else(|e| e.into_inner()).insert(h as usize, tx);
 		tracing::info!(kind = ?kind, ty, "duo pad: created");
-		Ok(Self { kind, xbox, handle: h, rumble_rx: Mutex::new(Some(rx)) })
+		Ok(Self { kind, xbox, handle: h, rumble_rx: Mutex::new(Some(rx)), _lease: PadLease::duo_discover(before) })
 	}
 }
 
@@ -407,6 +413,8 @@ pub struct DuoDs5 {
 	parent: Option<String>,
 	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	reader: Option<std::thread::JoinHandle<()>>,
+	/// This controller's entry in the leftover-pad record (dropped after `RemoveController`).
+	_lease: PadLease,
 }
 
 // Opaque DLL object pointer; every DLL call is serialized by `CALL`.
@@ -421,8 +429,11 @@ impl DuoDs5 {
 		let api =
 			api().ok_or_else(|| Error::new(ErrorKind::NotFound, "DuoController unavailable"))?;
 		let ty = if edge { 3u32 } else { 2u32 };
+		// A dead Pulsar's leftover DualSense would be picked over this one (pad_cleanup.rs).
+		pad_cleanup::before_create();
 		let _d = DS5_DISCOVER.lock().unwrap_or_else(|e| e.into_inner());
 		let before = duo_ds5_parents(edge);
+		let roots_before = pad_cleanup::duo_root_ids();
 		let mut h: *mut c_void = std::ptr::null_mut();
 		let hr = {
 			let _g = CALL.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,6 +454,7 @@ impl DuoDs5 {
 			parent: None,
 			stop: Default::default(),
 			reader: None,
+			_lease: PadLease::none(),
 		};
 		// No report yet: SendReport waits up to 1 s for the device's input section and
 		// fails until it exists; the caller's first state follows right after `start`.
@@ -457,6 +469,10 @@ impl DuoDs5 {
 		} else {
 			tracing::warn!("duo ds5: created, but its output section wasn't found; rumble only (no triggers/LEDs)");
 		}
+		pad._lease = match &pad.parent {
+			Some(p) => PadLease::duo_known(p),
+			None => PadLease::duo_discover(roots_before),
+		};
 		drop(_d);
 		let (tx, rx) = mpsc::channel();
 		let stop = pad.stop.clone();
