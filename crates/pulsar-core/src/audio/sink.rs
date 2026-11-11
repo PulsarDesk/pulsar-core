@@ -323,6 +323,9 @@ impl WaveFormatParams {
 }
 
 #[cfg(windows)]
+pub(super) use imp::device_name_fields;
+
+#[cfg(windows)]
 mod imp {
 	//! Windows `IPolicyConfig` sink-switching via raw IUnknown-vtable FFI.
 	//!
@@ -611,6 +614,23 @@ mod imp {
 		};
 		let _ = PropVariantClear(&mut prop);
 		val
+	}
+
+	/// A device's friendly name, adapter/interface friendly name and description (each
+	/// `None` when unreadable) — what [`device_matches`] searches. Also used by the
+	/// default-endpoint watcher (`endpoint_watch.rs`) to tell a DualSense's own endpoint.
+	pub(in crate::audio) unsafe fn device_name_fields(device: &IMMDevice) -> [Option<String>; 3] {
+		let Some(store) = open_property_store(device) else {
+			return [None, None, None];
+		};
+		let store_vtbl = &**(store as *const *const IPropertyStoreVtbl);
+		let out = [
+			store_string(store, &PKEY_DEVICE_FRIENDLY_NAME),
+			store_string(store, &PKEY_DEVICEINTERFACE_FRIENDLY_NAME),
+			store_string(store, &PKEY_DEVICE_DEVICEDESC),
+		];
+		(store_vtbl.Release)(store);
+		out
 	}
 
 	/// If `needle_lc` (already lower-cased) is a substring of any of the device's

@@ -31,6 +31,11 @@
 //! [`sink::SinkRedirectGuard`] and `set_host_muted`.
 
 mod command;
+// DualSense-aware host capture: source decision + endpoint-loopback PCM work (pure), and the
+// Windows default-endpoint volume/mute watch it reads.
+mod endpoint_route;
+#[cfg(windows)]
+mod endpoint_watch;
 #[cfg(windows)]
 mod loopback;
 // Per-process WASAPI loopback (Phase 4 same-host co-op): capture ONLY one app's render
@@ -52,9 +57,16 @@ pub use command::{
 	audio_command, audio_command_layout, audio_command_quality, opus_bitrate, opus_bitrate_for, opus_rtp_output,
 	opus_rtp_output_layout, opus_rtp_output_quality,
 };
+pub use endpoint_route::{
+	compensation_gain, downmix_frame, is_dualsense_name, Action as RouteAction, Capture as RouteCapture,
+	Decision as RouteDecision, EndpointObservation, GainSmoother, RouteInput, Router as SourceRouter,
+	Source as AudioSource, StereoConverter, MAX_COMPENSATION_DB,
+};
+#[cfg(windows)]
+pub use endpoint_watch::DefaultRenderWatch;
 #[cfg(windows)]
 pub use loopback::{
-	loopback_format, run_loopback_capture, run_loopback_capture_pinned,
+	loopback_format, run_device_loopback_capture, run_loopback_capture, run_loopback_capture_pinned,
 	run_loopback_capture_tracking, LoopbackFormat,
 };
 #[cfg(windows)]

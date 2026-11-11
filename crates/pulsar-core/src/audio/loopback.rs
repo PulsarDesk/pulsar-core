@@ -97,7 +97,7 @@ pub fn run_loopback_capture_pinned<W: std::io::Write>(
 ) -> Result<(), String> {
 	// `expected = None` → never compare the re-opened device's format, so this path
 	// behaves byte-for-byte as before (the example / standalone capture test use it).
-	win_loopback::run(sink, pinned_default.as_deref(), None).map(|_| ())
+	win_loopback::run(sink, pinned_default.as_deref(), true, None).map(|_| ())
 }
 
 /// Like [`run_loopback_capture_pinned`], but tracks the capture format against
@@ -118,7 +118,24 @@ pub fn run_loopback_capture_tracking<W: std::io::Write>(
 	pinned_default: Option<String>,
 	expected: LoopbackFormat,
 ) -> Result<Option<LoopbackFormat>, String> {
-	win_loopback::run(sink, pinned_default.as_deref(), Some(expected))
+	win_loopback::run(sink, pinned_default.as_deref(), true, Some(expected))
+}
+
+/// Capture the loopback of ONE render endpoint, `device_id`, with the format tracking of
+/// [`run_loopback_capture_tracking`] — but never touching the OS default (no pin
+/// re-assert). For a caller that watches the default endpoint itself and restarts the
+/// capture on the new id when it changes (the DualSense-aware host capture: it taps the
+/// default endpoint so audio rendered to a virtual pad's own endpoint is left out).
+///
+/// The capture stays on `device_id` even after the default moves elsewhere (a loopback
+/// client is bound to its device); a removed device is retried within the re-init budget
+/// and then fails with an `Err`.
+pub fn run_device_loopback_capture<W: std::io::Write>(
+	sink: W,
+	device_id: &str,
+	expected: LoopbackFormat,
+) -> Result<Option<LoopbackFormat>, String> {
+	win_loopback::run(sink, Some(device_id), false, Some(expected))
 }
 
 /// Windows system-audio capture via **WASAPI loopback** on the default render endpoint
@@ -307,6 +324,9 @@ mod win_loopback {
 	pub fn run<W: Write>(
 		mut sink: W,
 		pinned_default: Option<&str>,
+		// `false` = `pinned_default` is only the device to open, never re-asserted as
+		// the OS default (`run_device_loopback_capture`).
+		reassert: bool,
 		expected: Option<LoopbackFormat>,
 	) -> Result<Option<LoopbackFormat>, String> {
 		// Outer re-init loop: a device-invalidated / default-endpoint-change ends the
@@ -328,7 +348,9 @@ mod win_loopback {
 			// Before each (re)open, re-assert the pinned default render endpoint (the
 			// host-silent virtual sink) if the OS default has drifted off it — see the
 			// `reassert_pinned_default` doc. A no-op when `pinned_default` is None.
-			reassert_pinned_default(pinned_default);
+			if reassert {
+				reassert_pinned_default(pinned_default);
+			}
 			match run_once(&mut sink, pinned_default, expected, reopen) {
 				CaptureEnd::PipeBroken => return Ok(None),
 				CaptureEnd::Fatal(e) => return Err(e),
