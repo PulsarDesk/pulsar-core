@@ -545,6 +545,7 @@ enum DataMsgWire {
 		#[serde(default)]
 		reason: String,
 	},
+	HostPointer { active: bool, x: f32, y: f32 },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -588,6 +589,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::PairRequest { name } => DataMsg::PairRequest { name },
 			DataMsgWire::Unpair => DataMsg::Unpair,
 			DataMsgWire::PairResult { paired, reason } => DataMsg::PairResult { paired, reason },
+			DataMsgWire::HostPointer { active, x, y } => DataMsg::HostPointer { active, x, y },
 		}
 	}
 }
@@ -810,6 +812,13 @@ pub enum DataMsg {
 		#[serde(default)]
 		reason: String,
 	},
+	/// Host → client: the person AT the host is using their own mouse (remote-desktop
+	/// sessions; the host's takeover detection), with the host pointer at `x`,`y` normalized
+	/// 0..1 within the streamed screen. Sent ~30 Hz while `active`, then once with
+	/// `active: false` when the host mouse goes idle (remote input is held back meanwhile).
+	/// The client draws that pointer labelled "Host" next to its own one. Appended for
+	/// additive wire compat (an old client ignores the unknown variant).
+	HostPointer { active: bool, x: f32, y: f32 },
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1243,6 +1252,8 @@ mod tests {
 			DataMsg::Unpair,
 			DataMsg::PairResult { paired: true, reason: String::new() },
 			DataMsg::PairResult { paired: false, reason: "denied".into() },
+			DataMsg::HostPointer { active: true, x: 0.25, y: 0.75 },
+			DataMsg::HostPointer { active: false, x: 0.0, y: 0.0 },
 		];
 
 		for msg in cases {
