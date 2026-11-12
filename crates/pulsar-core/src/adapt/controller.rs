@@ -84,6 +84,16 @@
 //!   three), and each failed probe doubles the wait (1, 2, 4 … min). Steady mild pre-repair
 //!   loss is tested with a probe-down before it is learned as noise: a policer's overflow is
 //!   steady and flat too. Unmeasured samples (mobile) keep the post-repair rules.
+//! * **Bursty random loss is judged over many windows** (2026-11-12: a 100/50 Mbit line at
+//!   14 ms with Wi-Fi-like loss swinging 2 → 36 % window to window at EVERY rate). Each burst
+//!   over `LOSS_SEVERE` used to cut and count as confirmed by the loss itself, and the next,
+//!   luckier window read as "the cut worked": 13 → 0.35 Mbit in seven minutes. The last
+//!   `LOSS_HIST` unqueued measured windows (send rate, pre-repair loss, target) answer
+//!   "does the loss follow the rate?" (`loss_follows_rate`): when the rate varied ≥ ×1.15 and
+//!   the low-rate half lost about as much as the high-rate half, it doesn't — no cut, no
+//!   probe-down verdict of "followed", the rate goes back to what those windows ran at and the
+//!   loss is FEC's (`random_loss_hold`). A policer / thin link still shows loss falling with
+//!   the rate and keeps the rules above.
 
 use super::delay::{DelayState, Trendline};
 use super::fec_policy;
@@ -99,6 +109,16 @@ pub const LOSS_CLEAN: f32 = 0.005;
 pub const LOSS_DOWN: f32 = 0.03;
 /// Raw loss above this halves at once.
 pub const LOSS_SEVERE: f32 = 0.15;
+/// Windows of rate-vs-loss history kept for `loss_follows_rate` (48 s), and how many it needs.
+pub const LOSS_HIST: usize = 24;
+pub const LOSS_HIST_MIN: usize = 10;
+/// The history's high-rate half must run at least this much faster than its low-rate half
+/// for the comparison to say anything.
+pub const LOSS_HIST_RATE_SPREAD: f32 = 1.15;
+/// "Follows the rate": the low-rate half lost under this share of the high-rate half.
+pub const LOSS_FOLLOW_SHARE: f32 = 0.6;
+/// How long a "random loss" verdict outlives the last lossy window judged by it (2 min).
+pub const RANDOM_HOLD_WINDOWS: u32 = 60;
 /// RTT excess (ms) under which the link counts as unqueued (climb allowed).
 pub const RTT_OK_MS: f32 = 25.0;
 /// RTT excess that cuts ×0.7 even at zero loss.
@@ -491,6 +511,12 @@ pub struct Controller {
 	loss_cut: Option<LossCut>,
 	/// The last loss judgement found the loss non-congestive (see `loss_is_non_responsive`).
 	non_responsive: bool,
+	/// The last `LOSS_HIST` measured, unqueued windows: (host send-rate estimate, pre-repair
+	/// loss, target) — see `loss_follows_rate`.
+	loss_hist: std::collections::VecDeque<(f32, f32, u32)>,
+	/// The window until which a "random loss" verdict stands while the history can't judge
+	/// (the rate held steady, so it hardly varies): `random_loss`.
+	random_until: u32,
 	/// The startup ramp climbed this window (it doesn't use up a startup window).
 	startup_climbed: bool,
 	/// Windows spent at the floor with steady loss, and that loss (see `FLOOR_ESCAPE_WINDOWS`).
@@ -721,6 +747,8 @@ impl Controller {
 			send_est: None,
 			loss_cut: None,
 			non_responsive: false,
+			loss_hist: std::collections::VecDeque::new(),
+			random_until: 0,
 			startup_climbed: false,
 			floor_windows: 0,
 			floor_loss: 0.0,
@@ -1145,7 +1173,10 @@ impl Controller {
 				// FEC changed under the probe: inconclusive — restore, judge again later.
 				self.apply_rate(pd.from, &mut out);
 				out.reason = "probe down inconclusive (fec changed) — restored";
-			} else if pd.pre_loss - after >= (pd.pre_loss - pd.noise).max(0.0) * 0.4 && pd.pre_loss - after >= tol * 1.25 {
+			} else if pd.pre_loss - after >= (pd.pre_loss - pd.noise).max(0.0) * 0.4
+				&& pd.pre_loss - after >= tol * 1.25
+				&& !self.random_loss()
+			{
 				// Followed = the loss over the floor fell by 40 % AND by more than the scatter of
 				// one window against a two-window mean (`tol` × √1.5): the probe starts on a window
 				// picked for being lossy, so on a 35 % floor the next ones read lower by chance.
@@ -1187,6 +1218,26 @@ impl Controller {
 		};
 		let draining = delay == DelayState::Underuse || (excess >= RTT_OK_MS && excess_now < RTT_OK_MS);
 		let queued = !draining && (excess >= RTT_OK_MS || delay == DelayState::Overuse);
+		// Rate-vs-loss history for `loss_follows_rate`: measured, unqueued windows only (a queue
+		// is congestion by itself and judged on the RTT).
+		if let Some(send) = self.send_est.filter(|_| total > 100 && !queued && !queued_before) {
+			if self.loss_hist.len() == LOSS_HIST {
+				self.loss_hist.pop_front();
+			}
+			self.loss_hist.push_back((send, raw, self.target));
+		}
+		if queued {
+			// A queue is congestion whatever the loss did: the random-loss verdict is over.
+			self.random_until = 0;
+		} else {
+			// Judge on every window, not only on a lossy one: a verdict reached while the rate
+			// was varying (a climb, a cut) is what the next steady stretch relies on.
+			match self.loss_follows_rate() {
+				Some(false) => self.random_until = self.windows + RANDOM_HOLD_WINDOWS,
+				Some(true) => self.random_until = 0,
+				None => {}
+			}
+		}
 
 		// Never stuck at the floor: steady loss (or none) there for `FLOOR_ESCAPE_WINDOWS` is
 		// not something the rate causes — it can't go lower. Take that loss as the path's
@@ -1316,6 +1367,8 @@ impl Controller {
 					self.punish(before);
 					self.apply_rate(before * 7 / 10, &mut out);
 					out.reason = "sustained loss with a queued link → ×0.7";
+				} else if self.random_loss() {
+					return self.random_loss_hold(out, "sustained loss that doesn't follow the rate (flat link) — hold, FEC's job");
 				} else {
 					self.over = 0;
 					let to = raised.unwrap_or(before * 4 / 5);
@@ -1509,6 +1562,9 @@ impl Controller {
 
 	/// Severe loss with a measured goodput (see the module doc, "Loss is measured").
 	fn severe_loss_measured(&mut self, loss: f32, send: f32, queued: bool, mut out: Decision) -> Decision {
+		if !queued && self.random_loss() {
+			return self.random_loss_hold(out, "severe loss that doesn't follow the rate (flat link) — hold, FEC's job");
+		}
 		let before = self.target;
 		self.over = 0;
 		self.clean = 0;
@@ -1597,6 +1653,82 @@ impl Controller {
 		self.apply_rate(to, &mut out);
 		self.loss_cut =
 			Some(LossCut { window: self.windows, send_before: send, loss_before: loss, from, from_ceiling, from_bad });
+		self.finish(out)
+	}
+
+	/// Does the pre-repair loss follow the rate? Over the last `LOSS_HIST` measured, unqueued
+	/// windows sorted by send rate: `None` = can't tell (too few windows, the rate hardly
+	/// varied, or too little loss to judge); `Some(true)` = the low-rate half lost clearly less
+	/// (under `LOSS_FOLLOW_SHARE` of the high-rate half) — congestion / a policer; `Some(false)` =
+	/// about as much at the lower rates — random loss the rate doesn't cause.
+	fn loss_follows_rate(&self) -> Option<bool> {
+		if self.loss_hist.len() < LOSS_HIST_MIN {
+			return None;
+		}
+		let mut v: Vec<(f32, f32, u32)> = self.loss_hist.iter().copied().collect();
+		v.sort_by(|a, b| a.0.total_cmp(&b.0));
+		let (lo, hi) = v.split_at(v.len() / 2);
+		let mean = |s: &[(f32, f32, u32)], f: fn(&(f32, f32, u32)) -> f32| s.iter().map(f).sum::<f32>() / s.len().max(1) as f32;
+		let (lo_rate, hi_rate) = (mean(lo, |x| x.0), mean(hi, |x| x.0));
+		if hi_rate < lo_rate * LOSS_HIST_RATE_SPREAD {
+			return None;
+		}
+		let (lo_loss, hi_loss) = (mean(lo, |x| x.1), mean(hi, |x| x.1));
+		if hi_loss < LOSS_DOWN {
+			return None;
+		}
+		Some(lo_loss < hi_loss * LOSS_FOLLOW_SHARE)
+	}
+
+	/// The loss is random (doesn't follow the rate): judged so now, or judged so earlier and
+	/// the history can't tell since (the rate held steady) — renewed by every lossy window, so
+	/// it lapses `RANDOM_HOLD_WINDOWS` after the loss stops. A verdict that the loss DOES follow
+	/// the rate, or a queue, ends it at once.
+	fn random_loss(&mut self) -> bool {
+		match self.loss_follows_rate() {
+			Some(false) => {
+				self.random_until = self.windows + RANDOM_HOLD_WINDOWS;
+				true
+			}
+			Some(true) => {
+				self.random_until = 0;
+				false
+			}
+			// Still lossy, still unqueued, still no sign the loss follows the rate: the verdict
+			// stands for another `RANDOM_HOLD_WINDOWS` (it ends on a queue or a `Some(true)`).
+			None if self.windows <= self.random_until => {
+				self.random_until = self.windows + RANDOM_HOLD_WINDOWS;
+				true
+			}
+			None => false,
+		}
+	}
+
+	/// Random loss on a flat link (`random_loss`): don't cut — a lower rate
+	/// loses as much, only with less picture. Learn the loss as the path's noise (FEC sizes the
+	/// parity for it), forget the cuts it caused and go back to the highest rate those windows
+	/// ran at.
+	fn random_loss_hold(&mut self, mut out: Decision, reason: &'static str) -> Decision {
+		let n = self.loss_hist.len().max(1) as f32;
+		let mean_loss = self.loss_hist.iter().map(|x| x.1).sum::<f32>() / n;
+		let restore = self.loss_hist.iter().map(|x| x.2).max().unwrap_or(self.target).min(self.cap);
+		self.non_responsive = true;
+		self.over = 0;
+		self.loss_cut = None;
+		self.soft_limit = None;
+		self.soft_loss_at = None;
+		self.noise_loss = self.noise_loss.max(mean_loss.min(LOSS_SEVERE * 2.0));
+		self.noise_ok_rate = self.noise_ok_rate.max(restore);
+		self.ceiling = self.ceiling.max(restore).min(self.cap);
+		if self.bad_rate != 0 && self.bad_rate <= restore {
+			self.bad_rate = 0;
+		}
+		if restore > self.target {
+			self.apply_rate(restore, &mut out);
+			out.reason = "loss doesn't follow the rate (flat link) — random loss, rate restored";
+		} else {
+			out.reason = reason;
+		}
 		self.finish(out)
 	}
 
@@ -3130,6 +3262,53 @@ mod tests {
 
 	/// Random loss that doesn't follow the rate: judged non-congestive after one cut, the
 	/// cut undone; the flag clears once the loss goes away.
+	/// 2026-11-12 field case (a friend on a 100/50 Mbit line, P2P, 14 ms): pre-repair loss
+	/// swung 2 → 36 % window to window at EVERY rate (13 Mbit and 0.4 Mbit alike) while the
+	/// RTT stayed flat at ~20 ms — random loss (Wi-Fi / the line), not a queue. The rate was
+	/// halved on each severe burst ("confirmed" by the loss itself) and the next, luckier
+	/// window read as "the cut worked": 13 → 0.35 Mbit in seven minutes, 1080p30 at ~15 fps.
+	/// Loss that doesn't follow the rate on a flat link must not ratchet the rate down.
+	#[test]
+	fn bursty_random_loss_on_a_flat_link_keeps_the_rate() {
+		// The session's per-window pre-repair loss (%), in order (host log, 17:31–17:43).
+		const FIELD: [u32; 40] = [
+			6, 20, 8, 12, 24, 3, 5, 5, 4, 11, 12, 11, 7, 9, 5, 8, 9, 3, 17, 17, 36, 27, 31, 11, 10, 2, 2, 4, 4, 22,
+			12, 3, 9, 13, 4, 2, 6, 6, 11, 25,
+		];
+		let mut c = Controller::new(cfg(20_000, false));
+		let mut reasons = Vec::new();
+		let mut low = u32::MAX;
+		for w in 0..240usize {
+			let raw = FIELD[w % FIELD.len()];
+			let p = pkts(&c).max(50);
+			let dropped = p * raw / 100;
+			// FEC + NACK repair most of it; what is left is a fifth of the raw loss.
+			let lost = dropped / 5;
+			let repaired = dropped - lost;
+			let rtt = if w % 7 == 3 { 34.0 } else { 20.0 + (w % 5) as f32 };
+			let s = Sample {
+				recv: p - lost,
+				lost,
+				rtt_ms: vec![rtt, 20.0, rtt, 21.0],
+				nack_sent: repaired,
+				nack_ok: repaired,
+				recv_bytes: (p - lost) as u64 * 1100,
+				window_ms: 2000,
+				..Default::default()
+			};
+			let d = c.tick(&s);
+			if !d.reason.is_empty() {
+				reasons.push(format!("{w}: {} → {}", d.reason, c.target_kbps()));
+			}
+			if w >= 60 {
+				low = low.min(c.target_kbps());
+			}
+		}
+		let tail: Vec<_> = reasons.iter().rev().take(12).collect();
+		assert!(c.target_kbps() >= 12_000, "rate collapsed to {} — {tail:?}", c.target_kbps());
+		assert!(low >= 8_000, "dipped to {low} after the first two minutes — {tail:?}");
+	}
+
 	#[test]
 	fn non_responsive_loss_is_learned_and_the_cut_undone() {
 		let mut c = Controller::new(cfg(8_000, false));
