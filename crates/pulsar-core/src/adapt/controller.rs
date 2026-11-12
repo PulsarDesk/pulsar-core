@@ -115,8 +115,10 @@ pub const LOSS_HIST_MIN: usize = 10;
 /// The history's high-rate half must run at least this much faster than its low-rate half
 /// for the comparison to say anything.
 pub const LOSS_HIST_RATE_SPREAD: f32 = 1.15;
-/// "Follows the rate": the low-rate half lost under this share of the high-rate half.
+/// "Follows the rate": the low-rate half lost under this share of the high-rate half, or at
+/// least this many points less (a policer's overflow over a big random floor).
 pub const LOSS_FOLLOW_SHARE: f32 = 0.6;
+pub const LOSS_FOLLOW_ABS: f32 = 0.04;
 /// How long a "random loss" verdict outlives the last lossy window judged by it (2 min).
 pub const RANDOM_HOLD_WINDOWS: u32 = 60;
 /// RTT excess (ms) under which the link counts as unqueued (climb allowed).
@@ -1659,8 +1661,9 @@ impl Controller {
 	/// Does the pre-repair loss follow the rate? Over the last `LOSS_HIST` measured, unqueued
 	/// windows sorted by send rate: `None` = can't tell (too few windows, the rate hardly
 	/// varied, or too little loss to judge); `Some(true)` = the low-rate half lost clearly less
-	/// (under `LOSS_FOLLOW_SHARE` of the high-rate half) — congestion / a policer; `Some(false)` =
-	/// about as much at the lower rates — random loss the rate doesn't cause.
+	/// (under `LOSS_FOLLOW_SHARE` of the high-rate half, or `LOSS_FOLLOW_ABS` points less) —
+	/// congestion / a policer; `Some(false)` = about as much, and real loss, at the lower rates
+	/// too — random loss the rate doesn't cause.
 	fn loss_follows_rate(&self) -> Option<bool> {
 		if self.loss_hist.len() < LOSS_HIST_MIN {
 			return None;
@@ -1677,7 +1680,14 @@ impl Controller {
 		if hi_loss < LOSS_DOWN {
 			return None;
 		}
-		Some(lo_loss < hi_loss * LOSS_FOLLOW_SHARE)
+		// Follows: the low-rate half lost clearly less — relatively (a clean policer: little loss
+		// under its rate) or by `LOSS_FOLLOW_ABS` points (a policer's overflow on top of a large
+		// random floor: 35 % under it, 47 % over). Random needs loss at the low rates too.
+		let follows = lo_loss < hi_loss * LOSS_FOLLOW_SHARE || hi_loss - lo_loss >= LOSS_FOLLOW_ABS;
+		if !follows && lo_loss < LOSS_DOWN {
+			return None;
+		}
+		Some(follows)
 	}
 
 	/// The loss is random (doesn't follow the rate): judged so now, or judged so earlier and
@@ -1696,12 +1706,25 @@ impl Controller {
 			}
 			// Still lossy, still unqueued, still no sign the loss follows the rate: the verdict
 			// stands for another `RANDOM_HOLD_WINDOWS` (it ends on a queue or a `Some(true)`).
-			None if self.windows <= self.random_until => {
+			// …as long as the path stays lossy: a mostly clean history (a policer the rate now
+			// sits under) is not a random-loss path any more.
+			None if self.windows <= self.random_until && self.hist_loss() >= LOSS_DOWN => {
 				self.random_until = self.windows + RANDOM_HOLD_WINDOWS;
 				true
 			}
-			None => false,
+			None => {
+				self.random_until = 0;
+				false
+			}
 		}
+	}
+
+	/// Mean pre-repair loss over the rate-vs-loss history (0 when empty).
+	fn hist_loss(&self) -> f32 {
+		if self.loss_hist.is_empty() {
+			return 0.0;
+		}
+		self.loss_hist.iter().map(|x| x.1).sum::<f32>() / self.loss_hist.len() as f32
 	}
 
 	/// Random loss on a flat link (`random_loss`): don't cut — a lower rate
