@@ -546,6 +546,7 @@ enum DataMsgWire {
 		reason: String,
 	},
 	HostPointer { active: bool, x: f32, y: f32 },
+	Displays(Vec<DisplayInfo>),
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -590,6 +591,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::Unpair => DataMsg::Unpair,
 			DataMsgWire::PairResult { paired, reason } => DataMsg::PairResult { paired, reason },
 			DataMsgWire::HostPointer { active, x, y } => DataMsg::HostPointer { active, x, y },
+			DataMsgWire::Displays(d) => DataMsg::Displays(d),
 		}
 	}
 }
@@ -819,6 +821,13 @@ pub enum DataMsg {
 	/// The client draws that pointer labelled "Host" next to its own one. Appended for
 	/// additive wire compat (an old client ignores the unknown variant).
 	HostPointer { active: bool, x: f32, y: f32 },
+	/// Host → client: the host's monitor list changed mid-session (a monitor plugged in or
+	/// removed, a resolution / refresh / primary change) — the same list as
+	/// [`StreamCaps::displays`], which the client otherwise only gets once at connect. The
+	/// client refreshes its monitor picker; the streamed monitor is unaffected (capture
+	/// handles its own monitor going away). Sent on each change (event-driven on Windows).
+	/// Appended for additive wire compat (an old client ignores the unknown variant).
+	Displays(Vec<DisplayInfo>),
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1254,6 +1263,16 @@ mod tests {
 			DataMsg::PairResult { paired: false, reason: "denied".into() },
 			DataMsg::HostPointer { active: true, x: 0.25, y: 0.75 },
 			DataMsg::HostPointer { active: false, x: 0.0, y: 0.0 },
+			DataMsg::Displays(vec![DisplayInfo {
+				idx: 1,
+				name: "DISPLAY2".into(),
+				width: 2560,
+				height: 1440,
+				primary: false,
+				modes: vec![(2560, 1440), (1920, 1080)],
+				refresh_hz: 144,
+			}]),
+			DataMsg::Displays(vec![]),
 		];
 
 		for msg in cases {
