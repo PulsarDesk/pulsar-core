@@ -29,6 +29,12 @@ use pulsar_proto::{decode, encode, DeviceId};
 pub const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 71, 21);
 pub const DISCOVERY_PORT: u16 = 21117;
 
+/// Safety net for the network-change rejoin (see `rejoin_loop`): also rejoin this often, for
+/// platforms without a watcher and for a missed event.
+const REJOIN_FALLBACK: Duration = Duration::from_secs(30);
+/// Let a burst of change events (adapter up + address added + route…) settle into one rejoin.
+const REJOIN_SETTLE: Duration = Duration::from_millis(400);
+
 /// How often we re-announce ourselves.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
 /// Forget a peer we haven't heard from in this long (≈ a few missed announces).
@@ -121,8 +127,8 @@ pub struct Discovery {
 	group: SocketAddr,
 	/// Every real LAN NIC. We multicast the beacon out of EACH (not just the OS default
 	/// multicast interface, which on a multi-homed machine is often a dead APIPA/virtual
-	/// adapter), so peers on any reachable NIC hear us.
-	ifaces: Vec<Ipv4Addr>,
+	/// adapter), so peers on any reachable NIC hear us. Refreshed on every network change.
+	ifaces: std::sync::Mutex<Vec<Ipv4Addr>>,
 	inner: Mutex<Inner>,
 	cancel: Arc<Notify>,
 	/// When true the beacon stops ANNOUNCING (broadcasting) itself — set while this device
@@ -167,7 +173,7 @@ impl Discovery {
 		let disc = Arc::new(Self {
 			sock: sock.clone(),
 			group: SocketAddr::V4(SocketAddrV4::new(group, port)),
-			ifaces,
+			ifaces: std::sync::Mutex::new(ifaces),
 			inner: Mutex::new(Inner {
 				announce,
 				peers: HashMap::new(),
@@ -177,6 +183,7 @@ impl Discovery {
 		});
 		tokio::spawn(announce_loop(Arc::downgrade(&disc), disc.cancel.clone()));
 		tokio::spawn(recv_loop(Arc::downgrade(&disc), disc.cancel.clone(), sock));
+		tokio::spawn(rejoin_loop(Arc::downgrade(&disc), disc.cancel.clone()));
 		Ok(disc)
 	}
 
@@ -223,8 +230,9 @@ impl Discovery {
 			return;
 		}
 		let bytes = encode(&self.inner.lock().await.announce);
+		let ifaces = self.ifaces.lock().unwrap().clone();
 		// No enumerable NIC → fall back to the OS default multicast interface.
-		if self.ifaces.is_empty() {
+		if ifaces.is_empty() {
 			let _ = self.sock.send_to(&bytes, self.group).await;
 			return;
 		}
@@ -232,11 +240,32 @@ impl Discovery {
 		// socket2 socket keeps this off the shared recv socket (whose multicast_if we'd otherwise
 		// race). Peers dedup by nonce, so a host on two NICs of the same LAN getting two copies is
 		// harmless. The cost is trivial at the 2 s announce cadence.
-		for ip in &self.ifaces {
+		for ip in &ifaces {
 			if let Ok(s) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
 				let _ = s.set_multicast_if_v4(ip);
 				let _ = s.send_to(&bytes, &self.group.into());
 			}
+		}
+	}
+
+	/// The network changed (or the fallback timer fired): join the group again on every NIC
+	/// there is now and refresh the send list. The OS drops a socket's memberships when an
+	/// adapter goes down (sleep, Wi-Fi reconnect, VPN restart) and never restores them, so
+	/// without this the node goes deaf to the LAN until restart. Leave + join per NIC: a
+	/// membership that survived is renewed, a dropped one comes back; the join comes last, so
+	/// every NIC ends joined.
+	fn rejoin(&self) {
+		let SocketAddr::V4(g) = self.group else { return };
+		let group = *g.ip();
+		let now = lan_ifaces_v4();
+		for ip in std::iter::once(Ipv4Addr::UNSPECIFIED).chain(now.iter().copied()) {
+			let _ = self.sock.leave_multicast_v4(group, ip);
+			let _ = self.sock.join_multicast_v4(group, ip);
+		}
+		let mut cur = self.ifaces.lock().unwrap();
+		if *cur != now {
+			tracing::info!(ifaces = ?now, "LAN discovery: network changed, group rejoined");
+			*cur = now;
 		}
 	}
 
@@ -410,6 +439,32 @@ async fn announce_loop(disc: Weak<Discovery>, cancel: Arc<Notify>) {
 	}
 }
 
+/// Rejoin the multicast group as soon as the network changes (see `Discovery::rejoin`), then
+/// announce at once so peers see us again without waiting for the next beacon tick.
+async fn rejoin_loop(disc: Weak<Discovery>, cancel: Arc<Notify>) {
+	let mut changes = crate::netwatch::subscribe();
+	changes.borrow_and_update();
+	let mut fallback = tokio::time::interval(REJOIN_FALLBACK);
+	fallback.tick().await; // the first tick fires at once; the socket was just joined
+	loop {
+		tokio::select! {
+			_ = cancel.notified() => return,
+			r = changes.changed() => {
+				if r.is_err() {
+					// Watcher gone (never happens: the sender is a static) — fallback only.
+					std::future::pending::<()>().await;
+				}
+				tokio::time::sleep(REJOIN_SETTLE).await;
+				changes.borrow_and_update();
+			}
+			_ = fallback.tick() => {}
+		}
+		let Some(d) = disc.upgrade() else { return };
+		d.rejoin();
+		d.send_announce().await;
+	}
+}
+
 async fn recv_loop(disc: Weak<Discovery>, cancel: Arc<Notify>, sock: Arc<UdpSocket>) {
 	let mut buf = vec![0u8; 2048];
 	loop {
@@ -525,6 +580,22 @@ mod tests {
 
 		// A never lists itself.
 		assert!(a.peers().await.iter().all(|p| p.name != "Alice"));
+
+		// A network-change rejoin (leave + join on every NIC) keeps A hearing B: B's next
+		// beacons (every 2 s) still arrive afterwards.
+		a.rejoin();
+		a.rejoin();
+		let seen = |v: Vec<DiscoveredPeer>| v.into_iter().find(|p| p.name == "Bob").map(|p| p.last_seen);
+		let before = seen(a.peers().await).expect("B listed");
+		let mut fresh = false;
+		for _ in 0..40 {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			if seen(a.peers().await).is_some_and(|t| t > before) {
+				fresh = true;
+				break;
+			}
+		}
+		assert!(fresh, "A must still receive B's beacons after a rejoin");
 	}
 }
 

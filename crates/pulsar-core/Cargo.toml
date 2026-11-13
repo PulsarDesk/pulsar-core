@@ -71,6 +71,8 @@ windows-sys = { version = "0.61", features = [
 	"Win32_Graphics_Gdi",
 	# GetBestRoute: the default gateway, asked for a NAT-PMP port mapping (connection/portmap.rs).
 	"Win32_NetworkManagement_IpHelper",
+	# netwatch.rs: NotifyIpInterfaceChange's MIB_IPINTERFACE_ROW carries a NET_LUID.
+	"Win32_NetworkManagement_Ndis",
 	"Win32_Networking_WinSock",
 	# input/duo.rs: load Duo's DuoController.dll, find its install dir + HID-isolation flag,
 	# tell a Duo/RDP seat from the console session.
@@ -132,6 +134,8 @@ windows-core = "0.62"
 # our min macOS is well past 10.13, so it's always available.
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
+# netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }

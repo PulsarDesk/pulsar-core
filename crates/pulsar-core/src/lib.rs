@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod input;
 pub mod media;
+pub mod netwatch;
 pub mod pipeline;
 pub mod service;
 pub mod totp;
