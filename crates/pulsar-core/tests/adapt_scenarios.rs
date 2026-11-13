@@ -1036,3 +1036,13 @@ fn a_thin_link_steps_to_the_last_resort_rung() {
 		}
 	}
 }
+
+/// The last-resort rung is never where a session STARTS: the cautious start rate sits under
+/// remote 1080p30's pick margin, and must not open the session at 720p30.
+#[test]
+fn a_session_does_not_start_on_the_last_resort_rung() {
+	for game in [false, true] {
+		let ctl = floored(game, true);
+		assert_ne!(ctl.point().label(), "720p30", "game={game}");
+	}
+}

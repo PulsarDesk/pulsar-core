@@ -691,6 +691,22 @@ fn build_points(cfg: &Config, pin_res: Option<(u32, u32)>, pin_fps: Option<u32>)
 	points
 }
 
+/// `ladder::pick`, but never the last-resort rung (`Config::last_resort`): a start or a
+/// ladder rebuild lands on the cheapest floored rung, and only a measured shortfall there
+/// (the normal step down) reaches the last resort. 2026-11-13: the cautious start (~1.9 Mbit)
+/// under remote 1080p30's pick margin opened every session at 720p30 for a minute.
+fn pick_without_last_resort(cfg: &Config, points: &[Point], rate: u32) -> usize {
+	let i = ladder::pick(points, rate, POINT_MARGIN);
+	if cfg.last_resort.is_some() && points.len() >= 2 && i == points.len() - 1 {
+		let last = points[i];
+		let (h, f) = cfg.last_resort.unwrap_or_default();
+		if last.height <= h && last.fps <= f {
+			return i - 1;
+		}
+	}
+	i
+}
+
 impl Controller {
 	pub fn new(cfg: Config) -> Self {
 		let cap = cfg.cap_kbps.max(FLOOR_KBPS);
@@ -702,7 +718,7 @@ impl Controller {
 			cfg.start_kbps.clamp(FLOOR_KBPS, cap)
 		};
 		let points = build_points(&cfg, None, None);
-		let point_idx = if cfg.ladder { ladder::pick(&points, start, POINT_MARGIN) } else { 0 };
+		let point_idx = if cfg.ladder { pick_without_last_resort(&cfg, &points, start) } else { 0 };
 		let mut c = Self {
 			target: start,
 			cap,
@@ -1045,7 +1061,7 @@ impl Controller {
 		self.point_cap = 0;
 		self.at_point_cap = 0;
 		self.point_up = None;
-		self.point_idx = if self.cfg.ladder { ladder::pick(&self.points, self.want, POINT_MARGIN) } else { 0 };
+		self.point_idx = if self.cfg.ladder { pick_without_last_resort(&self.cfg, &self.points, self.want) } else { 0 };
 		self.point_age = 0;
 		self.clean_at_point = 0;
 		self.point_short = 0;
