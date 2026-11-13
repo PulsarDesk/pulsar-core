@@ -490,15 +490,23 @@ fn rs_data_shard(pkt: &[u8], shard_len: usize) -> Vec<u8> {
 /// Build the parity datagrams for one block of consecutive packets (`base_seq` = the first
 /// one's sequence number) at `ratio` (parity/data). Empty for an empty block or `ratio ≤ 0`.
 pub fn rs_parity_frames(base_seq: u16, pkts: &[&[u8]], ratio: f32) -> Vec<Vec<u8>> {
+	if ratio <= 0.0 {
+		return Vec::new();
+	}
+	rs_parity_frames_m(base_seq, pkts, (pkts.len() as f32 * ratio).ceil() as usize)
+}
+
+/// [`rs_parity_frames`] with an explicit parity count `m` (≥ 1; clamped to the field size).
+pub fn rs_parity_frames_m(base_seq: u16, pkts: &[&[u8]], m: usize) -> Vec<Vec<u8>> {
 	let k = pkts.len();
-	if k == 0 || k > RS_MAX_DATA || ratio <= 0.0 {
+	if k == 0 || k > RS_MAX_DATA || m == 0 {
 		return Vec::new();
 	}
 	let max = pkts.iter().map(|p| p.len()).max().unwrap_or(0);
 	if max == 0 || max > FEC_MAX_PACKET {
 		return Vec::new();
 	}
-	let m = ((k as f32 * ratio).ceil() as usize).clamp(1, 255 - k);
+	let m = m.clamp(1, 255 - k);
 	let shard_len = max + 2;
 	let mut shards: Vec<Vec<u8>> = pkts.iter().map(|p| rs_data_shard(p, shard_len)).collect();
 	shards.extend((0..m).map(|_| vec![0u8; shard_len]));
@@ -553,17 +561,46 @@ pub struct RsFecEncoder {
 	closed: bool,
 	/// Multi-frame blocks for small frames (on by default; `per_frame` turns it off).
 	grouping: bool,
+	/// Parity owed but not yet sent (fractional shards): a block's `k × ratio` adds to it and
+	/// each whole shard is sent, so the AVERAGE overhead is the ratio even when blocks stay
+	/// small. 2026-11-13, a 2.5 Mbit link at 30 fps: frames 33 ms apart can't group (25 ms
+	/// span), so every 1-2 packet frame got `ceil` = 1 shard — 50-100 % parity, the encoder
+	/// share halved, the rate collapsed. A block worth less than one whole shard now adds to
+	/// this credit and only gets its shard once the credit holds one (NACK covers the others).
+	/// Only with `use_credit` ([`with_parity_credit`](Self::with_parity_credit)); off, every
+	/// block gets at least one shard (the original behaviour).
+	credit: f32,
+	use_credit: bool,
 }
 
 impl Default for RsFecEncoder {
 	fn default() -> Self {
-		Self { ratio: 0.0, group: Vec::new(), base: 0, next: None, cur_ts: None, first_ts: 0, frames: 0, closed: false, grouping: true }
+		Self {
+			ratio: 0.0,
+			group: Vec::new(),
+			base: 0,
+			next: None,
+			cur_ts: None,
+			first_ts: 0,
+			frames: 0,
+			closed: false,
+			grouping: true,
+			credit: 0.0,
+			use_credit: false,
+		}
 	}
 }
 
 impl RsFecEncoder {
 	pub fn new(ratio: f32) -> Self {
 		Self { ratio: ratio.max(0.0), ..Default::default() }
+	}
+
+	/// Average the parity of blocks too small for a whole shard (see `credit`) instead of
+	/// giving each its own: the overhead stays at the ratio on a low-bitrate stream.
+	pub fn with_parity_credit(mut self) -> Self {
+		self.use_credit = true;
+		self
 	}
 
 	/// The strict one-block-per-frame encoder (no multi-frame blocks for small frames).
@@ -619,7 +656,23 @@ impl RsFecEncoder {
 		let group = std::mem::take(&mut self.group);
 		for chunk in group.chunks(RS_MAX_DATA) {
 			let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
-			out.extend(rs_parity_frames(base, &refs, self.ratio));
+			// A block worth at least one whole shard keeps `ceil(k × ratio)`. A smaller one adds
+			// its share to the credit and gets its single shard only once the credit holds one.
+			let want = chunk.len() as f32 * self.ratio;
+			let m = if want >= 1.0 || !self.use_credit {
+				(want.ceil() as usize).max(1)
+			} else {
+				self.credit += want;
+				if self.credit >= 1.0 {
+					self.credit -= 1.0;
+					1
+				} else {
+					0
+				}
+			};
+			if m > 0 {
+				out.extend(rs_parity_frames_m(base, &refs, m));
+			}
 			base = base.wrapping_add(chunk.len() as u16);
 		}
 		out
@@ -1120,6 +1173,31 @@ mod rs_fec_tests {
 		assert_eq!(blocks, 4);
 		let got: Vec<u16> = rebuilt.iter().map(|(s, _)| s - 60_000).collect();
 		assert_eq!(got, vec![2, 6, 10, 14]);
+	}
+
+	#[test]
+	fn parity_credit_keeps_small_blocks_at_the_ratio() {
+		// 30 fps one-packet frames (33 ms apart: too far to group) at 25 %: without the credit
+		// each frame gets a whole shard (100 %), with it one in four does.
+		let run = |mut enc: RsFecEncoder| {
+			let mut parity = 0;
+			for f in 0..40u16 {
+				parity += enc.push(f, &rtp(f, f as u32 * 3000, true, 200)).len();
+			}
+			parity += enc.flush_pending().len();
+			parity
+		};
+		assert_eq!(run(RsFecEncoder::new(0.25)), 40, "without the credit: one shard per frame");
+		let with = run(RsFecEncoder::new(0.25).with_parity_credit());
+		assert!((9..=11).contains(&with), "with the credit ≈ 25 %: {with}");
+		// Big blocks are unchanged: 8 packets × 25 % = 2 shards either way.
+		let mut enc = RsFecEncoder::new(0.25).with_parity_credit();
+		let mut n = 0;
+		for i in 0..8u16 {
+			n += enc.push(i, &rtp(i, 9000, i == 7, 900)).len();
+		}
+		n += enc.flush_pending().len();
+		assert_eq!(n, 2);
 	}
 
 	#[test]

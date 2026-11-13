@@ -341,6 +341,12 @@ pub struct Config {
 	/// Scale for every rung's minimum bitrate (1.0 = the game-content reference table).
 	/// Desktop content is mostly static and needs far fewer bits for the same look.
 	pub min_kbps_scale: f32,
+	/// A last-resort rung UNDER the floors: when the budget no longer covers the cheapest
+	/// floored rung, step to this `(height, fps)` (e.g. 720p30) instead of starving the encoder
+	/// at the floor (2026-11-13: a 2 Mbit hotspot held remote 1080p30 at 300-900 kbit/s, blocky
+	/// and 10-15 fps). Picked only when the floored rungs don't fit; the normal climb lifts it
+	/// back. `None` = no such rung (the floors are the bottom).
+	pub last_resort: Option<(u32, u32)>,
 }
 
 impl Config {
@@ -356,6 +362,7 @@ impl Config {
 			min_height: 0,
 			min_fps: 0,
 			min_kbps_scale: 1.0,
+			last_resort: None,
 		}
 	}
 }
@@ -667,6 +674,19 @@ fn build_points(cfg: &Config, pin_res: Option<(u32, u32)>, pin_fps: Option<u32>)
 	points.dedup();
 	if points.is_empty() {
 		points.push(scale(ladder::point_at(cfg.codec, cfg.native.0.max(640), cfg.native.1.max(360), cfg.native.2.max(30))));
+	}
+	// The last-resort rung, at the ladder's aspect, when it is cheaper than every rung there.
+	if let (Some((h, f)), Some(top)) = (cfg.last_resort, points.first().copied()) {
+		let h = h.min(top.height);
+		let w = if h == top.height {
+			top.width
+		} else {
+			(((h as f64 * top.width as f64 / top.height.max(1) as f64 / 16.0).round() as u32) * 16).max(160)
+		};
+		let p = scale(ladder::point_at(cfg.codec, w, h, f.min(top.fps)));
+		if points.iter().all(|q| q.min_kbps > p.min_kbps) {
+			points.push(p);
+		}
 	}
 	points
 }
@@ -1308,8 +1328,12 @@ impl Controller {
 			&& self.since_step >= 1
 		{
 			let before = self.target;
-			let cut = if excess >= RTT_BAD_MS { before / 2 } else { before * 7 / 10 };
-			out.reason = if excess >= RTT_BAD_MS { "rtt bloat severe → halve" } else { "rtt bloat → ×0.7" };
+			// Halve only for a standing queue (bloat in the last window too) or one already
+			// overflowing (loss): a single severe window on a bursty radio / shaped path
+			// (2026-11-13: 4 ms ↔ 700 ms on a 2.5 Mbit link used at 0.5 Mbit) is a ×0.7.
+			let severe = excess >= RTT_BAD_MS && (queued_before || eff > LOSS_CLEAN);
+			let cut = if severe { before / 2 } else { before * 7 / 10 };
+			out.reason = if severe { "rtt bloat severe → halve" } else { "rtt bloat → ×0.7" };
 			self.queue_cut_now = true;
 			let _ = self.queue_cut(before, cut, true, &mut out);
 			return self.finish(out);
@@ -2479,11 +2503,13 @@ mod tests {
 			c.tick(&win(1500, 0, 20.0));
 		}
 		assert_eq!(c.point().label(), "1080p60");
-		let d = c.tick(&win(1500, 0, 160.0)); // severe bloat, zero loss
-		assert_eq!(d.bitrate, Some(6000), "{d:?}");
+		// One severe window without loss is a ×0.7 (a burst); the second in a row is a standing
+		// queue and halves.
 		let d = c.tick(&win(1500, 0, 160.0));
-		assert_eq!(d.bitrate, Some(3000), "{d:?}");
-		assert_eq!(c.point().label(), "720p30", "6000 → 1080p30 → 3000 → 720p30");
+		assert_eq!(d.bitrate, Some(8400), "{d:?}");
+		let d = c.tick(&win(1500, 0, 160.0));
+		assert_eq!(d.bitrate, Some(4200), "{d:?}");
+		assert_ne!(c.point().label(), "1080p60", "the ladder follows the cuts");
 	}
 
 	#[test]

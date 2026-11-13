@@ -995,3 +995,44 @@ fn trace_poor_link() {
 		);
 	}
 }
+
+/// The desktop app's floors for a session (see `play.rs`): remote holds 1080p (desktop-content
+/// minimums), game keeps 60 fps down to 720p; both step to 720p30 as a last resort.
+fn floored(game: bool, last_resort: bool) -> Controller {
+	let mut cfg = Config::new(VCodec::H265, 16_000);
+	cfg.native = (1920, 1200, 120);
+	cfg.ladder = true;
+	if game {
+		cfg.min_fps = 60;
+		cfg.min_height = 720;
+	} else {
+		cfg.min_height = 1080;
+		cfg.min_kbps_scale = 0.5;
+	}
+	if last_resort {
+		cfg.last_resort = Some((720, 30));
+	}
+	Controller::new(cfg)
+}
+
+/// 2026-11-13: a ~2 Mbit hotspot (deep queue) held remote 1080p30 / game 720p60 at a rate far
+/// under the rung's minimum — blocky, 10-15 fps. With the last-resort rung the ladder steps to
+/// 720p30 once the floored rungs no longer fit; without it the floor rung stays.
+#[test]
+fn a_thin_link_steps_to_the_last_resort_rung() {
+	for (game, cap) in [(false, 1_300u32), (true, 2_200)] {
+		for last_resort in [false, true] {
+			let mut ctl = floored(game, last_resort);
+			let mut path = Path::measured(Profile { name: "thin", capacity_kbps: cap, delay_ms: 25.0, loss: 0.0 }, 0.5);
+			for w in 0..90 {
+				path.step(&mut ctl, w);
+			}
+			let label = ctl.point().label();
+			if last_resort {
+				assert_eq!(label, "720p30", "game={game}: under the floor rung's minimum → 720p30");
+			} else {
+				assert_ne!(label, "720p30", "game={game}: no last resort → the floor rung stays");
+			}
+		}
+	}
+}
