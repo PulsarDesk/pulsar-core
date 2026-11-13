@@ -13,9 +13,10 @@
 //! before the next. The client stamps every probe packet's arrival ([`Meter`]); per train it
 //! gets the delivered rate (dispersion: bytes over the first-to-last arrival span), the loss,
 //! and the one-way delay growth across the train (host send stamps vs arrival times — the
-//! clock offset cancels). The path's rate is the highest train that arrived clean; at the
-//! first train that didn't, its delivered rate bounds the estimate from above
-//! ([`Meter::estimate`]).
+//! clock offset cancels). The path's rate is the highest train that arrived clean; where the
+//! trains stop arriving clean, what the path still delivered bounds the estimate from above
+//! ([`Meter::estimate`]). A train that failed while a FASTER one after it arrived clean met a
+//! stall, not the path's limit, and does not count (see [`verdict`]).
 //!
 //! Limits: a policer with a deep bucket (some carriers allow a few hundred KB) lets a short
 //! train through above its rate, so the estimate can read high — the trains are long enough
@@ -128,6 +129,26 @@ pub struct TrainStat {
 	pub clean: bool,
 }
 
+impl TrainStat {
+	/// A train's numbers with the verdict on it (`clean`).
+	fn judged(rate_kbps: u32, sent: u16, received: u16, delivered_kbps: u32, delay_growth_ms: f32) -> Self {
+		let loss = if sent == 0 { 1.0 } else { 1.0 - received.min(sent) as f32 / sent as f32 };
+		let clean = received as usize >= MIN_PACKETS
+			&& loss <= MAX_LOSS
+			&& (delivered_kbps == 0 || delivered_kbps as f32 >= KEPT_UP * rate_kbps as f32)
+			&& delay_growth_ms < CLEAN_DELAY_GROWTH_MS;
+		Self {
+			rate_kbps,
+			sent,
+			received: received.min(sent),
+			delivered_kbps,
+			loss,
+			delay_growth_ms,
+			clean,
+		}
+	}
+}
+
 /// The probe's verdict.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Estimate {
@@ -196,8 +217,6 @@ impl Meter {
 	}
 
 	fn stat(a: &Acc) -> TrainStat {
-		let received = (a.pkts.len() as u16).min(a.count);
-		let loss = if a.count == 0 { 1.0 } else { 1.0 - received as f32 / a.count as f32 };
 		// The rate comes from the train's second half (by send time): a policer's bucket — which
 		// refilled during the gap — lets the head of a train through above its rate (a 10 Mbit
 		// policer with a 60-packet bucket read 13.6 Mbit over a whole 150 ms train); by the
@@ -215,52 +234,63 @@ impl Meter {
 			(Some(&(s0, r0, _)), Some(&(s1, r1, _))) => ((r1 - r0) - (s1.wrapping_sub(s0) as f64 / 1000.0)) as f32,
 			_ => 0.0,
 		};
-		let clean = a.pkts.len() >= MIN_PACKETS
-			&& loss <= MAX_LOSS
-			&& (delivered_kbps == 0 || delivered_kbps as f32 >= KEPT_UP * a.rate_kbps as f32)
-			&& delay_growth_ms < CLEAN_DELAY_GROWTH_MS;
-		TrainStat {
-			rate_kbps: a.rate_kbps,
-			sent: a.count,
-			received,
-			delivered_kbps,
-			loss,
-			delay_growth_ms,
-			clean,
-		}
+		TrainStat::judged(a.rate_kbps, a.count, a.pkts.len().min(u16::MAX as usize) as u16, delivered_kbps, delay_growth_ms)
 	}
 
 	/// The verdict, `None` when nothing usable came back (no host answer / everything lost).
-	///
-	/// Walk the trains in order: every clean one raises the floor to its rate. The first one
-	/// that is NOT clean ends the walk: its (tail) delivered rate is what the bottleneck let
-	/// through while overloaded — a shaper drains at its rate, a policer passes its rate — so
-	/// that is the estimate, never over the train's own rate. A QUEUE (delay grew) keeps the
-	/// last clean rate as a floor: a deep queue can stretch the span below the real rate. A
-	/// policer (loss, no queue) does not: its bucket can carry a smaller train through whole
-	/// above its rate (a 3 Mbit policer passed a 5 Mbit train), so that "clean" rate is no
-	/// floor. All clean = at least the top rate.
+	/// See [`verdict`].
 	pub fn estimate(&self) -> Option<Estimate> {
-		let trains: Vec<TrainStat> = self.trains.iter().filter(|a| a.count > 0).map(Self::stat).collect();
-		if trains.is_empty() {
+		verdict(self.trains.iter().filter(|a| a.count > 0).map(Self::stat).collect())
+	}
+}
+
+/// The path's rate from the trains, in the order they were sent (rising rates).
+///
+/// Walk them: every clean one raises the floor to its rate.
+///
+/// A train that is NOT clean while a later one at its rate or above IS clean met a stall, not
+/// the path's limit — at a real limit every faster train queues or loses more, never less. It
+/// is skipped. (2026-11-13, a laptop on Wi-Fi a few metres from its access point: the first
+/// train of a session arrived 79 ms late — the station's radio was asleep or off-channel when
+/// the session opened — while the 5, 10, 20 and 21 Mbit trains after it arrived whole. The
+/// estimate read 1.9 Mbit, and the stream started at 1080p30 on a 20 Mbit path.)
+///
+/// From the first train that no later one overrules, the path is past its limit, and what it
+/// still delivered is the estimate: the HIGHEST (tail) delivered rate among these trains, none
+/// counted above its own rate. A shaper drains at its rate and a policer passes its rate
+/// whatever the train asked for, so at a real limit they all read the same; where the trains
+/// were stretched by stalls instead (the same Wi-Fi: every train's tail 77 ms late at ANY
+/// rate, 2.1 Mbit delivered of 2.5 and 8.4 of 20), the first one only says how small it was.
+/// A QUEUE (delay grew) keeps the last clean rate as a floor: a deep queue can stretch the
+/// span below the real rate. A policer (loss, no queue) does not: its bucket can carry a
+/// smaller train through whole above its rate (a 3 Mbit policer passed a 5 Mbit train), so
+/// that "clean" rate is no floor. All clean (or overruled) = at least the top clean rate.
+pub fn verdict(trains: Vec<TrainStat>) -> Option<Estimate> {
+	if trains.is_empty() {
+		return None;
+	}
+	let mut floor = 0u32;
+	for (i, t) in trains.iter().enumerate() {
+		if t.clean {
+			floor = floor.max(t.rate_kbps);
+			continue;
+		}
+		if trains[i + 1..].iter().any(|l| l.clean && l.rate_kbps >= t.rate_kbps) {
+			continue;
+		}
+		let queued = t.delay_growth_ms >= CLEAN_DELAY_GROWTH_MS;
+		let delivered = trains[i..].iter().map(|l| l.delivered_kbps.min(l.rate_kbps)).max().unwrap_or(0);
+		let delivered = if delivered > 0 { delivered } else { floor };
+		let kbps = if queued { delivered.max(floor) } else { delivered };
+		if kbps == 0 {
 			return None;
 		}
-		let mut floor = 0u32;
-		for t in &trains {
-			if t.clean {
-				floor = floor.max(t.rate_kbps);
-				continue;
-			}
-			let queued = t.delay_growth_ms >= CLEAN_DELAY_GROWTH_MS;
-			let delivered = if t.delivered_kbps > 0 { t.delivered_kbps } else { floor };
-			let kbps = if queued { delivered.max(floor) } else { delivered }.min(t.rate_kbps);
-			if kbps == 0 {
-				return None;
-			}
-			return Some(Estimate { kbps, at_least: false, trains });
-		}
-		Some(Estimate { kbps: floor, at_least: true, trains })
+		return Some(Estimate { kbps, at_least: false, trains });
 	}
+	if floor == 0 {
+		return None;
+	}
+	Some(Estimate { kbps: floor, at_least: true, trains })
 }
 
 #[cfg(test)]
@@ -375,6 +405,85 @@ mod tests {
 	#[test]
 	fn nothing_back_is_no_estimate() {
 		assert_eq!(Meter::new().estimate(), None);
+	}
+
+	/// `(rate, delivered, delay growth ms)` per train, no loss — as the client logs them.
+	fn logged(trains: &[(u32, u32, f32)]) -> Vec<TrainStat> {
+		trains
+			.iter()
+			.map(|&(rate, delivered, growth)| {
+				let n = train_packets(rate, TRAIN_MS);
+				TrainStat::judged(rate, n, n, delivered, growth)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn a_stall_on_the_first_train_is_not_the_paths_limit() {
+		// 2026-11-13 20:19:30, LAN Wi-Fi: the old walk stopped at the first train → 1.9 Mbit.
+		let e = verdict(logged(&[
+			(2_500, 1_943, 79.0),
+			(5_000, 4_966, -16.0),
+			(10_000, 10_015, 0.0),
+			(20_000, 20_289, -2.0),
+			(21_021, 21_730, 0.0),
+		]))
+		.unwrap();
+		assert!(e.at_least, "{e:?}");
+		assert_eq!(e.kbps, 21_021);
+		// Two stalled trains, then the path shows itself (19:08:12: read 1.3 Mbit).
+		let e = verdict(logged(&[
+			(2_500, 1_281, 91.0),
+			(5_000, 2_046, 78.0),
+			(10_000, 10_242, -46.0),
+			(20_000, 20_317, -63.0),
+			(21_021, 23_793, -83.0),
+		]))
+		.unwrap();
+		assert!(e.at_least && e.kbps == 21_021, "{e:?}");
+	}
+
+	#[test]
+	fn a_stall_in_the_middle_is_skipped_too() {
+		// 18:02:30: the 10 Mbit train came up short, the 20 and 21 Mbit ones did not.
+		let e = verdict(logged(&[
+			(2_500, 3_859, 0.0),
+			(5_000, 5_006, -7.0),
+			(10_000, 8_073, 14.0),
+			(20_000, 18_109, 8.0),
+			(21_021, 24_720, 2.0),
+		]))
+		.unwrap();
+		assert!(e.at_least && e.kbps == 21_021, "{e:?}");
+	}
+
+	#[test]
+	fn trains_stretched_by_stalls_read_what_the_path_delivered() {
+		// 19:25:52: every train's tail ~77 ms late at any rate. No capacity limit looks like
+		// that (the delay would grow with the rate, the delivered rate would not) — the old
+		// walk read 2.1 Mbit from the first train; the path delivered 8.4.
+		let e = verdict(logged(&[
+			(2_500, 2_154, 56.0),
+			(5_000, 2_520, 73.0),
+			(10_000, 4_703, 77.0),
+			(20_000, 8_396, 77.0),
+			(21_021, 8_238, 76.0),
+		]))
+		.unwrap();
+		assert!(!e.at_least, "{e:?}");
+		assert_eq!(e.kbps, 8_396);
+	}
+
+	#[test]
+	fn a_real_limit_is_still_read_at_the_first_train_past_it() {
+		// A 6 Mbit shaper: 2.5 and 5 pass, 10 / 20 drain at 6 with a growing queue.
+		let e = verdict(logged(&[(2_500, 2_600, 0.0), (5_000, 5_050, 1.0), (10_000, 6_010, 100.0), (20_000, 5_990, 350.0)])).unwrap();
+		assert!(!e.at_least, "{e:?}");
+		assert!((5_900..=6_100).contains(&e.kbps), "{e:?}");
+		// The last train alone comes up short (nothing after it to overrule it): the last
+		// clean rate holds as the floor.
+		let e = verdict(logged(&[(2_500, 2_600, 0.0), (5_000, 5_050, 1.0), (10_000, 10_010, 0.0), (20_000, 9_000, 77.0)])).unwrap();
+		assert!(!e.at_least && e.kbps == 10_000, "{e:?}");
 	}
 
 	#[test]
