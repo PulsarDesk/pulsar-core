@@ -127,6 +127,9 @@ pub const RTT_OK_MS: f32 = 25.0;
 pub const RTT_EXCESS_MS: f32 = 35.0;
 /// RTT excess that halves at once.
 pub const RTT_BAD_MS: f32 = 90.0;
+/// An encoder-rate change caused by the FEC share alone smaller than this (% of the current
+/// encoder rate) is not sent (see the end of `tick`).
+pub const FEC_ONLY_DEADBAND_PCT: u64 = 15;
 
 /// Consecutive clean windows at a point before the ladder steps up (20 s) — resolution /
 /// fps changes restart the encoder, so they stay unhurried.
@@ -1859,7 +1862,14 @@ impl Controller {
 		// The encoder share may change with FEC even when the target holds — and a point step
 		// moves the target to the new rung's floor after the rate was already decided.
 		let enc = self.encoder_rate();
-		if enc != self.encoder_kbps {
+		// A change from the FEC share ALONE (no rate or point decision this window) only goes
+		// to the encoder when it is large: the host turning a ~10 % parity on and off retuned
+		// the encoder every few seconds (2026-11-13: 1806 ↔ 1633 kbit/s, a live bitrate change
+		// each time — a visible quality pulse on Media Foundation / AMF). The wire runs a few %
+		// over the target meanwhile, inside the budget margins.
+		let fec_only = out.bitrate.is_none() && out.reason.is_empty() && out.point.is_none();
+		let small = enc.abs_diff(self.encoder_kbps) as u64 * 100 < self.encoder_kbps as u64 * FEC_ONLY_DEADBAND_PCT;
+		if enc != self.encoder_kbps && !(fec_only && small) {
 			self.encoder_kbps = enc;
 			if out.bitrate.is_none() && out.reason.is_empty() {
 				out.reason = "fec share changed";
@@ -2570,10 +2580,12 @@ mod tests {
 	fn fec_share_is_deducted_from_the_encoder_rate() {
 		let mut c = Controller::new(cfg(8000, true));
 		assert_eq!(c.encoder_kbps(), 8000);
+		// A small share (1/16 = 6 %) alone doesn't retune the encoder (`FEC_ONLY_DEADBAND_PCT`).
 		c.set_fec_n(16);
 		let d = c.tick(&win(1000, 0, 20.0));
-		assert_eq!(d.bitrate, Some(7529), "8000 × 16/17: {d:?}");
+		assert_eq!(d.bitrate, None, "a 6 % share alone is under the deadband: {d:?}");
 		assert_eq!(c.target_kbps(), 8000, "the wire target is unchanged");
+		// A large one does.
 		c.set_fec_overhead(0.25);
 		let d = c.tick(&win(1000, 0, 20.0));
 		assert_eq!(d.bitrate, Some(6400), "8000 / 1.25: {d:?}");
