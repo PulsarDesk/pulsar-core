@@ -582,6 +582,21 @@ fn apply_fps_floor(points: &mut Vec<Point>, cfg: &Config, scale: &dyn Fn(Point) 
 	points.dedup();
 }
 
+/// A pinned `w × h` for this session's monitor: the native size when the pick is as large or
+/// larger, else the pick's height at the native aspect (width rounded to 16). `top` is the
+/// ladder's top rung (the native size) when `cfg.native` is unknown.
+fn fit_pin(cfg: &Config, top: (u32, u32), w: u32, h: u32) -> (u32, u32) {
+	let (nw, nh) = if cfg.native.0 > 0 && cfg.native.1 > 0 { (cfg.native.0, cfg.native.1) } else { top };
+	if nw == 0 || nh == 0 {
+		return (w, h);
+	}
+	if h >= nh || w >= nw {
+		return (nw, nh);
+	}
+	let width = (((h as f64 * nw as f64 / nh as f64 / 16.0).round() as u32) * 16).clamp(160, nw);
+	(width, h)
+}
+
 /// The soft-pinned ladder (see `build_points`): the pick on top, then the chain under it,
 /// built from `full` (the session's floored ladder) where it has the rung, otherwise from
 /// `ladder::point_at` (a display mode that isn't a rung gets its own rungs).
@@ -593,6 +608,10 @@ fn pinned_chain(
 	scale: &dyn Fn(Point) -> Point,
 ) -> Vec<Point> {
 	let Some(top) = full.first().copied() else { return Vec::new() };
+	// A pinned size never exceeds the captured monitor and keeps ITS aspect: a 2560x1440 pick
+	// carried over to a 1920x1200 monitor was streamed stretched to 16:9 (2026-11-13; the
+	// native-capture path ignored it, the ffmpeg path scaled to it).
+	let pin_res = pin_res.map(|(w, h)| fit_pin(cfg, (top.width, top.height), w, h));
 	let (rw, rh) = pin_res.unwrap_or((top.width, top.height));
 	let mut fps: Vec<u32> = full.iter().map(|p| p.fps).chain(pin_fps).collect();
 	fps.sort_unstable_by(|a, b| b.cmp(a));
@@ -2958,9 +2977,16 @@ mod tests {
 		let low = *at_fps.last().unwrap();
 		assert!(pts[at_fps.len()..].iter().all(|p| p.height == low && p.fps < 120), "then the fps: {pts:?}");
 		// A display mode that isn't a rung gets its own rungs on top.
+		c.set_pins(Some((1680, 1050)), None);
+		assert_eq!(size(&c.points()[0]), (1680, 1050));
+		assert!(c.points().iter().all(|p| p.height <= 1050));
+		// A pick larger than the monitor (another monitor's 2560x1440) is the native size, not
+		// a stretched 16:9 picture.
 		c.set_pins(Some((2560, 1440)), None);
-		assert_eq!(size(&c.points()[0]), (2560, 1440));
-		assert!(c.points().iter().all(|p| p.height <= 1440));
+		assert_eq!(size(&c.points()[0]), (1920, 1200));
+		// A smaller pick of another aspect keeps the monitor's: 1280x720 → 1152x720 on 16:10.
+		c.set_pins(Some((1280, 720)), None);
+		assert_eq!(size(&c.points()[0]), (1152, 720));
 		c.set_pins(None, None);
 		assert!(c.points().len() > 6, "back to the full ladder");
 	}
