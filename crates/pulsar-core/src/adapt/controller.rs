@@ -130,6 +130,8 @@ pub const RTT_BAD_MS: f32 = 90.0;
 /// An encoder-rate change caused by the FEC share alone smaller than this (% of the current
 /// encoder rate) is not sent (see the end of `tick`).
 pub const FEC_ONLY_DEADBAND_PCT: u64 = 15;
+/// …nor when what arrives plus the parity stays under this share of the target.
+pub const FEC_ONLY_ROOM: f32 = 0.8;
 
 /// Consecutive clean windows at a point before the ladder steps up (20 s) — resolution /
 /// fps changes restart the encoder, so they stay unhurried.
@@ -1869,7 +1871,13 @@ impl Controller {
 		// over the target meanwhile, inside the budget margins.
 		let fec_only = out.bitrate.is_none() && out.reason.is_empty() && out.point.is_none();
 		let small = enc.abs_diff(self.encoder_kbps) as u64 * 100 < self.encoder_kbps as u64 * FEC_ONLY_DEADBAND_PCT;
-		if enc != self.encoder_kbps && !(fec_only && small) {
+		// Nor when the wire has room for the parity anyway: what arrives plus the parity well
+		// under the target (2026-11-13 LAN: 4 Mbit of desktop under a 16.8 Mbit target, 10 %
+		// parity on/off retuned the encoder 16.8 ↔ 14.1 every few windows for nothing).
+		let roomy = self
+			.goodput
+			.is_some_and(|g| g * (1.0 + self.fec_overhead) < self.target as f32 * FEC_ONLY_ROOM);
+		if enc != self.encoder_kbps && !(fec_only && (small || roomy)) {
 			self.encoder_kbps = enc;
 			if out.bitrate.is_none() && out.reason.is_empty() {
 				out.reason = "fec share changed";
