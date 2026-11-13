@@ -465,12 +465,18 @@ fn profile_picks_latency_vs_quality_params() {
 	let gi = game.iter().position(|a| a == "-g").unwrap();
 	assert_eq!(game[gi + 1], "15");
 
-	// Desktop (quality): veryfast + a longer GOP (fps*2 = 120).
+	// Desktop (quality): veryfast + a longer GOP — 0.5 s at this 30 Mbit/s (fps/2 = 30),
+	// 2 s on a thin link (fps*2 = 120).
 	p.low_latency = false;
 	let (_, desk) = encode_command(&p);
 	assert!(desk.iter().any(|a| a == "veryfast"));
 	let gi = desk.iter().position(|a| a == "-g").unwrap();
-	assert_eq!(desk[gi + 1], "120");
+	assert_eq!(desk[gi + 1], "30");
+	p.bitrate_kbps = 1500;
+	let (_, thin) = encode_command(&p);
+	let gi = thin.iter().position(|a| a == "-g").unwrap();
+	assert_eq!(thin[gi + 1], "120");
+	p.bitrate_kbps = 30_000;
 
 	// NVENC: ull tune for games, a higher preset for the desktop.
 	let mut n = plan(HwEncoder::Nvenc);

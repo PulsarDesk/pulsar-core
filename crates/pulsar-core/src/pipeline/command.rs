@@ -26,19 +26,34 @@ pub fn supports_intra_refresh(enc: HwEncoder, codec: VCodec) -> bool {
 	)
 }
 
+/// The remote (desktop) GOP in frames when nothing but the next IDR heals a loss. This
+/// command runs an ffmpeg CLI encoder, which cannot be asked for a keyframe while it runs:
+/// after an unrepaired loss the client's picture stays held until the next scheduled IDR.
+/// At 2 s that was a 2-3 s "recovering" on a LAN Wi-Fi link losing one packet now and then
+/// (2026-11-13, a Windows host on its AMF fallback). The IDRs cost bitrate, so the period
+/// follows it: 0.5 s from 8 Mbit/s up, 1 s at 4 Mbit/s, the old 2 s at 2 Mbit/s and below
+/// (and when the bitrate is unknown) — a thin link keeps its bits for the picture, and the
+/// client asks for [`LossRecovery::ShortGop`] there once it actually loses packets.
+fn remote_idr_gop(fps: u32, bitrate_kbps: u32) -> u32 {
+	let secs = if bitrate_kbps == 0 { 2.0 } else { (4000.0 / bitrate_kbps as f32).clamp(0.5, 2.0) };
+	((fps as f32 * secs).round() as u32).max(1)
+}
+
 /// The GOP (`-g`) plus the encoder-specific intra-refresh arguments for the plan's
 /// [`LossRecovery`] mode. Returns `(gop, extra_args)`.
 ///
-/// * `Normal` — game ≈ 0.25 s, remote ≈ 2 s (unchanged pre-Phase-0 behaviour).
+/// * `Normal` — game ≈ 0.25 s, remote 0.5-2 s by bitrate ([`remote_idr_gop`]).
 /// * `ShortGop` — `min(normal, fps/2)`: an IDR at least every ~0.5 s.
 /// * `IntraRefresh` — where the encoder has it, a rolling intra wave with the refresh
 ///   period as the cycle; x264/NVENC take the period via `-g` (no IDRs in steady state),
-///   QSV/AMF keep the normal GOP and add their cycle option. Without support → `ShortGop`.
+///   QSV/AMF keep the long GOP (game ≈ 0.25 s, remote ≈ 2 s — the wave heals, not the
+///   IDRs) and add their cycle option. Without support → `ShortGop`.
 fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
-	let normal = if plan.low_latency {
-		(plan.fps / 4).max(1)
+	let (normal, long) = if plan.low_latency {
+		let g = (plan.fps / 4).max(1);
+		(g, g)
 	} else {
-		(plan.fps * 2).max(1)
+		(remote_idr_gop(plan.fps, plan.bitrate_kbps), (plan.fps * 2).max(1))
 	};
 	let period = refresh_period(plan.fps);
 	let short = normal.min(period);
@@ -52,7 +67,7 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 				(period, vec![s("-intra-refresh"), s("1")])
 			}
 			(HwEncoder::Qsv, VCodec::H264) | (HwEncoder::Qsv, VCodec::H265) => (
-				normal,
+				long,
 				vec![
 					s("-int_ref_type"),
 					s("1"), // vertical (column) refresh
@@ -68,7 +83,7 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 					(plan.width, plan.height)
 				};
 				let mbs = w.div_ceil(16) * h.div_ceil(16);
-				(normal, vec![s("-intra_refresh_mb"), mbs.div_ceil(period).max(1).to_string()])
+				(long, vec![s("-intra_refresh_mb"), mbs.div_ceil(period).max(1).to_string()])
 			}
 			_ => (short, Vec::new()),
 		},
@@ -137,10 +152,12 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	}
 
 	// GOP: game mode uses a short GOP (~0.25 s) so the picture self-heals fast after
-	// loss (the UDP relay has no retransmit); desktop/quality mode uses a longer GOP
-	// (~2 s) — desktop is low-motion, so fewer keyframes spends the bitrate on a
-	// sharper picture instead. On a LOSSY path the client asks for a loss-recovery mode
-	// (short GOP / intra refresh) and `recovery_args` overrides both — see there.
+	// loss (the UDP relay has no retransmit); desktop/quality mode uses a longer one —
+	// desktop is low-motion, so fewer keyframes spends the bitrate on a sharper picture —
+	// that shortens with the bitrate (2 s on a thin link, 0.5 s from 8 Mbit/s: this
+	// encoder can't be asked for a keyframe, see `remote_idr_gop`). On a LOSSY path the
+	// client asks for a loss-recovery mode (short GOP / intra refresh) and `recovery_args`
+	// overrides both — see there.
 	let (gop, recovery) = recovery_args(plan);
 	a.extend([
 		s("-c:v"),
@@ -461,13 +478,23 @@ mod tests {
 	}
 
 	#[test]
-	fn normal_gop_unchanged_by_phase0() {
-		// Remote ≈ 2 s, game ≈ 0.25 s — the pre-Phase-0 values, no refresh args.
-		let (_, a) = encode_command(&plan_for(HwEncoder::Software, VCodec::H264, false, LossRecovery::Normal));
-		assert_eq!(arg_after(&a, "-g").as_deref(), Some("120"));
-		assert!(!a.iter().any(|x| x == "-intra-refresh"));
-		let (_, a) = encode_command(&plan_for(HwEncoder::Software, VCodec::H264, true, LossRecovery::Normal));
-		assert_eq!(arg_after(&a, "-g").as_deref(), Some("15"));
+	fn normal_gop_follows_the_bitrate_in_remote_mode_only() {
+		// 60 fps. Remote: 0.5 s from 8 Mbit/s, 1 s at 4 Mbit/s, 2 s at 2 Mbit/s and below or
+		// when the bitrate is unknown. No refresh args.
+		for (kbps, gop) in [(30_000, "30"), (8000, "30"), (6000, "40"), (4000, "60"), (2000, "120"), (700, "120"), (0, "120")] {
+			let mut p = plan_for(HwEncoder::Software, VCodec::H264, false, LossRecovery::Normal);
+			p.bitrate_kbps = kbps;
+			let (_, a) = encode_command(&p);
+			assert_eq!(arg_after(&a, "-g").as_deref(), Some(gop), "{kbps} kbit/s");
+			assert!(!a.iter().any(|x| x == "-intra-refresh"));
+		}
+		// Game ≈ 0.25 s at any bitrate.
+		for kbps in [30_000, 2000] {
+			let mut p = plan_for(HwEncoder::Software, VCodec::H264, true, LossRecovery::Normal);
+			p.bitrate_kbps = kbps;
+			let (_, a) = encode_command(&p);
+			assert_eq!(arg_after(&a, "-g").as_deref(), Some("15"), "{kbps} kbit/s");
+		}
 	}
 
 	#[test]
@@ -494,7 +521,7 @@ mod tests {
 	}
 
 	#[test]
-	fn intra_refresh_qsv_uses_cycle_option_and_keeps_normal_gop() {
+	fn intra_refresh_qsv_uses_cycle_option_and_keeps_the_long_gop() {
 		let (_, a) = encode_command(&plan_for(HwEncoder::Qsv, VCodec::H264, false, LossRecovery::IntraRefresh));
 		let j = a.join(" ");
 		assert!(j.contains("-int_ref_type 1 -int_ref_cycle_size 30"), "{j}");
