@@ -53,8 +53,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   carries none (users can point at a self-hosted/local one, with or without a port);
   `NetworkMode`; `relay_keys` holds the access key each relay issued this device.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
-  ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
-  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
+  ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, macOS CGEvent, and the
+  per-window co-op injector `WindowInput` (same API on each OS: `window_win.rs`
+  PostMessage / `window_x11.rs` X11 SendEvent+XTest / `window_mac.rs`
+  CGEventPostToPid; pure helpers + tests in `window_common.rs`; native Wayland is
+  impossible; Linux/macOS untested on hardware), DS4/DS5 touchpad-as-mouse. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
