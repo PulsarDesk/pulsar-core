@@ -440,8 +440,27 @@ pub struct StreamPlan {
 	/// periodic-intra-refresh knobs in [`encode_command`](super::encode_command).
 	/// `Normal` = the long remote GOP.
 	pub loss_recovery: crate::service::LossRecovery,
-	/// Capture one window instead of the screen (`None` = the screen, as before).
+	/// Capture one window instead of the screen (`None` = the screen, as before). Linux X11
+	/// (`WindowInput::X11`): the per-window "Pencere" pick and the same-host co-op per-window
+	/// source; macOS: `WindowInput::RawNv12` from ScreenCaptureKit.
 	pub window: Option<WindowInput>,
+}
+
+impl StreamPlan {
+	/// Does this plan capture a single X window (and so need a scale to the plan size)?
+	pub fn captures_x11_window(&self) -> bool {
+		self.capture == CaptureMethod::X11grab && matches!(self.window, Some(WindowInput::X11 { .. }))
+	}
+}
+
+/// The encode size for a captured window of `win_w`×`win_h`: the window's own aspect,
+/// no larger than the window (no upscale) nor than `max_w`×`max_h`, both even (every
+/// hardware encoder wants even 4:2:0 dimensions), at least 2×2.
+pub fn fit_window_size(win_w: u32, win_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+	let (ww, wh) = (win_w.max(2) as f64, win_h.max(2) as f64);
+	let k = (max_w.max(2) as f64 / ww).min(max_h.max(2) as f64 / wh).min(1.0);
+	let even = |v: f64| ((v.floor() as u32) & !1).max(2);
+	(even(ww * k), even(wh * k))
 }
 
 impl StreamPlan {

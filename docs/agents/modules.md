@@ -53,8 +53,13 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   carries none (users can point at a self-hosted/local one, with or without a port);
   `NetworkMode`; `relay_keys` holds the access key each relay issued this device.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
-  ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
-  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. `input/pen_touch/` = pen + multi-touch:
+  ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, macOS CGEvent, and the
+  per-window co-op injector `WindowInput` (same API on each OS: `window_win.rs`
+  PostMessage / `window_x11.rs` X11 SendEvent+XTest / `window_mac.rs`
+  CGEventPostToPid; pure helpers + tests in `window_common.rs`; native Wayland is
+  impossible; Linux/macOS untested on hardware; `is_alive`/`in_front`/size/X11 child
+  under the pointer are cached 200 ms — the host asks per input event),
+  DS4/DS5 touchpad-as-mouse. `input/pen_touch/` = pen + multi-touch:
   wire state types (`PenState`, `TouchFrame` — `InputEvent::Pen` / `Touch`, host features
   `FEAT_PEN` / `FEAT_TOUCH`), the host `Driver` (sanitize, slot tracking, 1 s silence lift,
   keep-alive refresh) on a worker thread (`PenTouch`) feeding a platform `Sink` — Windows
@@ -102,6 +107,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   **for tests only**. Real encoders live in the apps (see below).
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`
   detect/resolve. No process spawning here (that's the Tauri layer).
+  `StreamPlan.window` = one window instead of the screen: `WindowInput::X11 { id }` for
+  x11grab (`-window_id`, scaled to the plan size; `fit_window_size` / `fit_within` pick it)
+  — used by both the per-window "Pencere" pick and the Linux per-window co-op capture
+  source — or `WindowInput::RawNv12` (macOS ScreenCaptureKit frames).
+- `x11win.rs` — X11 top-level window list (`_NET_CLIENT_LIST`) and launched-game →
+  window lookup (`_NET_WM_PID` over the `/proc` process tree) for the co-op path; the Linux
+  counterpart of `pulsar-capture`'s `window.rs`. Overlaps `window_capture/x11.rs` (the
+  client's window picker list) — two listings of the same EWMH data, kept separate since
+  the merge (`parity/all`); a later cleanup can fold one into the other. Empty on Wayland.
+  Untested on Linux hardware.
 - `capture.rs` — **Linux-only** (`cfg`): Wayland XDG ScreenCast portal →
   PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
   `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev

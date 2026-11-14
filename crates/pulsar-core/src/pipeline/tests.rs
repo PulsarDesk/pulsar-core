@@ -237,6 +237,17 @@ fn ddagrab_media_foundation_feeds_nv12() {
 }
 
 #[test]
+fn fit_window_size_keeps_aspect_even_and_never_upscales() {
+	use super::fit_window_size;
+	assert_eq!(fit_window_size(1280, 720, 1920, 1080), (1280, 720));
+	assert_eq!(fit_window_size(2560, 1440, 1920, 1080), (1920, 1080));
+	assert_eq!(fit_window_size(801, 601, 1920, 1080), (800, 600));
+	// A tall window into a wide box: the height binds.
+	assert_eq!(fit_window_size(1000, 2000, 1920, 1080), (540, 1080));
+	assert_eq!(fit_window_size(0, 0, 1920, 1080), (2, 2));
+}
+
+#[test]
 fn capture_backends_emit_the_right_input() {
 	let mut p = plan(HwEncoder::Software);
 	p.capture = CaptureMethod::X11grab;

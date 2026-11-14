@@ -28,6 +28,8 @@ pub mod pipeline;
 pub mod service;
 pub mod totp;
 pub mod window_capture;
+/// X11 window enumeration + launched-game window lookup (per-window capture target, Linux).
+pub mod x11win;
 
 pub use config::{Config, Language, NetworkMode};
 pub use connection::{ConnError, Node, RelayCreds, Session, SessionSender, Transport};

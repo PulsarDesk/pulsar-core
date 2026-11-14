@@ -59,7 +59,10 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # Per-window capture on X11 (window_capture/x11.rs): list the WM's client windows with their
 # titles / pids / sizes. Pure-Rust protocol (RustConnection) — no libX11/libxcb link.
 # `randr`: the monitor a window sits on, for fitting it to a split pane (window_capture::fit).
-x11rb = { version = "0.13", default-features = false, features = ["randr"] }
+# Same-host co-op per-WINDOW input on X11/XWayland (input/window_x11.rs): SendEvent to
+# one window + XTest when it is in front. Pure-Rust connection (no libX11 link, X errors
+# come back as Results instead of a process-global Xlib error handler), Send.
+x11rb = { version = "0.13", default-features = false, features = ["randr", "xtest"] }
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
@@ -140,7 +143,9 @@ windows-core = "0.62"
 [target.'cfg(target_os = "macos")'.dependencies]
 # "highsierra" gates CGEvent::new_scroll_event (CGEventCreateScrollWheelEvent2);
 # our min macOS is well past 10.13, so it's always available.
-core-graphics = { version = "0.25", features = ["highsierra"] }
+# "elcapitan" gates CGEvent::post_to_pid (CGEventPostToPid, macOS 10.11+) — the
+# per-window co-op injector (input/window_mac.rs) posts into one process.
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 # window_capture.rs: proc_listchildpids (a launched game's child processes).
@@ -157,7 +162,10 @@ libc = "0.2"
 # overlay_macos.rs: NSWindow level / collection behaviour of the remote-cursor overlay.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSValue"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen", "NSGraphics"] }
+# input/window_mac.rs: the frontmost application's pid (NSWorkspace) — the co-op injector
+# decides "is the target window in front" by owner pid + that pid's top window, since the
+# first on-screen layer-0 window can belong to a non-activating window of another app.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSScreen", "NSGraphics", "NSWorkspace", "NSRunningApplication"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "libc", "SCShareableContent", "SCStream", "SCError"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CMSampleBuffer", "CMTime", "CMBase"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }

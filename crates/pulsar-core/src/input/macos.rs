@@ -32,7 +32,7 @@ use std::collections::HashSet;
 /// printable characters is handled by `type_char` (Unicode injection); this table
 /// is for non-text keys (modifiers, arrows, F-keys, Enter, etc.) and the ASCII
 /// fast path.
-fn evdev_to_vk(code: u32) -> Option<u16> {
+pub(super) fn evdev_to_vk(code: u32) -> Option<u16> {
 	Some(match code {
 		1 => 0x35,  // Escape       (kVK_Escape)
 		2 => 0x12,  // Digit1       (kVK_ANSI_1)
@@ -156,7 +156,7 @@ fn post(ev: &CGEvent) {
 /// (CoreGraphics does NOT infer held modifiers from prior key-down events the way
 /// a hardware keyboard does, so synthetic events must carry the flags explicitly,
 /// or e.g. Shift+A injects a lowercase 'a').
-fn evdev_modifier_flag(code: u32) -> Option<CGEventFlags> {
+pub(super) fn evdev_modifier_flag(code: u32) -> Option<CGEventFlags> {
 	Some(match code {
 		29 | 97 => CGEventFlags::CGEventFlagControl,   // L/R Ctrl
 		42 | 54 => CGEventFlags::CGEventFlagShift,     // L/R Shift

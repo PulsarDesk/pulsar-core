@@ -137,10 +137,8 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	// One `-vf` chain (a second `-vf` would replace the first).
 	let mut vf: Vec<String> = Vec::new();
 	// gdigrab captures the desktop at its own size (see CaptureMethod::input_args), and so
-	// does an x11grab of one window.
-	let x11_window = plan.capture == CaptureMethod::X11grab
-		&& matches!(plan.window, Some(super::types::WindowInput::X11 { .. }));
-	if plan.capture == CaptureMethod::Gdigrab || x11_window {
+	// does an x11grab of one window: scale both to the plan size.
+	if plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window() {
 		vf.push(format!("scale={}:{}", plan.width, plan.height));
 	}
 
