@@ -57,7 +57,7 @@ type HandleReportFn = unsafe extern "C" fn(*mut c_void, u64, *const u8, isize) -
 
 extern "C" {
 	// libSystem (libdispatch + mach), always linked.
-	fn dispatch_queue_create(label: *const c_char, attr: *mut c_void) -> *mut c_void;
+	fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
 	fn dispatch_release(object: *mut c_void);
 	fn mach_absolute_time() -> u64;
 }
@@ -271,7 +271,7 @@ impl MacHidGamepad {
 			})
 		};
 
-		let queue = unsafe { dispatch_queue_create(c"com.pulsar.virtual-pad".as_ptr(), std::ptr::null_mut()) };
+		let queue = unsafe { dispatch_queue_create(c"com.pulsar.virtual-pad".as_ptr(), std::ptr::null()) };
 		if queue.is_null() {
 			// Not activated yet: a plain release is fine.
 			unsafe { CFRelease(dev as CFTypeRef) };
