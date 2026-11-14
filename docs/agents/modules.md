@@ -57,13 +57,20 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   per-window co-op injector `WindowInput` (same API on each OS: `window_win.rs`
   PostMessage / `window_x11.rs` X11 SendEvent+XTest / `window_mac.rs`
   CGEventPostToPid; pure helpers + tests in `window_common.rs`; native Wayland is
-  impossible; Linux/macOS untested on hardware), DS4/DS5 touchpad-as-mouse. **Controller *reading*
+  impossible; Linux/macOS untested on hardware; `is_alive`/`in_front`/size/X11 child
+  under the pointer are cached 200 ms — the host asks per input event),
+  DS4/DS5 touchpad-as-mouse. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
   **for tests only**. Real encoders live in the apps (see below).
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`
   detect/resolve. No process spawning here (that's the Tauri layer).
+  `StreamPlan.window_id` = one X window for x11grab (`-window_id`, scaled to the plan
+  size; `fit_window_size` picks it) — the Linux per-window co-op capture source.
+- `x11win.rs` — X11 top-level window list (`_NET_CLIENT_LIST`) and launched-game →
+  window lookup (`_NET_WM_PID` over the `/proc` process tree); the Linux counterpart of
+  `pulsar-capture`'s `window.rs`. Empty on Wayland. Untested on Linux hardware.
 - `capture.rs` — **Linux-only** (`cfg`): Wayland XDG ScreenCast portal →
   PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
   `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev
