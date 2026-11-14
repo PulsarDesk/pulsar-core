@@ -81,7 +81,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `NSScreen.localizedName` names, `CGDirectDisplayID` as `Monitor::id`) and Linux Wayland
   (`wl_output` + xdg-output). `watch()` = change events: CoreGraphics reconfiguration callback
   (macOS), Wayland `wl_output` / X11 RandR (Linux, x11rb). `index_of_rect` maps the portal's
-  stream geometry to a list index. Pure helpers unit-tested; untested on macOS / Wayland hardware.
+  stream geometry to a list index; `pointer_in` = the host pointer inside a monitor (macOS).
+  `watch()` never blocks and can be called again to restart a dropped Linux watcher. A monitor
+  without a platform name has an empty `name` + `builtin` flag (the app localizes the label).
+  `DataMsg::StreamedDisplay(idx)` (service/wire.rs) tells the client which monitor the Wayland
+  portal pick really streams. Pure helpers unit-tested; untested on macOS / Wayland hardware.
 - `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC.
 - `service/` — the app protocol over the encrypted session: OTP auth (non-empty
   passwords via **SPAKE2 PAKE** in `service/pake.rs`, MAC'd over the channel binding —
