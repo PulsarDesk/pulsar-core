@@ -289,7 +289,7 @@ pub async fn start(
 	restore_token: Option<String>,
 	system_gst: bool,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
-	start_inner(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, None).await
+	start_full(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, None).await
 }
 
 /// [`start`] for a chosen [`Source`] (the restore token is of that source's kind).
@@ -301,7 +301,7 @@ pub async fn start_with(
 	system_gst: bool,
 	source: Source,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
-	start_inner(ip, port, encoder_fragment, restore_token, system_gst, source, None).await
+	start_full(ip, port, encoder_fragment, restore_token, system_gst, source, None).await
 }
 
 /// [`start`], but first try the app's own encoder on raw NV12 frames (`frames`, see
@@ -316,10 +316,13 @@ pub async fn start_with_frames(
 	system_gst: bool,
 	frames: Option<FrameEncoderFactory>,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
-	start_inner(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, frames).await
+	start_full(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, frames).await
 }
 
-async fn start_inner(
+/// The general form of [`start`]: a [`Source`] plus an optional app-side raw-frame encoder
+/// (`frames`, screen casts only — a window cast always runs the gst pipeline, which scales it
+/// into its box).
+pub async fn start_full(
 	ip: &str,
 	port: u16,
 	encoder_fragment: &str,
