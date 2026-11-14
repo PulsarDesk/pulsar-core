@@ -54,6 +54,10 @@ gstreamer-video = "0.25"
 # a client's 0..1 pointer on the one monitor it is streaming.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# Same-host co-op per-WINDOW input on X11/XWayland (input/window_x11.rs): SendEvent to
+# one window + XTest when it is in front. Pure-Rust connection (no libX11 link, X errors
+# come back as Results instead of a process-global Xlib error handler), Send.
+x11rb = { version = "0.13", features = ["xtest"] }
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
@@ -132,7 +136,9 @@ windows-core = "0.62"
 [target.'cfg(target_os = "macos")'.dependencies]
 # "highsierra" gates CGEvent::new_scroll_event (CGEventCreateScrollWheelEvent2);
 # our min macOS is well past 10.13, so it's always available.
-core-graphics = { version = "0.25", features = ["highsierra"] }
+# "elcapitan" gates CGEvent::post_to_pid (CGEventPostToPid, macOS 10.11+) — the
+# per-window co-op injector (input/window_mac.rs) posts into one process.
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 libc = "0.2"

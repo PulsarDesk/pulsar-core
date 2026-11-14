@@ -126,6 +126,18 @@ impl WindowInput {
 		unsafe { IsWindow(self.hwnd) != 0 }
 	}
 
+	/// Is the target window the foreground window (or in its root-owner chain)? The
+	/// host sends a front window's keyboard through the global injector instead (see
+	/// host.rs). Same method exists on the Linux and macOS injectors.
+	pub fn in_front(&self) -> bool {
+		use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+		let fg = unsafe { GetForegroundWindow() };
+		if fg.is_null() {
+			return false;
+		}
+		fg == self.hwnd || unsafe { GetAncestor(fg, GA_ROOT) == GetAncestor(self.hwnd, GA_ROOT) }
+	}
+
 	/// Client-area size of the target window in pixels (0,0 if it can't be read).
 	fn client_size(&self) -> (i32, i32) {
 		let mut r = RECT {

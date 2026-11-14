@@ -63,6 +63,21 @@ mod windows;
 #[cfg(windows)]
 mod window_win;
 
+/// Pure helpers of the Linux/macOS per-window injectors (pointer mapping, X11
+/// keysym lookup, scroll accumulation) — compiled everywhere so they are tested.
+mod window_common;
+
+/// Linux per-WINDOW injection for X11 / XWayland windows (`SendEvent`, XTest when
+/// the window is in front). See [`window_x11::WindowInput`] for the ceiling (XI2
+/// clients ignore synthetic core events; native Wayland windows are impossible).
+#[cfg(target_os = "linux")]
+mod window_x11;
+
+/// macOS per-WINDOW injection (`CGEventPostToPid` to the window's owning process).
+/// See [`window_mac::WindowInput`] for the ceiling.
+#[cfg(target_os = "macos")]
+mod window_mac;
+
 /// macOS host-side mouse + keyboard injection via CoreGraphics `CGEvent`.
 #[cfg(target_os = "macos")]
 mod macos;
@@ -81,11 +96,16 @@ pub use uinput::DesktopInput;
 #[cfg(windows)]
 pub use windows::{evdev_to_raw_key, DesktopInput, MonitorRect};
 
-/// Windows-only per-window input injector (PostMessage). See its docs for the
-/// message-pump-apps-only ceiling. Selected per-session by the host when the
-/// session's capture target is a specific window (a launched game / picked app).
+/// Per-window input injector, same API on every desktop OS: Windows = PostMessage
+/// (HWND), Linux = X11 SendEvent/XTest (XID), macOS = CGEventPostToPid (CGWindowID).
+/// Selected per-session by the host when the session's capture target is a specific
+/// window (a launched game / picked app). Each backend documents its ceiling.
 #[cfg(windows)]
 pub use window_win::WindowInput;
+#[cfg(target_os = "linux")]
+pub use window_x11::WindowInput;
+#[cfg(target_os = "macos")]
+pub use window_mac::WindowInput;
 
 #[cfg(target_os = "macos")]
 pub use macos::DesktopInput;
