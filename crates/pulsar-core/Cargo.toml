@@ -134,6 +134,8 @@ windows-core = "0.62"
 # our min macOS is well past 10.13, so it's always available.
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
+# overlay_macos.rs: NSWindow level / collection behaviour of the remote-cursor overlay.
+objc2 = "0.6"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 libc = "0.2"
 

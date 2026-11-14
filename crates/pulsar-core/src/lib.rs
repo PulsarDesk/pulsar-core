@@ -20,6 +20,8 @@ pub mod discovery;
 pub mod input;
 pub mod media;
 pub mod netwatch;
+#[cfg(target_os = "macos")]
+pub mod overlay_macos;
 pub mod pipeline;
 pub mod service;
 pub mod totp;
