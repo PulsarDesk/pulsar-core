@@ -90,6 +90,11 @@ pub use window_win::WindowInput;
 #[cfg(target_os = "macos")]
 pub use macos::DesktopInput;
 
+/// macOS host: notice the local user's own mouse (listen-only CGEventTap that skips Pulsar's
+/// tagged injected events) — the desktop app's "host takes the mouse back" detection.
+#[cfg(target_os = "macos")]
+pub mod local_pointer_macos;
+
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub use desktop_stub::DesktopInput;
 
