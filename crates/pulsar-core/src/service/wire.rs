@@ -547,6 +547,7 @@ enum DataMsgWire {
 	},
 	HostPointer { active: bool, x: f32, y: f32 },
 	Displays(Vec<DisplayInfo>),
+	StreamedDisplay(u32),
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -592,6 +593,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::PairResult { paired, reason } => DataMsg::PairResult { paired, reason },
 			DataMsgWire::HostPointer { active, x, y } => DataMsg::HostPointer { active, x, y },
 			DataMsgWire::Displays(d) => DataMsg::Displays(d),
+			DataMsgWire::StreamedDisplay(i) => DataMsg::StreamedDisplay(i),
 		}
 	}
 }
@@ -828,6 +830,12 @@ pub enum DataMsg {
 	/// handles its own monitor going away). Sent on each change (event-driven on Windows).
 	/// Appended for additive wire compat (an old client ignores the unknown variant).
 	Displays(Vec<DisplayInfo>),
+	/// Host -> client: the stream shows host monitor `idx` (a [`DisplayInfo::idx`]) although
+	/// the client asked for another one. Linux Wayland only today: the ScreenCast portal
+	/// dialog, not the request, decides which monitor is shared, so the person at the host can
+	/// pick a different one. The client moves its monitor-picker selection (and its next
+	/// requests) to `idx`. Appended for additive wire compat (an old client ignores it).
+	StreamedDisplay(u32),
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1273,6 +1281,7 @@ mod tests {
 				refresh_hz: 144,
 			}]),
 			DataMsg::Displays(vec![]),
+			DataMsg::StreamedDisplay(1),
 		];
 
 		for msg in cases {
