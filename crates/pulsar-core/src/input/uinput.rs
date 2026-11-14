@@ -151,6 +151,8 @@ pub struct DesktopInput {
 	/// and on `Drop` (session teardown) — otherwise a held button/modifier stays stuck.
 	held_buttons: std::collections::HashSet<u16>,
 	held_keys: std::collections::HashSet<u16>,
+	/// Lazily started pen / touch worker (uinput tablet + touchscreen, see `pen_touch`).
+	pen_touch: Option<super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>>>,
 }
 
 impl DesktopInput {
@@ -204,7 +206,28 @@ impl DesktopInput {
 			region: None,
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
+			pen_touch: None,
 		})
+	}
+
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>> {
+		let region = self.region;
+		self.pen_touch.get_or_insert_with(|| {
+			let w = super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::UinputSink::new);
+			w.set_geom(region);
+			w
+		})
+	}
+
+	/// Client pen state (`InputEvent::Pen`) → the uinput tablet (pressure, tilt, eraser,
+	/// barrel, hover) on the streamed monitor.
+	pub fn pen(&mut self, s: super::pen_touch::PenState) {
+		self.pen_touch().pen(s);
+	}
+
+	/// Client touch frame (`InputEvent::Touch`) → the uinput multitouch screen.
+	pub fn touch(&mut self, f: super::pen_touch::TouchFrame) {
+		self.pen_touch().touch(f);
 	}
 
 	/// Confine absolute pointer moves to the streamed monitor. The compositor maps the
@@ -212,6 +235,11 @@ impl DesktopInput {
 	/// multi-monitor host an unmapped 0..1 position lands on whichever monitor that point
 	/// of the box belongs to — the cursor left the screen the client was looking at.
 	pub fn set_region(&mut self, region: Option<crate::capture::PointerRegion>) {
+		if self.region != region {
+			if let Some(w) = &self.pen_touch {
+				w.set_geom(region);
+			}
+		}
 		self.region = region;
 	}
 
@@ -370,6 +398,9 @@ impl DesktopInput {
 	/// modifier or a held mouse button (drag-select) stays stuck on the host.
 	/// Idempotent — drained sets make repeat calls no-ops.
 	pub fn flush_held(&mut self) {
+		if let Some(w) = &self.pen_touch {
+			w.release(); // lift the pen / every finger
+		}
 		let btn_up: Vec<InputEvent> = self
 			.held_buttons
 			.drain()

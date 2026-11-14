@@ -14,5 +14,7 @@ impl DesktopInput {
 	pub fn key(&mut self, _code: u32, _down: bool) {}
 	pub fn type_char(&mut self, _c: char) {}
 	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
+	pub fn pen(&mut self, _s: super::pen_touch::PenState) {}
+	pub fn touch(&mut self, _f: super::pen_touch::TouchFrame) {}
 	pub fn flush_held(&mut self) {}
 }

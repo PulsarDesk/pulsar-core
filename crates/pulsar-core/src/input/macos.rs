@@ -184,6 +184,9 @@ pub struct DesktopInput {
 	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
 	/// (the menu-bar corner); we fall back to this last-known position instead.
 	last_point: CGPoint,
+	/// Lazily started pen / touch worker (CGEvent tablet events, touch as mouse — see
+	/// `pen_touch`). A channel sender, so the struct stays `Send`.
+	pen_touch: Option<super::pen_touch::PenTouch<()>>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -217,7 +220,25 @@ impl DesktopInput {
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
+			pen_touch: None,
 		})
+	}
+
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<()> {
+		self.pen_touch
+			.get_or_insert_with(|| super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::MacSink::new))
+	}
+
+	/// Client pen state (`InputEvent::Pen`) → CGEvent tablet proximity + tablet-point mouse
+	/// events with pressure / tilt / rotation.
+	pub fn pen(&mut self, s: super::pen_touch::PenState) {
+		self.pen_touch().pen(s);
+	}
+
+	/// Client touch frame (`InputEvent::Touch`) → mouse + scroll (macOS has no public touch
+	/// injection; see `pen_touch/macos.rs`).
+	pub fn touch(&mut self, f: super::pen_touch::TouchFrame) {
+		self.pen_touch().touch(f);
 	}
 
 	/// A fresh HIDSystemState event source. HIDSystemState: events appear to come
@@ -417,6 +438,9 @@ impl DesktopInput {
 	/// (drag-select) stays stuck on the host. Idempotent — cleared sets make
 	/// repeat calls no-ops.
 	pub fn flush_held(&mut self) {
+		if let Some(w) = &self.pen_touch {
+			w.release(); // lift the pen / the touch-held button
+		}
 		let point = self.current_location();
 		for b in self.held_buttons.clone() {
 			let (cg_btn, ty) = button_events(b, false);
