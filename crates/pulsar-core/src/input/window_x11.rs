@@ -34,8 +34,10 @@
 //!   id) can be targeted, through this same X11 path. `new` returns `None` without an
 //!   X display, and the caller keeps the global injector.
 
+use std::cell::Cell;
 use std::collections::HashSet;
-use x11rb::connection::Connection;
+use std::time::{Duration, Instant};
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xproto::{
 	self, AtomEnum, ButtonPressEvent, ConnectionExt as _, EventMask, KeyPressEvent,
 	MotionNotifyEvent, Window,
@@ -53,6 +55,9 @@ use super::window_common::{
 const SCRATCH_KEYCODES: usize = 4;
 /// Caps Lock toggles `LockMask` in the event state.
 const LOCK_MASK: u16 = 1 << 1;
+/// Window size / front state are re-read at most this often: each is one or more X
+/// round-trips, and a mouse move would otherwise pay them on every event.
+const CACHE_TTL: Duration = Duration::from_millis(200);
 
 pub struct WindowInput {
 	conn: RustConnection,
@@ -79,6 +84,9 @@ pub struct WindowInput {
 	scratch_used: HashSet<u8>,
 	/// Whether the X server has XTest (front-window mouse path).
 	xtest: bool,
+	/// Cached `in_front` / `size` answers and when they were read (see `CACHE_TTL`).
+	front: Cell<Option<(Instant, bool)>>,
+	geom: Cell<Option<(Instant, (f64, f64))>>,
 }
 
 impl WindowInput {
@@ -119,6 +127,8 @@ impl WindowInput {
 			scratch_next: 0,
 			scratch_used: HashSet::new(),
 			xtest,
+			front: Cell::new(None),
+			geom: Cell::new(None),
 		};
 		me.refresh_keymap();
 		me.scratch = free_keycodes(&me.keymap, me.syms_per, me.first_keycode, SCRATCH_KEYCODES);
@@ -172,6 +182,17 @@ impl WindowInput {
 	/// the core input focus (WMs without EWMH). Either may name the client window or
 	/// its frame, so ancestry is checked both ways.
 	pub fn in_front(&self) -> bool {
+		if let Some((t, v)) = self.front.get() {
+			if t.elapsed() < CACHE_TTL {
+				return v;
+			}
+		}
+		let v = self.query_front();
+		self.front.set(Some((Instant::now(), v)));
+		v
+	}
+
+	fn query_front(&self) -> bool {
 		let active = (self.net_active != 0)
 			.then(|| {
 				self.conn
@@ -195,6 +216,17 @@ impl WindowInput {
 	}
 
 	fn size(&self) -> (f64, f64) {
+		if let Some((t, v)) = self.geom.get() {
+			if t.elapsed() < CACHE_TTL {
+				return v;
+			}
+		}
+		let v = self.query_size();
+		self.geom.set(Some((Instant::now(), v)));
+		v
+	}
+
+	fn query_size(&self) -> (f64, f64) {
 		self.conn
 			.get_geometry(self.win)
 			.ok()
