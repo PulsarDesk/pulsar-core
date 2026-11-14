@@ -54,7 +54,10 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `NetworkMode`; `relay_keys` holds the access key each relay issued this device.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
   ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
-  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
+  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse (`touchpad_mouse.rs` = the shared,
+  unit-tested gesture machine — pointer / two-finger scroll / click / two-finger right
+  click — used by the Linux evdev reader `touchpad_linux.rs` and by the desktop app's
+  SDL3-based Windows/macOS reader; untested on hardware). **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
