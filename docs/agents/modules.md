@@ -56,7 +56,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
   (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
-  saying otherwise). macOS virtual pad = no-op stub.
+  saying otherwise). **macOS virtual pad** = `mac_hid.rs`: `IOHIDUserDeviceCreateWithProperties`
+  (symbols via `dlsym`, macOS 10.15+) impersonating an Xbox Wireless (BT, 045E:0B13) or DS4 (USB,
+  054C:09CC) pad; descriptors / reports / rumble decoding are pure in `virtual_hid.rs` (tested on
+  every host). Needs the restricted entitlement `com.apple.developer.hid.virtual.device`;
+  without it creation returns NULL → `PadFailure::MacEntitlement` (checked via
+  `SecTaskCopyValueForEntitlement`) → `RecordingPad`. `create_virtual_pad_checked` returns the
+  `PadFailure` for every OS (`vigem_missing`, `uinput_denied`, …); the app relays it as
+  `DataMsg::PadUnavailable { slot, reason }`. Untested on macOS hardware.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
   **for tests only**. Real encoders live in the apps (see below).
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`
