@@ -62,7 +62,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   tablet + multitouch type B, macOS CGEvent tablet events for the pen and touch-as-mouse
   (`mouse::TouchMouse`; macOS has no public touch injection) — plus the client gate
   `client::ClientPenTouch` (feature check, mouse fallback for old hosts, 250 ms keep-alive,
-  30 s stale lift). `DesktopInput::pen` / `touch` on every platform (no-ops in the stub).
+  30 s stale lift, 2.5 s for hover only). The Windows sink injects through a `PointerBackend`
+  (`LocalDevices` in-process, or the desktop app's SYSTEM helper via plain-data
+  `SynthContact`s). `tablet` = client-side native tablet attributes for webviews that report a
+  pen as a mouse (macOS listen-only CGEventTap, Linux evdev reader; `TabletAugment` turns the
+  mouse into `Pen`). `avf_screens` maps an avfoundation capture device to its CG display (macOS
+  host geometry, `DesktopInput::set_display`). Linux skips the streamed-monitor region for the
+  direct devices on GNOME / KDE Wayland (`region_applies`, unverified assumption).
+  `DesktopInput::pen` / `touch` on every platform (no-ops in the stub).
   Untested on pen / touch hardware. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.

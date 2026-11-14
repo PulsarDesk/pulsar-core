@@ -8,8 +8,15 @@
 //!   (`ABS_MT_SLOT` / `ABS_MT_TRACKING_ID` / `ABS_MT_POSITION_X/Y`, [`MAX_TOUCH`] slots) plus
 //!   the single-touch `ABS_X/Y` + `BTN_TOUCH` emulation and `BTN_TOOL_*TAP` finger counts.
 //!
-//! Both are mapped over the bounding box of all outputs by the compositor (like the absolute
-//! pointer), so positions go through the same streamed-monitor region.
+//! Mapping (UNVERIFIED assumption, see [`region_applies`]): Xorg and the wlroots-style
+//! compositors map an unassociated absolute device over the bounding box of all outputs
+//! (like the absolute pointer, verified on KWin 6 for that one), so positions go through the
+//! streamed-monitor region there. Mutter and KWin on Wayland map an unassociated DIRECT
+//! touchscreen / display tablet to one output (usually the built-in or primary one); the
+//! region is then not applied — positions span that output. Associating the devices with the
+//! streamed output explicitly (KWin `org.kde.KWin.InputDevice.outputName` over D-Bus,
+//! Mutter `org.gnome.desktop.peripherals.{touchscreen,tablet}` `output` keyed by
+//! `5055:0002` / `5055:0001`) is not done yet.
 //!
 //! Untested on real pen / touch hardware.
 
@@ -35,6 +42,17 @@ fn key(k: KeyCode, down: bool) -> InputEvent {
 }
 fn abs(a: Abs, v: i32) -> InputEvent {
 	ev(EventType::ABSOLUTE, a.0, v)
+}
+
+/// Whether the streamed-monitor region applies to the direct pen / touch devices in this
+/// session (`XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`): not on GNOME / KDE Wayland, where the
+/// compositor maps them to a single output (see the module docs).
+pub(crate) fn region_applies(session_type: Option<&str>, desktop: Option<&str>) -> bool {
+	if !session_type.is_some_and(|t| t.eq_ignore_ascii_case("wayland")) {
+		return true;
+	}
+	let d = desktop.unwrap_or("").to_ascii_lowercase();
+	!d.split(':').any(|p| matches!(p, "gnome" | "kde" | "ubuntu" | "unity" | "pop" | "budgie-desktop"))
 }
 
 /// Normalized (streamed-monitor) → device units, through the monitor's region of the layout.
@@ -241,7 +259,16 @@ impl UinputSink {
 impl Sink for UinputSink {
 	type Geom = Option<PointerRegion>;
 	fn set_geom(&mut self, g: Self::Geom) {
-		self.region = g;
+		static APPLIES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+		let applies = *APPLIES.get_or_init(|| {
+			let a = region_applies(
+				std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+				std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+			);
+			tracing::info!(applies = a, "pen/touch: streamed-monitor region for the direct uinput devices");
+			a
+		});
+		self.region = g.filter(|_| applies);
 	}
 	fn pen(&mut self, prev: &PenState, next: &PenState) {
 		let reports = pen_reports(self.region, prev, next);
@@ -268,6 +295,15 @@ mod tests {
 
 	fn has(r: &[InputEvent], ty: EventType, code: u16, v: i32) -> bool {
 		r.iter().any(|e| e.event_type() == ty && e.code() == code && e.value() == v)
+	}
+
+	#[test]
+	fn the_region_is_skipped_where_the_compositor_maps_to_one_output() {
+		assert!(region_applies(Some("x11"), Some("GNOME")));
+		assert!(region_applies(None, None));
+		assert!(region_applies(Some("wayland"), Some("sway")));
+		assert!(!region_applies(Some("wayland"), Some("ubuntu:GNOME")));
+		assert!(!region_applies(Some("wayland"), Some("KDE")));
 	}
 
 	#[test]
