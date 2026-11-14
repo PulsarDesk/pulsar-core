@@ -33,6 +33,14 @@ pub const PAD_WIDTH: f64 = 1920.0;
 pub const DS4_PAD_HEIGHT: f64 = 942.0;
 /// Raw touchpad height of a DualSense (0..1079).
 pub const DS5_PAD_HEIGHT: f64 = 1080.0;
+/// The Y scale SDL's HIDAPI DS4 driver normalizes with (`y / 920`, not the raw 942):
+/// multiply SDL's normalized Y by this to get raw units back, so the SDL path moves the
+/// pointer exactly like the evdev / raw-report paths (no 1-2 % X/Y anisotropy).
+pub const SDL_DS4_Y_SCALE: f64 = 920.0;
+/// The Y scale SDL's HIDAPI DualSense driver normalizes with (`y / 1070`).
+pub const SDL_DS5_Y_SCALE: f64 = 1070.0;
+/// The X scale both SDL drivers normalize with.
+pub const SDL_X_SCALE: f64 = 1920.0;
 
 /// One contact on the pad, in raw touchpad units.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -40,6 +48,11 @@ pub struct Finger {
 	pub down: bool,
 	pub x: f64,
 	pub y: f64,
+	/// This contact began in this report (a reader that sees contact ids sets it). A slot
+	/// can go straight from one finger to another inside one report (lift + land), with
+	/// the finger count unchanged; this flag makes the machine re-seed instead of applying
+	/// the distance between the two contacts as one pointer jump.
+	pub new_contact: bool,
 }
 
 /// The pad's state in one report: up to two contacts (the hardware tracks two) and
@@ -58,12 +71,14 @@ impl TouchFrame {
 }
 
 /// Turn a normalized (0..1) contact — SDL's `SDL_GetGamepadTouchpadFinger` — into raw
-/// touchpad units, so every reader feeds [`TouchpadMouse`] the same scale.
-pub fn finger_from_normalized(down: bool, x: f32, y: f32, pad_height: f64) -> Finger {
+/// touchpad units, so every reader feeds [`TouchpadMouse`] the same scale. `y_scale` is
+/// the divisor SDL normalized Y with ([`SDL_DS4_Y_SCALE`] / [`SDL_DS5_Y_SCALE`]).
+pub fn finger_from_normalized(down: bool, x: f32, y: f32, y_scale: f64) -> Finger {
 	Finger {
 		down,
-		x: x.clamp(0.0, 1.0) as f64 * PAD_WIDTH,
-		y: y.clamp(0.0, 1.0) as f64 * pad_height,
+		x: x.clamp(0.0, 1.0) as f64 * SDL_X_SCALE,
+		y: y.clamp(0.0, 1.0) as f64 * y_scale,
+		new_contact: false,
 	}
 }
 
@@ -76,6 +91,7 @@ pub fn ds5_usb_touch(r: &[u8; 64]) -> TouchFrame {
 		down: r[o] & 0x80 == 0,
 		x: (r[o + 1] as u16 | ((r[o + 2] as u16 & 0x0F) << 8)) as f64,
 		y: ((r[o + 2] as u16 >> 4) | ((r[o + 3] as u16) << 4)) as f64,
+		new_contact: false,
 	};
 	TouchFrame {
 		fingers: [point(33), point(37)],
@@ -156,8 +172,11 @@ impl TouchpadMouse {
 			return out;
 		}
 
-		// Motion first, so a press lands where the finger already moved the pointer.
-		if count == self.prev_count && count > 0 {
+		// Motion first, so a press lands where the finger already moved the pointer. A
+		// contact that began in this report (same count, new finger) re-seeds like a
+		// count change.
+		let fresh = frame.fingers.iter().any(|f| f.down && f.new_contact);
+		if count == self.prev_count && count > 0 && !fresh {
 			if let Some(prev) = self.prev {
 				let (mut dx, mut dy) = (0.0, 0.0);
 				for (f, p) in frame.fingers.iter().zip(prev.iter()) {
@@ -217,14 +236,17 @@ mod tests {
 
 	fn one(x: f64, y: f64) -> TouchFrame {
 		TouchFrame {
-			fingers: [Finger { down: true, x, y }, Finger::default()],
+			fingers: [Finger { down: true, x, y, new_contact: false }, Finger::default()],
 			click: false,
 		}
 	}
 
 	fn two(x: f64, y: f64) -> TouchFrame {
 		TouchFrame {
-			fingers: [Finger { down: true, x, y }, Finger { down: true, x: x + 300.0, y }],
+			fingers: [
+				Finger { down: true, x, y, new_contact: false },
+				Finger { down: true, x: x + 300.0, y, new_contact: false },
+			],
 			click: false,
 		}
 	}
@@ -326,7 +348,10 @@ mod tests {
 		r[37] = 0x80;
 		r[10] = 0x02;
 		let t = ds5_usb_touch(&r);
-		assert_eq!(t.fingers[0], Finger { down: true, x: 0x234 as f64, y: 0x156 as f64 });
+		assert_eq!(
+			t.fingers[0],
+			Finger { down: true, x: 0x234 as f64, y: 0x156 as f64, new_contact: false }
+		);
 		assert!(!t.fingers[1].down);
 		assert!(t.click);
 		assert_eq!(t.count(), 1);
@@ -334,7 +359,21 @@ mod tests {
 
 	#[test]
 	fn normalized_scales_to_raw() {
-		let f = finger_from_normalized(true, 0.5, 1.0, DS4_PAD_HEIGHT);
-		assert_eq!((f.x, f.y), (960.0, 942.0));
+		let f = finger_from_normalized(true, 0.5, 1.0, SDL_DS4_Y_SCALE);
+		assert_eq!((f.x, f.y), (960.0, 920.0));
+		let f = finger_from_normalized(true, 1.0, 0.5, SDL_DS5_Y_SCALE);
+		assert_eq!((f.x, f.y), (1920.0, 535.0));
+	}
+
+	#[test]
+	fn new_contact_in_same_slot_reseeds() {
+		let mut m = TouchpadMouse::new(1.0);
+		m.update(&one(100.0, 100.0), true);
+		// Finger lifted and another landed far away within one report: count stays 1.
+		let mut f = one(1500.0, 800.0);
+		f.fingers[0].new_contact = true;
+		assert!(m.update(&f, true).is_empty());
+		// The new finger then moves normally from its own seed.
+		assert_eq!(rel(&m.update(&one(1510.0, 800.0), true)), (10.0, 0.0));
 	}
 }

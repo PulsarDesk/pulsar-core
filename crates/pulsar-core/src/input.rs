@@ -49,6 +49,11 @@ mod uinput;
 /// DualSense raw-HID readers on Windows and macOS.
 pub mod touchpad_mouse;
 
+/// Which client session a controller's input goes to (tabs, split-screen panes, pad
+/// locks, split "press to join"). Shared by the desktop app's gamepad forward loop and
+/// its touchpad-as-mouse readers so both route a pad the same way.
+pub mod pad_route;
+
 /// DS4/DS5 touchpad-as-mouse reader via evdev (Linux client-side).
 ///
 /// Enumerates `/dev/input/event*` for a Sony touchpad device and feeds its two

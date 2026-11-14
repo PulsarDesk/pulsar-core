@@ -209,6 +209,12 @@ impl MtState {
 				self.uses_mt = true;
 				if let Some(f) = self.fingers.get_mut(self.slot) {
 					f.down = value >= 0;
+					// Protocol B emits a tracking id only when it changes, so any id >= 0
+					// is a new contact — also when the slot went straight from one finger
+					// to the next inside one SYN frame (count unchanged): re-seed it.
+					if value >= 0 {
+						f.new_contact = true;
+					}
 				}
 			}
 			AbsoluteAxisCode::ABS_MT_POSITION_X => {
@@ -238,12 +244,16 @@ impl MtState {
 		}
 	}
 
-	fn frame(&self) -> TouchFrame {
+	/// The report at a SYN_REPORT. Clears the per-report "new contact" marks.
+	fn frame(&mut self) -> TouchFrame {
 		let fingers = if self.uses_mt {
 			self.fingers
 		} else {
 			[self.st, Finger::default()]
 		};
+		for f in &mut self.fingers {
+			f.new_contact = false;
+		}
 		TouchFrame { fingers, click: self.click }
 	}
 }

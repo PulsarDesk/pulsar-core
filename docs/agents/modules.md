@@ -57,7 +57,9 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse (`touchpad_mouse.rs` = the shared,
   unit-tested gesture machine — pointer / two-finger scroll / click / two-finger right
   click — used by the Linux evdev reader `touchpad_linux.rs` and by the desktop app's
-  SDL3-based Windows/macOS reader; untested on hardware). **Controller *reading*
+  SDL3-based Windows/macOS reader; untested on hardware; `pad_route.rs` = which client
+  session a local pad drives — tabs / split panes / locks / press-to-join — shared by the
+  desktop app's gamepad forward gate and its touchpad readers). **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
