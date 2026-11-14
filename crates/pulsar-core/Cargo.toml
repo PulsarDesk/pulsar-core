@@ -54,6 +54,9 @@ gstreamer-video = "0.25"
 # a client's 0..1 pointer on the one monitor it is streaming.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# displays.rs: X11 RandR change events (monitor plugged / mode changed) for the host's
+# live monitor list. Pure-Rust X11 connection, no libxcb needed.
+x11rb = { version = "0.13", features = ["randr"] }
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
@@ -136,6 +139,12 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 libc = "0.2"
+# displays/macos.rs: NSScreen.localizedName for monitor names (main-thread AppKit, reached via
+# the main dispatch queue).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSValue", "NSDictionary", "NSArray"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen", "NSGraphics"] }
+dispatch2 = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }

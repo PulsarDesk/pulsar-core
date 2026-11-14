@@ -184,6 +184,8 @@ pub struct DesktopInput {
 	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
 	/// (the menu-bar corner); we fall back to this last-known position instead.
 	last_point: CGPoint,
+	/// The streamed monitor (`CGDirectDisplayID`, see [`Self::set_display`]); `None` = main.
+	display: Option<u32>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -217,6 +219,7 @@ impl DesktopInput {
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
+			display: None,
 		})
 	}
 
@@ -269,19 +272,28 @@ impl DesktopInput {
 		}
 	}
 
-	/// Move the pointer to a normalized (0..1) position on the main display.
+	/// Aim absolute pointer moves at the streamed monitor (`CGDirectDisplayID`, from
+	/// [`crate::displays::Monitor::id`]); `None` = the main display. A display that went away
+	/// falls back to the main display at the next move.
+	pub fn set_display(&mut self, display: Option<u32>) {
+		self.display = display;
+	}
+
+	/// Move the pointer to a normalized (0..1) position on the streamed display (the main
+	/// display unless [`Self::set_display`] picked another).
 	///
 	/// CGEvent global coordinates live in the **points** space (the desktop's logical
 	/// coordinate system), NOT backing pixels. Using `pixels_wide()/pixels_high()`
 	/// here put clicks at e.g. 2× the right spot on a Retina/scaled display (a 2880px
-	/// backing on a 1440pt display). `CGDisplay::bounds()` is in points, so map the
-	/// normalized position onto its `size` for a correct Retina mapping.
-	///
-	/// TODO(multi-monitor): this maps onto the MAIN display only. A capture of a
-	/// non-primary display would land the pointer on the wrong screen — a full fix
-	/// needs the captured display's bounds/origin threaded through here.
+	/// backing on a 1440pt display). `CGDisplay::bounds()` is in points (global, the
+	/// main display at 0,0), so map the normalized position onto its origin + `size`.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let bounds = CGDisplay::main().bounds();
+		let display = self
+			.display
+			.map(CGDisplay::new)
+			.filter(|d| d.is_active())
+			.unwrap_or_else(CGDisplay::main);
+		let bounds = display.bounds();
 		let px = bounds.origin.x + x.clamp(0.0, 1.0) * bounds.size.width;
 		let py = bounds.origin.y + y.clamp(0.0, 1.0) * bounds.size.height;
 		let ty = self.move_event_type();

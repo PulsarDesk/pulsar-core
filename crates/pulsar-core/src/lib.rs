@@ -17,6 +17,7 @@ pub mod config;
 pub mod connection;
 pub mod crypto;
 pub mod discovery;
+pub mod displays;
 pub mod input;
 pub mod media;
 pub mod netwatch;

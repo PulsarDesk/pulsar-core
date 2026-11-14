@@ -58,6 +58,9 @@ pub struct WaylandCapture {
 	stopped: Arc<AtomicBool>,
 	/// Where the streamed monitor sits in the output layout, see [`Self::pointer_region`].
 	pointer_region: Option<PointerRegion>,
+	/// The streamed monitor's `(x, y, w, h)` in the compositor's logical layout, as the
+	/// portal reported it; see [`Self::stream_rect`].
+	stream_rect: Option<(i32, i32, i32, i32)>,
 }
 
 /// The streamed monitor's rectangle as fractions (0..1) of the bounding box of all outputs
@@ -161,6 +164,13 @@ impl WaylandCapture {
 	/// compositor gives no geometry (then the pointer covers the whole layout, as before).
 	pub fn pointer_region(&self) -> Option<PointerRegion> {
 		self.pointer_region
+	}
+
+	/// The streamed monitor's `(x, y, w, h)` in the compositor's logical layout — which
+	/// monitor the person at the host picked in the portal dialog (map it to an index with
+	/// [`crate::displays::index_of_rect`]). `None` for a window cast / no portal geometry.
+	pub fn stream_rect(&self) -> Option<(i32, i32, i32, i32)> {
+		self.stream_rect
 	}
 
 	/// Stop the capture: tear the pipeline down and **close the portal session**.
@@ -286,6 +296,7 @@ pub async fn start(
 						short_gop,
 						stopped,
 						pointer_region,
+						stream_rect: stream_rect.map(|r| (r.x, r.y, r.w, r.h)),
 					},
 					token,
 				));
