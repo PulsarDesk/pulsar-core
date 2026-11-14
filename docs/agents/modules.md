@@ -72,7 +72,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `DesktopInput::pen` / `touch` on every platform (no-ops in the stub).
   Untested on pen / touch hardware. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
-  saying otherwise). macOS virtual pad = no-op stub.
+  saying otherwise). **macOS virtual pad** = `mac_hid.rs`: `IOHIDUserDeviceCreateWithProperties`
+  (symbols via `dlsym`, macOS 10.15+) impersonating an Xbox Wireless (BT, 045E:0B13) or DS4 (USB,
+  054C:09CC) pad; descriptors / reports / rumble decoding are pure in `virtual_hid.rs` (tested on
+  every host). Needs the restricted entitlement `com.apple.developer.hid.virtual.device`;
+  without it creation returns NULL → `PadFailure::MacEntitlement` (checked via
+  `SecTaskCopyValueForEntitlement`) → `RecordingPad`. `create_virtual_pad_checked` returns the
+  `PadFailure` for every OS (`vigem_missing`, `uinput_denied`, …); the app relays it as
+  `DataMsg::PadUnavailable { slot, reason }`. Untested on macOS hardware.
   **Touchpad pinch injection** (`DesktopInput::pinch`, `InputEvent::Pinch`, advertised by the
   desktop host as `FEAT_PINCH`): Windows = two-finger touch injection (`windows.rs`); Linux =
   a lazily created virtual uinput TOUCHPAD ("Pulsar Virtual Touchpad", `uinput.rs`) whose two

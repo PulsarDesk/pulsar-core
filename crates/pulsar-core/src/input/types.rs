@@ -182,7 +182,8 @@ pub trait VirtualGamepad: Send {
 	/// Apply the latest input state to the emulated device.
 	fn apply(&mut self, state: &GamepadState);
 	/// A blocking rumble reader for forwarding the game's force-feedback back to the
-	/// client's physical pad, if this backend supports it (ViGEm DS4 on Windows). `None`
+	/// client's physical pad, if this backend supports it (ViGEm DS4 / Duo on Windows, the
+	/// macOS virtual HID pad). `None`
 	/// otherwise. Taken once right after the pad is created.
 	fn rumble_reader(&self) -> Option<Box<dyn RumbleReader>> {
 		None
@@ -196,7 +197,7 @@ pub trait VirtualGamepad: Send {
 }
 
 /// A test/no-op backend that just records what it was told to apply. The real
-/// backends (ViGEm / uinput / IOKit) implement this same trait.
+/// backends (ViGEm / uinput / IOHIDUserDevice) implement this same trait.
 #[derive(Debug, Default)]
 pub struct RecordingPad {
 	kind_override: Option<GamepadKind>,
@@ -332,13 +333,58 @@ pub fn ds4_report_fields(state: &GamepadState) -> (u16, u8, u8, u8, u8, u8) {
 	(buttons, special, lx, ly, rx, ry)
 }
 
+/// Why the host could not create a real virtual controller (the pad then falls back to the
+/// no-op [`RecordingPad`], so its input goes nowhere). Sent to the client as
+/// `DataMsg::PadUnavailable` so the player sees why their controller does nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadFailure {
+	/// macOS: `IOHIDUserDeviceCreateWithProperties` was refused and the running build does not
+	/// carry the `com.apple.developer.hid.virtual.device` entitlement (unsigned / ad-hoc /
+	/// self-built app, or a provisioning profile without it).
+	MacEntitlement,
+	/// macOS older than 10.15: no public `IOHIDUserDevice` API.
+	MacUnsupported,
+	/// Windows: the ViGEmBus driver is not installed or not reachable.
+	VigemMissing,
+	/// Linux: `/dev/uinput` is missing or not writable for this user.
+	UinputDenied,
+	/// Anything else (the host log has the detail).
+	Other,
+}
+
+impl PadFailure {
+	/// Stable wire token (the client localizes it; unknown tokens fall back to a generic text).
+	pub fn as_wire(self) -> &'static str {
+		match self {
+			Self::MacEntitlement => "mac_entitlement",
+			Self::MacUnsupported => "mac_unsupported",
+			Self::VigemMissing => "vigem_missing",
+			Self::UinputDenied => "uinput_denied",
+			Self::Other => "unavailable",
+		}
+	}
+
+	/// Inverse of [`as_wire`](Self::as_wire); unknown tokens (a newer host) map to `Other`.
+	pub fn from_wire(s: &str) -> Self {
+		match s {
+			"mac_entitlement" => Self::MacEntitlement,
+			"mac_unsupported" => Self::MacUnsupported,
+			"vigem_missing" => Self::VigemMissing,
+			"uinput_denied" => Self::UinputDenied,
+			_ => Self::Other,
+		}
+	}
+}
+
 /// Create a host-side virtual pad for `kind` using `EmulationTarget::Auto` to select
 /// the backend. See [`create_virtual_pad_target`] for full control over the target.
 ///
 /// * Linux → a real **uinput** Xbox-style pad (falls back to recording if
 ///   `/dev/uinput` isn't writable).
 /// * Windows → a **ViGEm** Xbox 360 pad (needs the ViGEmBus driver; falls back to
-///   recording if it isn't installed). macOS → a driver, TODO (recording for now).
+///   recording if it isn't installed).
+/// * macOS → an **IOHIDUserDevice** virtual HID pad (needs the virtual-HID entitlement;
+///   falls back to recording without it).
 pub fn create_virtual_pad(kind: GamepadKind) -> Box<dyn VirtualGamepad> {
 	create_virtual_pad_target(kind, EmulationTarget::Auto)
 }
@@ -348,42 +394,73 @@ pub fn create_virtual_pad(kind: GamepadKind) -> Box<dyn VirtualGamepad> {
 /// so `Auto` maps Sony families (Ds3/Ds4/Ds5) to DS4 and everything else to Xbox
 /// 360. Explicit `Xbox360` / `Ds4` override the detected kind regardless of `kind`.
 ///
-/// Platforms:
-/// * Linux → **uinput** (falls back to recording if `/dev/uinput` isn't writable).
-/// * Windows → **ViGEm** (falls back to recording if ViGEmBus isn't installed).
-/// * macOS / other → recording (no-op) backend; `target` is documented-ignored.
+/// Never fails: an unavailable backend gives the no-op [`RecordingPad`]. Use
+/// [`create_virtual_pad_checked`] to learn why.
 pub fn create_virtual_pad_target(
 	kind: GamepadKind,
 	target: EmulationTarget,
 ) -> Box<dyn VirtualGamepad> {
+	create_virtual_pad_checked(kind, target).0
+}
+
+/// [`create_virtual_pad_target`] that also reports why the real backend was not available
+/// (`Some(failure)` ⇒ the returned pad is a no-op [`RecordingPad`]).
+///
+/// Platforms:
+/// * Linux → **uinput** (`UinputDenied` if `/dev/uinput` isn't writable).
+/// * Windows → Duo's driver inside a Duo seat, else **ViGEm** (`VigemMissing`).
+/// * macOS → **IOHIDUserDevice** virtual HID: Xbox360 target = an Xbox Wireless (Bluetooth)
+///   pad, Ds4 = a DualShock 4 (USB) — the pads macOS's GameController framework and SDL
+///   drive natively (`MacEntitlement` / `MacUnsupported` / `Other`).
+/// * any other OS → recording, `Other`.
+pub fn create_virtual_pad_checked(
+	kind: GamepadKind,
+	target: EmulationTarget,
+) -> (Box<dyn VirtualGamepad>, Option<PadFailure>) {
 	let resolved = target.resolve(kind);
 	#[cfg(target_os = "linux")]
-	{
-		match super::uinput::UinputGamepad::new_target(kind, resolved) {
-			Ok(pad) => return Box::new(pad),
-			Err(e) => {
-				tracing::warn!("uinput virtual pad unavailable ({e}); using recording backend")
-			}
+	let failure = match super::uinput::UinputGamepad::new_target(kind, resolved) {
+		Ok(pad) => return (Box::new(pad), None),
+		Err(e) => {
+			tracing::warn!("uinput virtual pad unavailable ({e}); using recording backend");
+			PadFailure::UinputDenied
 		}
-	}
+	};
 	#[cfg(windows)]
-	{
+	let failure = {
 		// Inside a Duo multi-seat session a ViGEm pad is hidden from the session's own apps by
 		// Duo's HID isolation; create the pad through Duo's controller driver instead.
 		if super::duo::wanted() {
 			match super::duo::DuoGamepad::new_target(kind, resolved) {
-				Ok(pad) => return Box::new(pad),
+				Ok(pad) => return (Box::new(pad), None),
 				Err(e) => tracing::warn!("Duo virtual pad unavailable ({e}); trying ViGEm"),
 			}
 		}
 		match super::vigem::ViGEmGamepad::new_target(kind, resolved) {
-			Ok(pad) => return Box::new(pad),
+			Ok(pad) => return (Box::new(pad), None),
 			Err(e) => {
-				tracing::warn!("ViGEm virtual pad unavailable ({e}); using recording backend")
+				tracing::warn!("ViGEm virtual pad unavailable ({e}); using recording backend");
+				PadFailure::VigemMissing
 			}
 		}
-	}
-	Box::new(RecordingPad::new(kind))
+	};
+	#[cfg(target_os = "macos")]
+	let failure = match super::mac_hid::MacHidGamepad::new_target(kind, resolved) {
+		Ok(pad) => return (Box::new(pad), None),
+		Err(f) => {
+			tracing::warn!(
+				reason = f.as_wire(),
+				"macOS virtual HID pad unavailable; using recording backend"
+			);
+			f
+		}
+	};
+	#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+	let failure = {
+		let _ = resolved;
+		PadFailure::Other
+	};
+	(Box::new(RecordingPad::new(kind)), Some(failure))
 }
 
 #[cfg(test)]
@@ -471,6 +548,20 @@ mod tests {
 		pad.apply(&st);
 		assert_eq!(pad.applied, 2);
 		assert_eq!(pad.last, Some(st));
+	}
+
+	#[test]
+	fn pad_failure_wire_tokens_round_trip() {
+		for f in [
+			PadFailure::MacEntitlement,
+			PadFailure::MacUnsupported,
+			PadFailure::VigemMissing,
+			PadFailure::UinputDenied,
+			PadFailure::Other,
+		] {
+			assert_eq!(PadFailure::from_wire(f.as_wire()), f);
+		}
+		assert_eq!(PadFailure::from_wire("something_new"), PadFailure::Other);
 	}
 
 	#[test]

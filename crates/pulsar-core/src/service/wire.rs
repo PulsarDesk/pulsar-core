@@ -575,6 +575,11 @@ enum DataMsgWire {
 	HostPointer { active: bool, x: f32, y: f32 },
 	Displays(Vec<DisplayInfo>),
 	StreamedDisplay(u32),
+	PadUnavailable {
+		slot: u8,
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -621,6 +626,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::HostPointer { active, x, y } => DataMsg::HostPointer { active, x, y },
 			DataMsgWire::Displays(d) => DataMsg::Displays(d),
 			DataMsgWire::StreamedDisplay(i) => DataMsg::StreamedDisplay(i),
+			DataMsgWire::PadUnavailable { slot, reason } => DataMsg::PadUnavailable { slot, reason },
 		}
 	}
 }
@@ -863,6 +869,18 @@ pub enum DataMsg {
 	/// pick a different one. The client moves its monitor-picker selection (and its next
 	/// requests) to `idx`. Appended for additive wire compat (an old client ignores it).
 	StreamedDisplay(u32),
+	/// Host → client: the host could not create a real virtual controller for the pad at
+	/// `slot` (macOS: the build lacks the virtual-HID entitlement; Windows: no ViGEmBus;
+	/// Linux: `/dev/uinput` not writable), so that pad's input goes nowhere this session.
+	/// `reason` is a [`PadFailure`](crate::input::PadFailure) wire token
+	/// ([`PadFailure::as_wire`](crate::input::PadFailure::as_wire)); the client shows a
+	/// localized notice for it. Sent once per failed creation. Appended for additive wire
+	/// compat (an old client ignores the unknown variant).
+	PadUnavailable {
+		slot: u8,
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1309,6 +1327,7 @@ mod tests {
 			}]),
 			DataMsg::Displays(vec![]),
 			DataMsg::StreamedDisplay(1),
+			DataMsg::PadUnavailable { slot: 1, reason: "mac_entitlement".into() },
 		];
 
 		for msg in cases {

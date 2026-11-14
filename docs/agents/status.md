@@ -16,6 +16,16 @@ Windows `PointerBackend` (SYSTEM-helper path), hover stale limit, client native 
 tests are pure and run everywhere), macOS streamed-display geometry (`avf_screens`), Linux
 Wayland region policy. Mobile's host
 `match ev` has a wildcard, so it keeps compiling on the bump (it ignores pen / touch).
+## macOS host virtual gamepad — written, untested on macOS hardware (2026-11-14)
+
+`input/mac_hid.rs` + `input/virtual_hid.rs` (see [modules.md](modules.md)). To verify on a
+Mac: build signed with the virtual-HID entitlement + provisioning profile (pulsar-desktop
+`src-tauri/entitlements/virtual-hid.plist`, release.yml "macOS signing overlay"), host a game
+session, check the pad appears in System Settings → Game Controllers / an SDL test app,
+buttons/sticks/triggers/d-pad map right for both targets, and rumble reaches the client.
+Unsigned build: expect `PadFailure::MacEntitlement` in the log and the client notice. Open
+question: do GameController and SDL accept a virtual device's VID/PID as the real pad (the
+DS4 calibration/serial feature reports are answered; motion stays zero).
 
 ## Adaptive streaming rework — shipped, awaiting the maintainer's real-session test
 

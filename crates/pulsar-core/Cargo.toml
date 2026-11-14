@@ -145,6 +145,7 @@ core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 # window_capture.rs: proc_listchildpids (a launched game's child processes).
 # macos_capture: dlopen/dlsym of ScreenCaptureKit (macOS 12.3+, never linked) + sysctl.
+# input/mac_hid.rs: dlopen/dlsym of the IOHIDUserDevice API (macOS 10.15+).
 libc = "0.2"
 # displays/macos.rs: NSScreen.localizedName for monitor names (main-thread AppKit, reached via
 # the main dispatch queue).
@@ -160,6 +161,7 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CMSampleBuffer", "CMTime", "CMBase"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+# input/mac_hid.rs: the IOHIDUserDevice get/set-report + cancel handlers are Clang blocks.
 block2 = "0.6"
 dispatch2 = { version = "0.3", features = ["std", "alloc", "objc2"] }
 
