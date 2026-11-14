@@ -217,7 +217,8 @@ impl Drop for SessionCloseGuard {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Source {
 	/// The screen stream: monitors (and windows — the dialog's own choice), restored from
-	/// the persisted token after the first pick.
+	/// the session's screen token after its first pick (the host keeps the token per
+	/// session: a re-stream skips the dialog, a new connection asks again).
 	#[default]
 	Screen,
 	/// ONE application window (the client's "Pencere" pick): the dialog offers windows
@@ -230,10 +231,10 @@ pub enum Source {
 	Window { max: (u32, u32) },
 }
 
-/// Open the portal (with the persisted restore token, if any, so the share dialog is
+/// Open the portal (with the session's restore token, if any, so the share dialog is
 /// skipped after the first time), then run the pipeline in-process — or under the system
 /// `gst-launch-1.0` when `system_gst` is set (the caller validated the encoder only there).
-/// Returns the capture and the (possibly new) restore token to persist.
+/// Returns the capture and the (possibly new) restore token for the caller to keep.
 pub async fn start(
 	ip: &str,
 	port: u16,
