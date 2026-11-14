@@ -44,11 +44,15 @@ pub use duo::{duo_available, duo_ds5_interfaces, duo_pads_wanted, DuoDs5};
 #[cfg(target_os = "linux")]
 mod uinput;
 
+/// DS4/DS5 touchpad-as-mouse gesture logic (one finger = pointer, two = scroll, press =
+/// click), shared by every client reader: Linux evdev below, and the desktop app's SDL3 /
+/// DualSense raw-HID readers on Windows and macOS.
+pub mod touchpad_mouse;
+
 /// DS4/DS5 touchpad-as-mouse reader via evdev (Linux client-side).
 ///
-/// Enumerates `/dev/input/event*` for a Sony touchpad device and synthesizes
-/// `PointerRelative` / `PointerButton` [`InputEvent`]s from raw ABS_MT / BTN
-/// events. Follow-ups: Windows (raw HID via hidapi) and macOS (IOHIDManager).
+/// Enumerates `/dev/input/event*` for a Sony touchpad device and feeds its two
+/// multitouch slots + pad click into [`touchpad_mouse::TouchpadMouse`].
 #[cfg(target_os = "linux")]
 pub mod touchpad_linux;
 
