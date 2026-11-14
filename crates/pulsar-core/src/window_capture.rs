@@ -101,6 +101,64 @@ pub fn size(id: u64) -> Option<(u32, u32)> {
 	}
 }
 
+/// The in-process window sources (macOS [`WindowStream`]) of the host's sessions, keyed by
+/// session id: the host app starts one per stream and must stop it on every re-stream and
+/// teardown ([`stop_for`]). One per session at most.
+#[cfg(target_os = "macos")]
+static SESSIONS: std::sync::Mutex<Vec<(u64, WindowStream)>> = std::sync::Mutex::new(Vec::new());
+
+/// Start capturing window `id` for `session` (replacing that session's previous one) at
+/// exactly `width`×`height` and `fps`, and return the url its raw NV12 frames are served
+/// on — the `url` of [`WindowInput::RawNv12`](crate::pipeline::WindowInput::RawNv12).
+/// macOS only (ScreenCaptureKit); every other host has no in-process window source and
+/// gets an error (X11 grabs by id in ffmpeg/gst, Wayland goes through the portal).
+pub fn serve_for(session: u64, id: u64, width: u32, height: u32, fps: u32) -> anyhow::Result<String> {
+	#[cfg(target_os = "macos")]
+	{
+		stop_for(session);
+		let stream = WindowStream::start(id, width, height, fps)?;
+		let url = stream.url().to_string();
+		SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).push((session, stream));
+		Ok(url)
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		let _ = (session, id, width, height, fps);
+		anyhow::bail!("this host has no in-process window source")
+	}
+}
+
+/// Stop `session`'s in-process window source, if any (no-op elsewhere / when none runs).
+pub fn stop_for(session: u64) {
+	#[cfg(target_os = "macos")]
+	{
+		let taken: Vec<_> = {
+			let mut g = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+			let (gone, kept) = std::mem::take(&mut *g).into_iter().partition(|(s, _)| *s == session);
+			*g = kept;
+			gone
+		};
+		// Dropped outside the lock: stopping joins the frame server thread.
+		drop(taken);
+	}
+	#[cfg(not(target_os = "macos"))]
+	let _ = session;
+}
+
+/// `session`'s in-process window source runs (`None` = it has none).
+pub fn alive_for(session: u64) -> Option<bool> {
+	#[cfg(target_os = "macos")]
+	{
+		let g = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		g.iter().find(|(s, _)| *s == session).map(|(_, w)| w.is_alive())
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		let _ = session;
+		None
+	}
+}
+
 /// The window of a launched program: the largest listed window owned by `pid` **or any of
 /// its descendants** (launchers such as Steam start the real game in a child). A single
 /// attempt — games open their window seconds after starting, so the caller polls.

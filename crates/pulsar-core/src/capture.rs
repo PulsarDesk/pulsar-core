@@ -221,10 +221,12 @@ pub enum Source {
 	#[default]
 	Screen,
 	/// ONE application window (the client's "Pencere" pick): the dialog offers windows
-	/// only and the pick is never persisted (another window next time; the screen token is
-	/// left alone). Wayland lets no program list or choose other programs' windows, so the
-	/// person at the host picks it. Frames are scaled into an even `max` box keeping the
-	/// window's aspect, so a resize never changes the encoded size.
+	/// only. Wayland lets no program list or choose other programs' windows, so the person
+	/// at the host picks it. The restore token passed and returned is then a WINDOW token
+	/// (the caller keeps it apart from the screen's, so a re-stream re-opens the same window
+	/// without the dialog, and the screen pick is never replaced by a window). Frames are
+	/// scaled into an even `max` box keeping the window's aspect, so a resize never changes
+	/// the encoded size.
 	Window { max: (u32, u32) },
 }
 
@@ -242,8 +244,7 @@ pub async fn start(
 	start_with(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen).await
 }
 
-/// [`start`] for a chosen [`Source`]. For [`Source::Window`] the restore token is
-/// ignored and the returned token is always `None`.
+/// [`start`] for a chosen [`Source`] (the restore token is of that source's kind).
 pub async fn start_with(
 	ip: &str,
 	port: u16,
@@ -284,9 +285,7 @@ pub async fn start_with(
 			false
 		}
 	};
-	let (mut guard, node_id, pw_fd, token, stream_rect, cast_size) =
-		open_portal(if window { None } else { restore_token }, window).await?;
-	let token = if window { None } else { token };
+	let (mut guard, node_id, pw_fd, token, stream_rect, cast_size) = open_portal(restore_token, window).await?;
 	let size = size_for(cast_size);
 	if window {
 		tracing::info!(?cast_size, ?size, "wayland window cast");
@@ -497,16 +496,12 @@ async fn run_child(desc: &str) -> anyhow::Result<std::process::Child> {
 /// monitor's layout rect, and the cast's size (any source type).
 type PortalCast = (SessionCloseGuard, u32, OwnedFd, Option<String>, Option<Rect>, Option<(i32, i32)>);
 
-/// `window`: offer windows only and never persist the pick (see [`Source::Window`]).
+/// `window`: offer windows only (see [`Source::Window`]).
 async fn open_portal(restore_token: Option<String>, window: bool) -> anyhow::Result<PortalCast> {
 	let proxy: Screencast = Screencast::new().await?;
 	let session: Session<Screencast> = proxy.create_session(Default::default()).await?;
 	let guard = SessionCloseGuard(Some(session));
-	let (sources, persist) = if window {
-		(SourceType::Window.into(), PersistMode::DoNot)
-	} else {
-		(SourceType::Monitor | SourceType::Window, PersistMode::Application)
-	};
+	let sources = if window { SourceType::Window.into() } else { SourceType::Monitor | SourceType::Window };
 	let (node_id, pw_fd, token, rect, size) = async {
 		let session = guard.0.as_ref().expect("session present");
 		proxy
@@ -517,7 +512,7 @@ async fn open_portal(restore_token: Option<String>, window: bool) -> anyhow::Res
 					.set_sources(sources)
 					.set_multiple(false)
 					.set_restore_token(restore_token.as_deref())
-					.set_persist_mode(persist),
+					.set_persist_mode(PersistMode::Application),
 			)
 			.await?;
 		let response = proxy

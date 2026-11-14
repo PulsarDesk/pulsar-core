@@ -286,7 +286,8 @@ pub struct WindowStream {
 impl WindowStream {
 	/// Start capturing window `id` (a `CGWindowID`) at exactly `width`×`height` (even;
 	/// the window is scaled into it keeping its aspect) and serve it at `fps`. The url
-	/// ([`Self::url`]) accepts ONE reader (ffmpeg) within 20 s.
+	/// ([`Self::url`]) serves one reader (ffmpeg) at a time; each must connect within 20 s
+	/// of the previous one leaving.
 	pub fn start(id: u64, width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
 		let (w, h) = ((width.max(2) & !1) as usize, (height.max(2) & !1) as usize);
 		let fps = fps.clamp(1, 240);
@@ -381,7 +382,7 @@ impl WindowStream {
 		&self.url
 	}
 
-	/// The window stream still runs (not stopped by macOS, the reader still connected).
+	/// The window stream still runs (not stopped by macOS, and a reader came in time).
 	pub fn is_alive(&self) -> bool {
 		!self.shared.dead.load(Ordering::Acquire)
 	}
@@ -405,26 +406,38 @@ impl Drop for WindowStream {
 	}
 }
 
-/// Accept ffmpeg, then write the latest frame every `1/fps` until stopped or it leaves.
+/// Serve readers one after another: accept ffmpeg, write the latest frame every `1/fps`
+/// until it leaves, then wait for the next one (the host's encoder fallback chain spawns a
+/// new ffmpeg on the same url when one dies). Ends on stop, or when no reader comes.
 fn serve(listener: TcpListener, shared: Arc<Shared>, fps: u32) {
-	let Some(mut sock) = accept(&listener, &shared) else {
-		shared.dead.store(true, Ordering::Release);
-		return;
-	};
-	let _ = sock.set_nodelay(true);
 	let mut buf = shared.frame.lock().unwrap().clone();
 	let mut seen = 0u64;
+	while !shared.stop.load(Ordering::Acquire) {
+		let Some(mut sock) = accept(&listener, &shared) else {
+			if !shared.stop.load(Ordering::Acquire) {
+				shared.dead.store(true, Ordering::Release);
+			}
+			return;
+		};
+		let _ = sock.set_nodelay(true);
+		// A reader that stops reading must not wedge the server (and `Drop`'s join).
+		let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+		write_frames(&mut sock, &shared, fps, &mut buf, &mut seen);
+	}
+}
+
+/// Write frames to one reader until it leaves or the stream stops.
+fn write_frames(sock: &mut TcpStream, shared: &Shared, fps: u32, buf: &mut [u8], seen: &mut u64) {
 	let tick = Duration::from_secs_f64(1.0 / fps as f64);
 	let mut next = Instant::now();
 	while !shared.stop.load(Ordering::Acquire) {
 		let got = shared.received.load(Ordering::Acquire);
-		if got != seen {
-			seen = got;
+		if got != *seen {
+			*seen = got;
 			buf.copy_from_slice(&shared.frame.lock().unwrap());
 		}
-		if let Err(e) = sock.write_all(&buf) {
+		if let Err(e) = sock.write_all(buf) {
 			tracing::info!("window frame reader left: {e}");
-			shared.dead.store(true, Ordering::Release);
 			return;
 		}
 		next += tick;
