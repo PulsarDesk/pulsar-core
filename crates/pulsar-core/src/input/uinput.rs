@@ -153,6 +153,8 @@ pub struct DesktopInput {
 	held_keys: std::collections::HashSet<u16>,
 	/// Lazily started virtual-touchpad pinch worker (see `pinch`).
 	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
+	/// Lazily started pen / touch worker (uinput tablet + touchscreen, see `pen_touch`).
+	pen_touch: Option<super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>>>,
 }
 
 /// Commands for the touchpad-pinch worker thread.
@@ -433,7 +435,28 @@ impl DesktopInput {
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
 			pinch_tx: None,
+			pen_touch: None,
 		})
+	}
+
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>> {
+		let region = self.region;
+		self.pen_touch.get_or_insert_with(|| {
+			let w = super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::UinputSink::new);
+			w.set_geom(region);
+			w
+		})
+	}
+
+	/// Client pen state (`InputEvent::Pen`) → the uinput tablet (pressure, tilt, eraser,
+	/// barrel, hover) on the streamed monitor.
+	pub fn pen(&mut self, s: super::pen_touch::PenState) {
+		self.pen_touch().pen(s);
+	}
+
+	/// Client touch frame (`InputEvent::Touch`) → the uinput multitouch screen.
+	pub fn touch(&mut self, f: super::pen_touch::TouchFrame) {
+		self.pen_touch().touch(f);
 	}
 
 	/// Confine absolute pointer moves to the streamed monitor. The compositor maps the
@@ -441,6 +464,11 @@ impl DesktopInput {
 	/// multi-monitor host an unmapped 0..1 position lands on whichever monitor that point
 	/// of the box belongs to — the cursor left the screen the client was looking at.
 	pub fn set_region(&mut self, region: Option<crate::capture::PointerRegion>) {
+		if self.region != region {
+			if let Some(w) = &self.pen_touch {
+				w.set_geom(region);
+			}
+		}
 		self.region = region;
 	}
 
@@ -597,6 +625,9 @@ impl DesktopInput {
 	pub fn flush_held(&mut self) {
 		if let Some(tx) = &self.pinch_tx {
 			let _ = tx.send(PinchCmd::End); // never leave the virtual fingers down
+		}
+		if let Some(w) = &self.pen_touch {
+			w.release(); // lift the pen / every finger
 		}
 		let btn_up: Vec<InputEvent> = self
 			.held_buttons

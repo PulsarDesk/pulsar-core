@@ -228,6 +228,8 @@ pub struct DesktopInput {
 	monitor: Option<MonitorRect>,
 	/// Lazily started touch-pinch worker (see `pinch`).
 	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
+	/// Lazily started pen / touch worker (synthetic pointer devices, see `pen_touch`).
+	pen_touch: Option<super::pen_touch::PenTouch<Option<MonitorRect>>>,
 }
 
 /// Commands for the touch-pinch worker thread.
@@ -349,7 +351,28 @@ impl DesktopInput {
 			scroll_acc_h: 0.0,
 			monitor: None,
 			pinch_tx: None,
+			pen_touch: None,
 		})
+	}
+
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<Option<MonitorRect>> {
+		let monitor = self.monitor;
+		self.pen_touch.get_or_insert_with(|| {
+			let w = super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::WinSink::new);
+			w.set_geom(monitor);
+			w
+		})
+	}
+
+	/// Client pen state (`InputEvent::Pen`) → a synthetic `PT_PEN` pointer on the streamed
+	/// monitor (pressure, tilt, rotation, eraser, barrel, hover).
+	pub fn pen(&mut self, s: super::pen_touch::PenState) {
+		self.pen_touch().pen(s);
+	}
+
+	/// Client touch frame (`InputEvent::Touch`) → a synthetic `PT_TOUCH` device (multi-touch).
+	pub fn touch(&mut self, f: super::pen_touch::TouchFrame) {
+		self.pen_touch().touch(f);
 	}
 
 	/// Touchpad pinch from the client (`InputEvent::Pinch`): phase 0 begin / 1 update / 2 end,
@@ -377,6 +400,9 @@ impl DesktopInput {
 	/// the stream's `display_idx` is (re)selected.
 	pub fn set_monitor(&mut self, rect: Option<MonitorRect>) {
 		self.monitor = rect;
+		if let Some(w) = &self.pen_touch {
+			w.set_geom(rect);
+		}
 	}
 
 	/// Move the pointer to a normalized (0..1) position on the streamed monitor. When a
@@ -522,6 +548,9 @@ impl DesktopInput {
 	pub fn flush_held(&mut self) {
 		if let Some(tx) = &self.pinch_tx {
 			let _ = tx.send(PinchCmd::End); // never leave injected fingers down
+		}
+		if let Some(w) = &self.pen_touch {
+			w.release(); // lift the pen / every injected finger
 		}
 		for b in self.held_buttons.drain() {
 			let flag = match b {

@@ -2,6 +2,21 @@
 
 Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
 
+## Pen + multi-touch — branch `parity/pen-touch`, LOCAL, untested on hardware
+
+`input/pen_touch/` (see [modules.md](modules.md)): `InputEvent::Pen` / `InputEvent::Touch`,
+features `pen` / `touch`, injection on Windows (synthetic pointer devices), Linux (uinput
+tablet + MT type B) and macOS (CGEvent tablet; touch mapped to mouse + scroll — no public
+touch injection exists). Old peers: an old host's `dec` drops the unknown variant, and new
+clients only send them to hosts advertising the feature (others get mouse events). Unit
+tests run on Windows + Linux; macOS is type-checked only. Never run with a real pen or
+touchscreen on any platform; desktop counterpart on the same-named branch. Since the review:
+Windows `PointerBackend` (SYSTEM-helper path), hover stale limit, client native tablet capture
+(`pen_touch/tablet.rs`: macOS CGEventTap, Linux evdev — Linux code is type-checked only, its
+tests are pure and run everywhere), macOS streamed-display geometry (`avf_screens`), Linux
+Wayland region policy. Mobile's host
+`match ev` has a wildcard, so it keeps compiling on the bump (it ignores pen / touch).
+
 ## Adaptive streaming rework — shipped, awaiting the maintainer's real-session test
 
 **Design, phased plan and implementation status: [`../adaptive-streaming.md`](../adaptive-streaming.md).**

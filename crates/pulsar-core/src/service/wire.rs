@@ -82,6 +82,16 @@ pub enum InputEvent {
 	/// advertises [`FEAT_DS5`](crate::input::ds5::wire::FEAT_DS5); the host replays it on
 	/// its virtual wired DualSense. Additive new→new variant; old hosts drop it.
 	Ds5Input { slot: u8, report: crate::input::ds5::wire::Ds5Report },
+	/// Stylus state (position, pressure, tilt, twist, eraser, barrel button, hover) — the
+	/// whole pen, not an edge; re-sent every [`KEEPALIVE`](crate::input::pen_touch::KEEPALIVE)
+	/// while in range. Additive new→new variant: sent only to hosts that advertise
+	/// [`FEAT_PEN`](crate::service::media::FEAT_PEN) (old hosts drop an unknown variant
+	/// anyway); every other host gets the pen as mouse events.
+	Pen(crate::input::pen_touch::PenState),
+	/// Every finger on the client's screen (empty = all lifted), re-sent while any is down.
+	/// Sent only to hosts that advertise [`FEAT_TOUCH`](crate::service::media::FEAT_TOUCH);
+	/// others get the touch as mouse events (tap = click, drag, two-finger scroll).
+	Touch(crate::input::pen_touch::TouchFrame),
 }
 
 /// How the client wants the host to bias the encode: minimize latency, balance,
@@ -1372,5 +1382,39 @@ mod tests {
 			}
 			other => panic!("expected GamepadSlot, got {other:?}"),
 		}
+	}
+
+	/// Pen / touch travel as plain JSON (literal form locked so a future change stays
+	/// additive), and an OLD host's `InputEvent` (no such variants) fails to parse them —
+	/// the service's `dec` then drops the message instead of misreading it.
+	#[test]
+	fn pen_and_touch_wire_form() {
+		use crate::input::pen_touch::{PenState, TouchFrame, TouchPoint};
+		let pen = InputEvent::Pen(PenState {
+			x: 0.5,
+			y: 0.25,
+			pressure: 0.75,
+			in_range: true,
+			contact: true,
+			..Default::default()
+		});
+		let json = serde_json::to_string(&pen).unwrap();
+		assert!(json.starts_with(r#"{"Pen":{"x":0.5,"y":0.25,"pressure":0.75"#), "{json}");
+		assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), pen);
+		let touch = InputEvent::Touch(TouchFrame::new(&[TouchPoint { id: 3, x: 0.5, y: 0.5, pressure: 0.0 }]));
+		let json = serde_json::to_string(&touch).unwrap();
+		assert_eq!(json, r#"{"Touch":[{"id":3,"x":0.5,"y":0.5,"pressure":0.0}]}"#);
+		assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), touch);
+		// A newer client may add pen fields; this host ignores them.
+		let ev: InputEvent =
+			serde_json::from_str(r#"{"Pen":{"x":0.1,"y":0.2,"in_range":true,"future":1}}"#).unwrap();
+		assert!(matches!(ev, InputEvent::Pen(p) if p.in_range && !p.contact));
+		// What an old host sees: an enum without these variants rejects the message.
+		#[derive(serde::Deserialize)]
+		#[allow(dead_code)]
+		enum OldInputEvent {
+			PointerMotion { x: f64, y: f64 },
+		}
+		assert!(serde_json::from_str::<OldInputEvent>(&json).is_err());
 	}
 }

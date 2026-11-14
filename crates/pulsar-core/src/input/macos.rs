@@ -15,7 +15,6 @@
 //! process must run in a GUI session — a LaunchDaemon with no window server has no
 //! event stream to post into.)
 
-use core_graphics::display::CGDisplay;
 use core_graphics::event::{
 	CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
 };
@@ -186,11 +185,16 @@ pub struct DesktopInput {
 	last_point: CGPoint,
 	/// Cumulative scale of the open magnify gesture (`pinch`); `None` = no gesture open.
 	pinch_prev: Option<f64>,
-	/// The streamed monitor (`CGDirectDisplayID`, see [`Self::set_display`]); `None` = main.
-	display: Option<u32>,
 	/// Per-window capture: the streamed window's frame (global points); absolute moves map
 	/// onto it instead of the main display (see [`Self::set_window_rect`]).
 	window: Option<crate::window_capture::WindowRect>,
+	/// Lazily started pen / touch worker (CGEvent tablet events, touch as mouse — see
+	/// `pen_touch`). A channel sender, so the struct stays `Send`.
+	pen_touch: Option<super::pen_touch::PenTouch<Option<u32>>>,
+	/// The streamed display (CGDirectDisplayID, see [`Self::set_display`]; `None` = the one
+	/// the capture published, else the main display): absolute pointer, pen and touch
+	/// positions land on it.
+	display: Option<u32>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -225,9 +229,42 @@ impl DesktopInput {
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
 			pinch_prev: None,
-			display: None,
 			window: None,
+			pen_touch: None,
+			display: None,
 		})
+	}
+
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<Option<u32>> {
+		let display = self.display;
+		self.pen_touch.get_or_insert_with(|| {
+			let w = super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::MacSink::new);
+			w.set_geom(display);
+			w
+		})
+	}
+
+	/// Aim absolute pointer, pen and touch moves at the streamed monitor (`CGDirectDisplayID`,
+	/// from [`crate::displays::Monitor::id`] / `avf_screens`); `None` = the display the capture
+	/// published ([`crate::macos_capture::streamed_display`]), else the main display. A display
+	/// that went away falls back the same way at the next move.
+	pub fn set_display(&mut self, id: Option<u32>) {
+		self.display = id;
+		if let Some(w) = &self.pen_touch {
+			w.set_geom(id);
+		}
+	}
+
+	/// Client pen state (`InputEvent::Pen`) → CGEvent tablet proximity + tablet-point mouse
+	/// events with pressure / tilt / rotation.
+	pub fn pen(&mut self, s: super::pen_touch::PenState) {
+		self.pen_touch().pen(s);
+	}
+
+	/// Client touch frame (`InputEvent::Touch`) → mouse + scroll (macOS has no public touch
+	/// injection; see `pen_touch/macos.rs`).
+	pub fn touch(&mut self, f: super::pen_touch::TouchFrame) {
+		self.pen_touch().touch(f);
 	}
 
 	/// A fresh HIDSystemState event source. HIDSystemState: events appear to come
@@ -279,14 +316,6 @@ impl DesktopInput {
 		}
 	}
 
-	/// Aim absolute pointer moves at the streamed monitor (`CGDirectDisplayID`, from
-	/// [`crate::displays::Monitor::id`]); `None` = the display the capture published
-	/// ([`crate::macos_capture::streamed_display`]), else the main display. A display that
-	/// went away falls back the same way at the next move.
-	pub fn set_display(&mut self, display: Option<u32>) {
-		self.display = display;
-	}
-
 	/// Move the pointer to a normalized (0..1) position on the streamed display (the one
 	/// [`Self::set_display`] picked, else the one the capture published, else the main one).
 	///
@@ -306,14 +335,7 @@ impl DesktopInput {
 		let (px, py) = match self.window {
 			Some(r) => window_point(r, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)),
 			None => {
-				let bounds = self
-					.display
-					.filter(|&id| id != 0)
-					.or_else(|| Some(crate::macos_capture::streamed_display()).filter(|&id| id != 0))
-					.map(|id| CGDisplay::new(id).bounds())
-					// An unplugged display reports an empty rect: fall back to the main one.
-					.filter(|b| b.size.width > 0.0 && b.size.height > 0.0)
-					.unwrap_or_else(|| CGDisplay::main().bounds());
+				let bounds = super::pen_touch::macos_display_bounds(self.display);
 				crate::macos_capture::map_to_display(
 					x,
 					y,
@@ -462,6 +484,9 @@ impl DesktopInput {
 	pub fn flush_held(&mut self) {
 		// Never leave a magnify gesture open in the window server.
 		self.pinch(2, 1.0);
+		if let Some(w) = &self.pen_touch {
+			w.release(); // lift the pen / the touch-held button
+		}
 		let point = self.current_location();
 		for b in self.held_buttons.clone() {
 			let (cg_btn, ty) = button_events(b, false);
