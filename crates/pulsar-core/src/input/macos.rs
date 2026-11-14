@@ -184,6 +184,8 @@ pub struct DesktopInput {
 	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
 	/// (the menu-bar corner); we fall back to this last-known position instead.
 	last_point: CGPoint,
+	/// Cumulative scale of the open magnify gesture (`pinch`); `None` = no gesture open.
+	pinch_prev: Option<f64>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -217,6 +219,7 @@ impl DesktopInput {
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
+			pinch_prev: None,
 		})
 	}
 
@@ -392,10 +395,6 @@ impl DesktopInput {
 	///
 	/// We do NOT stamp `self.flags` here: the codepoint is already the resolved
 	/// character, so asserting e.g. Shift would risk re-interpreting it.
-	/// Pinch gestures are not injected on this platform (the host doesn't advertise
-	/// `FEAT_PINCH`, so clients send Ctrl + wheel instead).
-	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
-
 	pub fn type_char(&mut self, c: char) {
 		let mut buf = [0u16; 2];
 		let units = c.encode_utf16(&mut buf);
@@ -417,6 +416,8 @@ impl DesktopInput {
 	/// (drag-select) stays stuck on the host. Idempotent — cleared sets make
 	/// repeat calls no-ops.
 	pub fn flush_held(&mut self) {
+		// Never leave a magnify gesture open in the window server.
+		self.pinch(2, 1.0);
 		let point = self.current_location();
 		for b in self.held_buttons.clone() {
 			let (cg_btn, ty) = button_events(b, false);
@@ -444,6 +445,132 @@ impl DesktopInput {
 	}
 }
 
+impl DesktopInput {
+	/// Touchpad pinch from the client (`InputEvent::Pinch`): phase 0 begin / 1 update / 2 end,
+	/// `scale` cumulative since begin. Posted as a trackpad MAGNIFY gesture (what a real
+	/// trackpad pinch produces: `NSEventTypeMagnify` in the app under the cursor — Safari,
+	/// Preview, Maps, Photos zoom smoothly). There is no public API to create gesture events,
+	/// so this uses the window server's gesture event layout (see `gesture`); untested on
+	/// macOS hardware.
+	pub fn pinch(&mut self, phase: u8, scale: f64) {
+		let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+		match phase {
+			0 => {
+				if self.pinch_prev.is_some() {
+					gesture::end();
+				}
+				gesture::begin();
+				self.pinch_prev = Some(1.0);
+				if (scale - 1.0).abs() > f64::EPSILON {
+					gesture::magnify(gesture::PHASE_CHANGED, scale - 1.0);
+					self.pinch_prev = Some(scale);
+				}
+			}
+			1 => {
+				let prev = match self.pinch_prev {
+					Some(p) => p,
+					None => {
+						// An update without its begin (lost / reordered): open the gesture.
+						gesture::begin();
+						1.0
+					}
+				};
+				gesture::magnify(gesture::PHASE_CHANGED, magnify_delta(prev, scale));
+				self.pinch_prev = Some(scale);
+			}
+			_ => {
+				if self.pinch_prev.take().is_some() {
+					gesture::end();
+				}
+			}
+		}
+	}
+}
+
+/// The per-event magnification macOS reports (`NSEvent.magnification`): the relative change
+/// since the previous event, so the product of `1 + m` over a gesture is its total scale.
+fn magnify_delta(prev: f64, now: f64) -> f64 {
+	if prev > 0.0 && now.is_finite() {
+		(now / prev - 1.0).clamp(-0.9, 4.0)
+	} else {
+		0.0
+	}
+}
+
+/// Synthetic trackpad gesture events (CoreGraphics private event layout). A pinch is a
+/// "begin gesture" event, magnify events (phase began / changed / ended, value =
+/// relative magnification), and an "end gesture" event — the same sequence the trackpad
+/// driver produces and the one tools like Hammerspoon (`hs.eventtap.event.newGesture`) post.
+/// `CGEventCreate(NULL)` stamps the current cursor location, so the gesture lands on the
+/// window under the pointer (like the Windows host's touch pinch at the cursor).
+mod gesture {
+	use std::ffi::c_void;
+
+	type CGEventRef = *mut c_void;
+	/// `kCGSEventGesture` — the window server's gesture event type (not in `CGEventType`).
+	const EVENT_GESTURE: u32 = 29;
+	/// Private `CGEventField`s of a gesture event.
+	const FIELD_HID_TYPE: u32 = 110;
+	const FIELD_ZOOM_VALUE: u32 = 113;
+	const FIELD_PHASE: u32 = 132;
+	/// IOHIDEventType subtypes: zoom (magnify) and the begin/end gesture brackets.
+	const HID_ZOOM: i64 = 8;
+	const HID_BEGIN_GESTURE: i64 = 61;
+	const HID_END_GESTURE: i64 = 62;
+	/// Gesture phases (`kCGSGesturePhase*`).
+	pub const PHASE_BEGAN: i64 = 1;
+	pub const PHASE_CHANGED: i64 = 2;
+	pub const PHASE_ENDED: i64 = 4;
+	/// `kCGHIDEventTap`.
+	const TAP_HID: u32 = 0;
+
+	#[link(name = "CoreGraphics", kind = "framework")]
+	unsafe extern "C" {
+		fn CGEventCreate(source: *const c_void) -> CGEventRef;
+		fn CGEventSetType(event: CGEventRef, ty: u32);
+		fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+		fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
+		fn CGEventPost(tap: u32, event: CGEventRef);
+	}
+	#[link(name = "CoreFoundation", kind = "framework")]
+	unsafe extern "C" {
+		fn CFRelease(cf: *const c_void);
+	}
+
+	fn post(hid_type: i64, phase: Option<i64>, zoom: Option<f64>) {
+		unsafe {
+			let ev = CGEventCreate(std::ptr::null());
+			if ev.is_null() {
+				return;
+			}
+			CGEventSetType(ev, EVENT_GESTURE);
+			CGEventSetIntegerValueField(ev, FIELD_HID_TYPE, hid_type);
+			if let Some(z) = zoom {
+				CGEventSetDoubleValueField(ev, FIELD_ZOOM_VALUE, z);
+			}
+			if let Some(p) = phase {
+				CGEventSetIntegerValueField(ev, FIELD_PHASE, p);
+			}
+			CGEventPost(TAP_HID, ev);
+			CFRelease(ev as *const c_void);
+		}
+	}
+
+	pub fn begin() {
+		post(HID_BEGIN_GESTURE, None, None);
+		magnify(PHASE_BEGAN, 0.0);
+	}
+
+	pub fn magnify(phase: i64, value: f64) {
+		post(HID_ZOOM, Some(phase), Some(value));
+	}
+
+	pub fn end() {
+		magnify(PHASE_ENDED, 0.0);
+		post(HID_END_GESTURE, None, None);
+	}
+}
+
 // Compile-time guarantee: the host serve loop holds DesktopInput across awaits
 // (tokio task), so it MUST be Send — this is exactly what broke the first CI mac
 // build when a CGEventSource (non-Send NonNull) was stored in the struct.
@@ -463,8 +590,19 @@ impl Drop for DesktopInput {
 
 #[cfg(test)]
 mod tests {
-	use super::{evdev_modifier_flag, evdev_to_vk};
+	use super::{evdev_modifier_flag, evdev_to_vk, magnify_delta};
 	use core_graphics::event::CGEventFlags;
+
+	#[test]
+	fn magnify_delta_is_relative_to_the_previous_step() {
+		assert!((magnify_delta(1.0, 1.1) - 0.1).abs() < 1e-9);
+		assert!((magnify_delta(2.0, 1.0) + 0.5).abs() < 1e-9);
+		// The deltas compose back to the cumulative scale.
+		let total = (1.0 + magnify_delta(1.0, 1.2)) * (1.0 + magnify_delta(1.2, 1.5));
+		assert!((total - 1.5).abs() < 1e-9);
+		assert_eq!(magnify_delta(0.0, 1.5), 0.0);
+		assert_eq!(magnify_delta(1.0, f64::NAN), 0.0);
+	}
 
 	#[test]
 	fn maps_common_evdev_keys_to_mac_vk() {
