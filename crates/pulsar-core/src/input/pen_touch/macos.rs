@@ -11,8 +11,9 @@
 //!   fingers = pixel scroll that follows the fingers. Pinch / rotate cannot be injected
 //!   (no public magnify-gesture event).
 //!
-//! Positions map onto the main display in points, like `DesktopInput::pointer`. Posting
-//! needs the Accessibility grant (see `input/macos.rs`). Untested on macOS hardware.
+//! Positions map onto the streamed display in points (`Geom` = its CGDirectDisplayID, set by
+//! `DesktopInput::set_display`; `None` = the main display), like `DesktopInput::pointer`.
+//! Posting needs the Accessibility grant (see `input/macos.rs`). Untested on macOS hardware.
 
 use super::mouse::{MouseAct, TouchMouse};
 use super::{PenState, Sink, SlotChange, TouchFrame};
@@ -58,8 +59,17 @@ fn source() -> Option<CGEventSource> {
 	CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()
 }
 
-fn to_point(x: f32, y: f32) -> CGPoint {
-	let b = CGDisplay::main().bounds();
+/// The bounds (global points) of display `id`, or of the main display when `id` is `None` or
+/// no longer active.
+pub(crate) fn display_bounds(id: Option<u32>) -> core_graphics::geometry::CGRect {
+	if let Some(b) = id.map(|i| CGDisplay::new(i).bounds()).filter(|b| b.size.width > 0.0 && b.size.height > 0.0) {
+		return b;
+	}
+	CGDisplay::main().bounds()
+}
+
+fn to_point(display: Option<u32>, x: f32, y: f32) -> CGPoint {
+	let b = display_bounds(display);
 	CGPoint::new(
 		b.origin.x + x.clamp(0.0, 1.0) as f64 * b.size.width,
 		b.origin.y + y.clamp(0.0, 1.0) as f64 * b.size.height,
@@ -79,6 +89,7 @@ fn mouse_type(m: PenMouse) -> (CGEventType, CGMouseButton) {
 }
 
 pub(crate) struct MacSink {
+	display: Option<u32>,
 	pen_held: Option<u8>,
 	touch: TouchMouse,
 	touch_pressed: bool,
@@ -88,13 +99,13 @@ pub(crate) struct MacSink {
 impl MacSink {
 	pub(crate) fn new() -> Option<Self> {
 		source()?;
-		Some(Self { pen_held: None, touch: TouchMouse::default(), touch_pressed: false, last_touch: CGPoint::new(0.0, 0.0) })
+		Some(Self { display: None, pen_held: None, touch: TouchMouse::default(), touch_pressed: false, last_touch: CGPoint::new(0.0, 0.0) })
 	}
 
 	fn proximity(&self, s: &PenState, enter: bool) {
 		let Some(ev) = source().and_then(|src| CGEvent::new(src).ok()) else { return };
 		ev.set_type(CGEventType::TabletProximity);
-		ev.set_location(to_point(s.x, s.y));
+		ev.set_location(to_point(self.display, s.x, s.y));
 		ev.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_DEVICE_ID, DEVICE_ID);
 		ev.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_SYSTEM_TABLET_ID, 1);
 		ev.set_integer_value_field(EventField::TABLET_PROXIMITY_EVENT_POINTER_ID, 1);
@@ -109,7 +120,7 @@ impl MacSink {
 
 	fn pen_event(&self, m: PenMouse, s: &PenState) {
 		let (ty, btn) = mouse_type(m);
-		let at = to_point(s.x, s.y);
+		let at = to_point(self.display, s.x, s.y);
 		let Some(ev) = source().and_then(|src| CGEvent::new_mouse_event(src, ty, at, btn).ok()) else { return };
 		// The subtype first: CoreGraphics reads the tablet fields only for a tablet event.
 		ev.set_integer_value_field(EventField::MOUSE_EVENT_SUB_TYPE, SUBTYPE_TABLET_POINT);
@@ -131,7 +142,7 @@ impl MacSink {
 		for a in acts {
 			match a {
 				MouseAct::Move { x, y } => {
-					self.last_touch = to_point(x, y);
+					self.last_touch = to_point(self.display, x, y);
 					let ty = if self.touch_pressed { CGEventType::LeftMouseDragged } else { CGEventType::MouseMoved };
 					self.post_mouse(ty, CGMouseButton::Left);
 				}
@@ -148,7 +159,7 @@ impl MacSink {
 					self.post_mouse(ty, btn);
 				}
 				MouseAct::Scroll { dx, dy } => {
-					let b = CGDisplay::main().bounds();
+					let b = display_bounds(self.display);
 					// CG: positive wheel = content moves down (scroll toward the top).
 					let v = (-dy as f64 * b.size.height).round() as i32;
 					let h = (-dx as f64 * b.size.width).round() as i32;
@@ -174,8 +185,10 @@ impl MacSink {
 }
 
 impl Sink for MacSink {
-	type Geom = ();
-	fn set_geom(&mut self, _: ()) {}
+	type Geom = Option<u32>;
+	fn set_geom(&mut self, g: Option<u32>) {
+		self.display = g;
+	}
 	fn pen(&mut self, prev: &PenState, next: &PenState) {
 		let tool_change = prev.in_range && next.in_range && prev.eraser != next.eraser;
 		if prev.in_range && (!next.in_range || tool_change) {

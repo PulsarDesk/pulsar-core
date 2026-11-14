@@ -36,7 +36,7 @@ pub(crate) use linux::UinputSink;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub(crate) use macos::MacSink;
+pub(crate) use macos::{display_bounds as macos_display_bounds, MacSink};
 
 /// Most simultaneous touch contacts carried and injected (Windows synthetic touch devices,
 /// the Linux multitouch slots). Extra fingers are ignored.

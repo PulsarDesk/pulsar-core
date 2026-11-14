@@ -186,7 +186,10 @@ pub struct DesktopInput {
 	last_point: CGPoint,
 	/// Lazily started pen / touch worker (CGEvent tablet events, touch as mouse — see
 	/// `pen_touch`). A channel sender, so the struct stays `Send`.
-	pen_touch: Option<super::pen_touch::PenTouch<()>>,
+	pen_touch: Option<super::pen_touch::PenTouch<Option<u32>>>,
+	/// The streamed display (CGDirectDisplayID; `None` = the main display): absolute pointer,
+	/// pen and touch positions land on it.
+	display: Option<u32>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -221,12 +224,25 @@ impl DesktopInput {
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
 			pen_touch: None,
+			display: None,
 		})
 	}
 
-	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<()> {
-		self.pen_touch
-			.get_or_insert_with(|| super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::MacSink::new))
+	fn pen_touch(&mut self) -> &super::pen_touch::PenTouch<Option<u32>> {
+		let display = self.display;
+		self.pen_touch.get_or_insert_with(|| {
+			let w = super::pen_touch::PenTouch::spawn("pulsar-pen-touch", super::pen_touch::MacSink::new);
+			w.set_geom(display);
+			w
+		})
+	}
+
+	/// The display the host streams (CGDirectDisplayID, see `avf_screens`); `None` = main.
+	pub fn set_display(&mut self, id: Option<u32>) {
+		self.display = id;
+		if let Some(w) = &self.pen_touch {
+			w.set_geom(id);
+		}
 	}
 
 	/// Client pen state (`InputEvent::Pen`) → CGEvent tablet proximity + tablet-point mouse
@@ -302,7 +318,7 @@ impl DesktopInput {
 	/// non-primary display would land the pointer on the wrong screen — a full fix
 	/// needs the captured display's bounds/origin threaded through here.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let bounds = CGDisplay::main().bounds();
+		let bounds = super::pen_touch::macos_display_bounds(self.display);
 		let px = bounds.origin.x + x.clamp(0.0, 1.0) * bounds.size.width;
 		let py = bounds.origin.y + y.clamp(0.0, 1.0) * bounds.size.height;
 		let ty = self.move_event_type();
