@@ -253,6 +253,32 @@ pub fn x11_pipeline(
 	)
 }
 
+/// X11 pipeline for ONE application window (`ximagesrc xid=`), the gst counterpart of
+/// `x11grab -window_id` for hosts whose encoder only exists in GStreamer (Rockchip MPP).
+/// The window can be any size and can be resized while it streams, so the frames are
+/// always converted and scaled to a fixed even `width`×`height` (no BGRx-direct shortcut:
+/// the encoder must never see a size change mid-stream).
+pub fn x11_window_pipeline(
+	display: &str,
+	xid: u64,
+	fps: u32,
+	(width, height): (u32, u32),
+	fragment: &str,
+	ip: &str,
+	port: u16,
+) -> String {
+	let fps = fps.max(1);
+	let (w, h) = ((width.max(2)) & !1, (height.max(2)) & !1);
+	format!(
+		"ximagesrc display-name={display} xid={xid} use-damage=0 show-pointer=true \
+		 ! video/x-raw,framerate={fps}/1 \
+		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+		 ! videoconvert ! videoscale ! video/x-raw,format=I420,width={w},height={h},pixel-aspect-ratio=1/1 \
+		 ! {fragment} \
+		 ! udpsink host={ip} port={port} sync=false"
+	)
+}
+
 /// Full KMS (DRM scanout) pipeline: ZERO-COPY capture for game streaming on
 /// RK3588-class hosts. `kmssrc` imports the CRTC's framebuffer as a DMABuf every
 /// vblank and `mpph26Xenc` imports that fd straight into the encoder — no CPU

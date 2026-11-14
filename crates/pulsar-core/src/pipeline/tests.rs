@@ -18,6 +18,7 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		hdr: false,
 		yuv444: false,
 		loss_recovery: crate::service::LossRecovery::Normal,
+		window: None,
 	}
 }
 
@@ -662,4 +663,94 @@ fn gst_fragment_loss_recovery_modes() {
 	assert!(nv.contains("gop-size=30") && !nv.contains("intra-refresh"), "{nv}");
 	let mpp = encoder_fragment_with(GstEncoder::Mpp, VCodec::H264, 4000, 30, LossRecovery::IntraRefresh).unwrap();
 	assert!(mpp.contains("gop=15") && !mpp.contains("intra-refresh"), "{mpp}");
+}
+
+/// One X11 window: `-window_id` instead of `-video_size`, the bare display, and ONE `-vf`
+/// chain that scales the grab and (VA-API) uploads it — never two `-vf` flags.
+#[test]
+fn x11_window_capture_args() {
+	let p = StreamPlan {
+		window: Some(WindowInput::X11 { id: 0x3a0_0007 }),
+		width: 1280,
+		height: 720,
+		..plan(HwEncoder::Software)
+	};
+	let args = encode_command(&p).1;
+	let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+	assert_eq!(at("-window_id").as_deref(), Some("60817415"));
+	assert_eq!(at("-i").as_deref(), Some(":0.0"));
+	assert!(!args.iter().any(|a| a == "-video_size"), "{args:?}");
+	assert_eq!(at("-vf").as_deref(), Some("scale=1280:720"));
+
+	let v = StreamPlan { encoder: HwEncoder::Vaapi, ..p.clone() };
+	let args = encode_command(&v).1;
+	assert_eq!(args.iter().filter(|a| *a == "-vf").count(), 1, "{args:?}");
+	assert!(args.iter().any(|a| a == "scale=1280:720,format=nv12,hwupload"), "{args:?}");
+}
+
+/// The screen path is untouched by the window field: no `-window_id`, `-video_size` kept,
+/// and a window id on a non-x11grab capture is ignored.
+#[test]
+fn window_none_keeps_screen_args() {
+	let args = encode_command(&plan(HwEncoder::Software)).1;
+	assert!(!args.iter().any(|a| a == "-window_id"));
+	assert!(args.iter().any(|a| a == "1920x1080"));
+	assert!(!args.iter().any(|a| a == "-vf"), "{args:?}");
+	let k = StreamPlan {
+		capture: CaptureMethod::Kmsgrab,
+		window: Some(WindowInput::X11 { id: 5 }),
+		..plan(HwEncoder::Software)
+	};
+	let args = encode_command(&k).1;
+	assert!(!args.iter().any(|a| a == "-window_id"), "{args:?}");
+}
+
+/// Raw NV12 frames from an in-process source (macOS ScreenCaptureKit) replace the capture
+/// method's input entirely and carry the exact frame size.
+#[test]
+fn raw_nv12_window_input() {
+	let p = StreamPlan {
+		capture: CaptureMethod::AvFoundation,
+		encoder: HwEncoder::VideoToolbox,
+		width: 1440,
+		height: 900,
+		window: Some(WindowInput::RawNv12 { url: "tcp://127.0.0.1:40123".into() }),
+		..plan(HwEncoder::Software)
+	};
+	let args = encode_command(&p).1;
+	let joined = args.join(" ");
+	assert!(
+		joined.contains("-f rawvideo -pix_fmt nv12 -video_size 1440x900 -framerate 60 -i tcp://127.0.0.1:40123"),
+		"{joined}"
+	);
+	assert!(!joined.contains("avfoundation"), "{joined}");
+	assert!(joined.contains("h264_videotoolbox"), "{joined}");
+}
+
+#[test]
+fn fit_within_keeps_aspect_even_and_never_upscales() {
+	// Smaller than the box: own size, rounded down to even.
+	assert_eq!(fit_within((801, 601), (1920, 1080)), (800, 600));
+	// Wider than the box: width-bound.
+	assert_eq!(fit_within((3840, 1600), (1920, 1080)), (1920, 800));
+	// Taller than the box: height-bound.
+	assert_eq!(fit_within((1000, 2000), (1920, 1080)), (540, 1080));
+	// Exactly the box.
+	assert_eq!(fit_within((1920, 1080), (1920, 1080)), (1920, 1080));
+	// Odd box and odd result stay even and inside the box.
+	let (w, h) = fit_within((2561, 1441), (1279, 719));
+	assert!(w % 2 == 0 && h % 2 == 0 && w <= 1279 && h <= 719, "{w}x{h}");
+	// Degenerate inputs never yield 0.
+	assert_eq!(fit_within((0, 0), (1280, 720)), (1280, 720));
+	assert_eq!(fit_within((1, 1), (1280, 720)), (2, 2));
+	assert_eq!(fit_within((640, 480), (0, 0)), (2, 2));
+}
+
+#[test]
+fn gst_x11_window_pipeline_targets_the_window_at_a_fixed_size() {
+	let p = gst::x11_window_pipeline(":0", 0x3a0_0007, 0, (1281, 721), "x264enc name=venc", "10.0.0.5", 9000);
+	assert!(p.starts_with("ximagesrc display-name=:0 xid=60817415 "), "{p}");
+	assert!(p.contains("framerate=1/1"), "fps floored to 1: {p}");
+	assert!(p.contains("width=1280,height=720"), "even fixed size: {p}");
+	assert!(p.contains("! x264enc name=venc ! udpsink host=10.0.0.5 port=9000"), "{p}");
 }

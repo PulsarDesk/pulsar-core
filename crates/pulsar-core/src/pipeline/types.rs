@@ -70,6 +70,42 @@ impl CaptureMethod {
 		let s = |x: &str| x.to_string();
 		let fps = plan.fps.to_string();
 		let size = format!("{}x{}", plan.width, plan.height);
+		// A single application window instead of the screen (see [`WindowInput`]).
+		match &plan.window {
+			// Frames made in-process (macOS ScreenCaptureKit), read from a loopback socket.
+			// rawvideo timestamps count frames at `-framerate`, so the producer paces them.
+			Some(WindowInput::RawNv12 { url }) => {
+				return vec![
+					s("-f"),
+					s("rawvideo"),
+					s("-pix_fmt"),
+					s("nv12"),
+					s("-video_size"),
+					size,
+					s("-framerate"),
+					fps,
+					s("-i"),
+					url.clone(),
+				];
+			}
+			// x11grab of one window: no `-video_size` (that would be a region of the window,
+			// and larger than it fails to open); the grab is the window's own size and
+			// `encode_command` scales it to the plan's size. The id goes in decimal (the
+			// option is an integer; hex parsing is up to the libc).
+			Some(WindowInput::X11 { id }) if self == Self::X11grab => {
+				return vec![
+					s("-f"),
+					s("x11grab"),
+					s("-framerate"),
+					fps,
+					s("-window_id"),
+					id.to_string(),
+					s("-i"),
+					plan.display.clone(),
+				];
+			}
+			_ => {}
+		}
 		match self {
 			Self::X11grab => vec![
 				s("-f"),
@@ -327,6 +363,42 @@ pub fn resolve_codec(
 	}
 }
 
+/// One application window as the capture source instead of a whole screen (the client's
+/// "Pencere" pick, or the window of a game the host launched). Windows does not use this:
+/// it captures windows natively through WGC (`pulsar-capture`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowInput {
+	/// Linux X11: `x11grab -window_id <id>` (the X window id from `_NET_CLIENT_LIST`).
+	/// Only applies to [`CaptureMethod::X11grab`]; the grab is scaled to the plan's size.
+	X11 { id: u64 },
+	/// Raw NV12 frames of exactly the plan's `width`×`height`, made in-process (macOS:
+	/// ScreenCaptureKit, `crate::window_capture`) and served on a loopback url such as
+	/// `tcp://127.0.0.1:PORT`. Replaces the capture method's own input.
+	RawNv12 { url: String },
+}
+
+/// The largest even size that fits `src` into `max` keeping the aspect ratio, never larger
+/// than `src` itself (a small window is not blown up). Every encoder wants even 4:2:0
+/// dimensions, and a window can be any size. A zero anywhere degrades to `max` (or 2×2).
+pub fn fit_within(src: (u32, u32), max: (u32, u32)) -> (u32, u32) {
+	let even = |v: u32| (v & !1).max(2);
+	let (sw, sh) = src;
+	let (mw, mh) = (max.0.max(2), max.1.max(2));
+	if sw == 0 || sh == 0 {
+		return (even(mw), even(mh));
+	}
+	if sw <= mw && sh <= mh {
+		return (even(sw), even(sh));
+	}
+	// Scale by the tighter side; u64 so a 8K×8K window can't overflow.
+	let (w, h) = if (sw as u64) * (mh as u64) >= (sh as u64) * (mw as u64) {
+		(mw as u64, (sh as u64 * mw as u64 + sw as u64 / 2) / sw as u64)
+	} else {
+		((sw as u64 * mh as u64 + sh as u64 / 2) / sh as u64, mh as u64)
+	};
+	(even(w as u32).min(even(mw)), even(h as u32).min(even(mh)))
+}
+
 /// What/where to capture and encode.
 #[derive(Clone, Debug)]
 pub struct StreamPlan {
@@ -368,6 +440,8 @@ pub struct StreamPlan {
 	/// periodic-intra-refresh knobs in [`encode_command`](super::encode_command).
 	/// `Normal` = the long remote GOP.
 	pub loss_recovery: crate::service::LossRecovery,
+	/// Capture one window instead of the screen (`None` = the screen, as before).
+	pub window: Option<WindowInput>,
 }
 
 impl StreamPlan {

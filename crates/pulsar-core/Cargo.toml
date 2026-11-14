@@ -54,6 +54,9 @@ gstreamer-video = "0.25"
 # a client's 0..1 pointer on the one monitor it is streaming.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# Per-window capture on X11 (window_capture/x11.rs): list the WM's client windows with their
+# titles / pids / sizes. Pure-Rust protocol (RustConnection) — no libX11/libxcb link.
+x11rb = { version = "0.13", default-features = false }
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
@@ -135,7 +138,18 @@ windows-core = "0.62"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
+# window_capture.rs: proc_listchildpids (a launched game's child processes).
 libc = "0.2"
+# Per-window host capture (window_capture/mac.rs): ScreenCaptureKit lists the windows and
+# streams one (SCContentFilter desktopIndependentWindow) as NV12 CVPixelBuffers.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSArray", "NSString", "NSError"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "SCShareableContent", "SCStream", "SCError"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CMSampleBuffer", "CMTime", "CMBase"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "alloc", "objc2"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }
