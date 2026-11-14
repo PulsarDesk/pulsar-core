@@ -151,6 +151,234 @@ pub struct DesktopInput {
 	/// and on `Drop` (session teardown) — otherwise a held button/modifier stays stuck.
 	held_buttons: std::collections::HashSet<u16>,
 	held_keys: std::collections::HashSet<u16>,
+	/// Lazily started virtual-touchpad pinch worker (see `pinch`).
+	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
+}
+
+/// Commands for the touchpad-pinch worker thread.
+enum PinchCmd {
+	Begin,
+	Scale(f64),
+	End,
+}
+
+/// Virtual touchpad surface for pinch injection: 100 × 70 mm at 40 units/mm (libinput
+/// works in mm, so the resolution must be real).
+const TP_W: i32 = 4000;
+const TP_H: i32 = 2800;
+const TP_RES: i32 = 40;
+/// Finger spread (touchpad units) at pinch begin (20 mm), and its clamp while pinching:
+/// 3 mm .. 80 mm keeps both fingers out of the 8 % edge (palm) zones.
+const TP_D0: f64 = 800.0;
+const TP_DMIN: f64 = 120.0;
+const TP_DMAX: f64 = 3200.0;
+/// Two touches lifted sooner than libinput's tap timeout (180 ms) with little motion are a
+/// two-finger TAP = right click. A pinch is held at least this long before its fingers lift.
+const TP_MIN_HOLD_MS: u64 = 260;
+
+/// Finger spread for a cumulative pinch `scale` (libinput reports the gesture's scale as
+/// current / initial finger distance, so spread = D0 · scale gives the same scale back).
+fn pinch_spread(scale: f64) -> f64 {
+	let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+	(TP_D0 * s).clamp(TP_DMIN, TP_DMAX)
+}
+
+/// The two contacts (x, y) for a spread: symmetric about the pad centre on one row, so the
+/// fingers move in opposite directions (libinput's pinch, never its two-finger scroll).
+fn pinch_fingers(d: f64) -> [(i32, i32); 2] {
+	let half = (d / 2.0).round() as i32;
+	let (cx, cy) = (TP_W / 2, TP_H / 2);
+	[((cx - half).max(0), cy), ((cx + half).min(TP_W), cy)]
+}
+
+/// A virtual multitouch TOUCHPAD (udev tags it ID_INPUT_TOUCHPAD: ABS + BTN_TOOL_FINGER,
+/// no INPUT_PROP_DIRECT). libinput turns its two contacts into a real pinch gesture, which
+/// the compositor delivers to the client under the pointer (Wayland pointer-gestures,
+/// X11 XI 2.4 gestures) — browsers, image viewers and maps zoom as with a local touchpad.
+fn virtual_touchpad() -> std::io::Result<VirtualDevice> {
+	let mut keys = AttributeSet::<KeyCode>::new();
+	for k in [
+		KeyCode::BTN_LEFT,
+		KeyCode::BTN_TOUCH,
+		KeyCode::BTN_TOOL_FINGER,
+		KeyCode::BTN_TOOL_DOUBLETAP,
+	] {
+		keys.insert(k);
+	}
+	let mut props = AttributeSet::<PropType>::new();
+	props.insert(PropType::POINTER);
+	props.insert(PropType::BUTTONPAD);
+	let axis = |a, max| UinputAbsSetup::new(a, AbsInfo::new(0, 0, max, 0, 0, TP_RES));
+	VirtualDevice::builder()?
+		.name("Pulsar Virtual Touchpad")
+		// USB = an "external" touchpad for libinput: not paired with the host's internal
+		// keyboard for disable-while-typing.
+		.input_id(InputId::new(BusType::BUS_USB, 0, 0, 1))
+		.with_properties(&props)?
+		.with_keys(&keys)?
+		.with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X, TP_W))?
+		.with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, TP_H))?
+		.with_absolute_axis(&UinputAbsSetup::new(
+			AbsoluteAxisCode::ABS_MT_SLOT,
+			AbsInfo::new(0, 0, 1, 0, 0, 0),
+		))?
+		.with_absolute_axis(&UinputAbsSetup::new(
+			AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+			AbsInfo::new(0, 0, 65535, 0, 0, 0),
+		))?
+		.with_absolute_axis(&axis(AbsoluteAxisCode::ABS_MT_POSITION_X, TP_W))?
+		.with_absolute_axis(&axis(AbsoluteAxisCode::ABS_MT_POSITION_Y, TP_H))?
+		.build()
+}
+
+/// One touchpad frame for both contacts: `Some(tracking ids)` = down/moving at spread `d`,
+/// `None` = both lifted.
+fn touchpad_frame(d: f64, ids: Option<[i32; 2]>, first: bool) -> Vec<InputEvent> {
+	let abs = |a: AbsoluteAxisCode, v: i32| InputEvent::new(EventType::ABSOLUTE.0, a.0, v);
+	let key = |k: KeyCode, v: i32| InputEvent::new(EventType::KEY.0, k.code(), v);
+	let pts = pinch_fingers(d);
+	let mut ev = Vec::with_capacity(14);
+	for (slot, (x, y)) in pts.iter().enumerate() {
+		ev.push(abs(AbsoluteAxisCode::ABS_MT_SLOT, slot as i32));
+		match ids {
+			Some(ids) => {
+				if first {
+					ev.push(abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, ids[slot]));
+				}
+				ev.push(abs(AbsoluteAxisCode::ABS_MT_POSITION_X, *x));
+				ev.push(abs(AbsoluteAxisCode::ABS_MT_POSITION_Y, *y));
+			}
+			None => ev.push(abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1)),
+		}
+	}
+	match ids {
+		Some(_) => {
+			if first {
+				ev.push(key(KeyCode::BTN_TOUCH, 1));
+				ev.push(key(KeyCode::BTN_TOOL_DOUBLETAP, 1));
+			}
+			ev.push(abs(AbsoluteAxisCode::ABS_X, pts[0].0));
+			ev.push(abs(AbsoluteAxisCode::ABS_Y, pts[0].1));
+		}
+		None => {
+			ev.push(key(KeyCode::BTN_TOUCH, 0));
+			ev.push(key(KeyCode::BTN_TOOL_DOUBLETAP, 0));
+		}
+	}
+	ev
+}
+
+/// The pinch worker: owns the virtual touchpad (created on the first pinch, so hosts that
+/// never get one never show a touchpad), smooths the client's step-sized scale updates into
+/// ~60 Hz finger motion (libinput needs continuous motion to recognise the pinch), and
+/// lifts the fingers when the gesture ends or the client goes silent mid-pinch.
+fn pinch_worker(rx: std::sync::mpsc::Receiver<PinchCmd>) {
+	use std::sync::mpsc::RecvTimeoutError;
+	use std::time::{Duration, Instant};
+	let mut dev = match virtual_touchpad() {
+		Ok(d) => d,
+		Err(e) => {
+			tracing::warn!(err = %e, "virtual touchpad unavailable — pinch ignored");
+			for _ in rx {}
+			return;
+		}
+	};
+	let mut next_id: i32 = 1;
+	let mut ids: Option<[i32; 2]> = None;
+	let (mut d, mut target) = (TP_D0, TP_D0);
+	let mut down_at = Instant::now();
+	let mut last_msg = Instant::now();
+	let mut ending = false;
+	let lift = |dev: &mut VirtualDevice, d: f64, down_at: Instant| {
+		let held = down_at.elapsed();
+		let min = Duration::from_millis(TP_MIN_HOLD_MS);
+		if held < min {
+			std::thread::sleep(min - held);
+		}
+		let _ = dev.emit(&touchpad_frame(d, None, false));
+	};
+	loop {
+		let wait = if ids.is_some() { Duration::from_millis(16) } else { Duration::from_secs(3600) };
+		match rx.recv_timeout(wait) {
+			Ok(PinchCmd::Begin) => {
+				if ids.is_some() {
+					lift(&mut dev, d, down_at);
+				}
+				let pair = [next_id, next_id + 1];
+				next_id = if next_id > 60000 { 1 } else { next_id + 2 };
+				d = TP_D0;
+				target = TP_D0;
+				ending = false;
+				ids = dev.emit(&touchpad_frame(d, Some(pair), true)).ok().map(|_| pair);
+				if ids.is_none() {
+					tracing::warn!("pinch: virtual touchpad down failed");
+				}
+				down_at = Instant::now();
+				last_msg = Instant::now();
+				continue;
+			}
+			Ok(PinchCmd::Scale(s)) => {
+				target = pinch_spread(s);
+				last_msg = Instant::now();
+			}
+			Ok(PinchCmd::End) => {
+				// Finish the motion toward the last target first, then lift (below).
+				ending = true;
+			}
+			Err(RecvTimeoutError::Timeout) => {}
+			Err(RecvTimeoutError::Disconnected) => {
+				if ids.is_some() {
+					lift(&mut dev, d, down_at);
+				}
+				return;
+			}
+		}
+		if ids.is_some() {
+			// A client that vanished mid-pinch must not leave two fingers on the pad.
+			if last_msg.elapsed() > Duration::from_millis(1500) {
+				ending = true;
+			}
+			if ending {
+				if (target - d).abs() > 1.0 {
+					d = target;
+					let _ = dev.emit(&touchpad_frame(d, ids, false));
+				}
+				lift(&mut dev, d, down_at);
+				ids = None;
+				ending = false;
+				continue;
+			}
+			let step = (target - d) * 0.45;
+			if step.abs() >= 0.5 {
+				d += step;
+				let _ = dev.emit(&touchpad_frame(d, ids, false));
+			}
+		}
+	}
+}
+
+impl DesktopInput {
+	/// Touchpad pinch from the client (`InputEvent::Pinch`): phase 0 begin / 1 update / 2 end,
+	/// `scale` cumulative since begin. Injected as a real two-finger pinch on a virtual
+	/// touchpad (libinput gesture) at the pointer — see `pinch_worker`. Untested on Linux
+	/// hardware.
+	pub fn pinch(&mut self, phase: u8, scale: f64) {
+		let tx = self.pinch_tx.get_or_insert_with(|| {
+			let (tx, rx) = std::sync::mpsc::channel();
+			let _ = std::thread::Builder::new()
+				.name("pulsar-pinch".into())
+				.spawn(move || pinch_worker(rx));
+			tx
+		});
+		let cmd = match phase {
+			0 => PinchCmd::Begin,
+			1 => PinchCmd::Scale(if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }),
+			_ => PinchCmd::End,
+		};
+		if tx.send(cmd).is_err() {
+			self.pinch_tx = None;
+		}
+	}
 }
 
 impl DesktopInput {
@@ -204,6 +432,7 @@ impl DesktopInput {
 			region: None,
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
+			pinch_tx: None,
 		})
 	}
 
@@ -327,10 +556,6 @@ impl DesktopInput {
 	/// matching US-layout evdev keycode (+ Shift when needed) on the existing keyboard device —
 	/// reliable for URLs, passwords, chat and filenames. Non-ASCII codepoints have no fixed
 	/// keycode without a temporary keymap remap and remain unhandled.
-	/// Pinch gestures are not injected on this platform (the host doesn't advertise
-	/// `FEAT_PINCH`, so clients send Ctrl + wheel instead).
-	pub fn pinch(&mut self, _phase: u8, _scale: f64) {}
-
 	pub fn type_char(&mut self, c: char) {
 		let Some((key, shift)) = us_char_to_key(c) else {
 			return;
@@ -370,6 +595,9 @@ impl DesktopInput {
 	/// modifier or a held mouse button (drag-select) stays stuck on the host.
 	/// Idempotent — drained sets make repeat calls no-ops.
 	pub fn flush_held(&mut self) {
+		if let Some(tx) = &self.pinch_tx {
+			let _ = tx.send(PinchCmd::End); // never leave the virtual fingers down
+		}
 		let btn_up: Vec<InputEvent> = self
 			.held_buttons
 			.drain()
@@ -502,7 +730,56 @@ fn letter_key_code(c: char, upper: bool) -> u16 {
 
 #[cfg(test)]
 mod tests {
-	use super::{button, evdev_buttons};
+	use super::{button, evdev_buttons, pinch_fingers, pinch_spread, touchpad_frame, TP_D0, TP_W};
+
+	#[test]
+	fn pinch_spread_follows_the_scale_within_the_pad() {
+		assert_eq!(pinch_spread(1.0), TP_D0);
+		assert_eq!(pinch_spread(2.0), TP_D0 * 2.0);
+		assert_eq!(pinch_spread(100.0), super::TP_DMAX);
+		assert_eq!(pinch_spread(0.001), super::TP_DMIN);
+		assert_eq!(pinch_spread(f64::NAN), TP_D0);
+		assert_eq!(pinch_spread(-3.0), TP_D0);
+	}
+
+	#[test]
+	fn pinch_fingers_are_symmetric_on_one_row() {
+		let [(x0, y0), (x1, y1)] = pinch_fingers(800.0);
+		assert_eq!(y0, y1);
+		assert_eq!(x1 - x0, 800);
+		assert_eq!(x0 + x1, TP_W);
+		// The widest spread stays on the pad.
+		let [(a, _), (b, _)] = pinch_fingers(super::TP_DMAX);
+		assert!(a >= 0 && b <= TP_W);
+	}
+
+	#[test]
+	fn touchpad_frames_open_and_close_both_contacts() {
+		use evdev::{AbsoluteAxisCode, EventType, KeyCode};
+		let tid = |ev: &[evdev::InputEvent]| -> Vec<i32> {
+			ev.iter()
+				.filter(|e| {
+					e.event_type() == EventType::ABSOLUTE
+						&& e.code() == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0
+				})
+				.map(|e| e.value())
+				.collect()
+		};
+		let touch = |ev: &[evdev::InputEvent]| {
+			ev.iter()
+				.find(|e| e.event_type() == EventType::KEY && e.code() == KeyCode::BTN_TOUCH.code())
+				.map(|e| e.value())
+		};
+		let down = touchpad_frame(800.0, Some([5, 6]), true);
+		assert_eq!(tid(&down), vec![5, 6]);
+		assert_eq!(touch(&down), Some(1));
+		let mv = touchpad_frame(900.0, Some([5, 6]), false);
+		assert!(tid(&mv).is_empty());
+		assert_eq!(touch(&mv), None);
+		let up = touchpad_frame(900.0, None, false);
+		assert_eq!(tid(&up), vec![-1, -1]);
+		assert_eq!(touch(&up), Some(0));
+	}
 
 	#[test]
 	fn evdev_button_map_is_complete_and_correct() {
