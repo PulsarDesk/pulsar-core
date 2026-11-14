@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 pub mod client;
+pub mod tablet;
 pub mod mouse;
 
 #[cfg(windows)]
