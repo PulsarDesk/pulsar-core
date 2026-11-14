@@ -11,19 +11,26 @@
 use super::mouse::{MouseAct, PenMouse, TouchMouse};
 use super::{PenState, TouchFrame, KEEPALIVE};
 use crate::service::InputEvent;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Browser-wheel pixels per screen height of two-finger scroll in the mouse fallback
 /// (`InputEvent::Scroll` is in browser wheel pixels; 100 ≈ one notch on the hosts).
 pub const FALLBACK_SCROLL_PX: f32 = 1500.0;
+
+/// No new pen / touch input from the source for this long while something is still down or
+/// hovering: the source lost track of it (a window that stopped getting the events without
+/// a lift) — the keep-alive stops and the pen / fingers are lifted on the host.
+pub const STALE: Duration = Duration::from_secs(30);
 
 pub struct ClientPenTouch {
 	host_pen: bool,
 	host_touch: bool,
 	pen: PenState,
 	pen_sent: Instant,
+	pen_input: Instant,
 	touch: TouchFrame,
 	touch_sent: Instant,
+	touch_input: Instant,
 	pen_mouse: PenMouse,
 	touch_mouse: TouchMouse,
 }
@@ -49,8 +56,10 @@ impl ClientPenTouch {
 			host_touch,
 			pen: PenState::default(),
 			pen_sent: now,
+			pen_input: now,
 			touch: TouchFrame::default(),
 			touch_sent: now,
+			touch_input: now,
 			pen_mouse: PenMouse::default(),
 			touch_mouse: TouchMouse::default(),
 		}
@@ -68,6 +77,7 @@ impl ClientPenTouch {
 					}
 					self.pen = s;
 					self.pen_sent = now;
+					self.pen_input = now;
 					vec![InputEvent::Pen(s)]
 				} else {
 					to_events(self.pen_mouse.update(&s))
@@ -80,6 +90,7 @@ impl ClientPenTouch {
 					}
 					self.touch = f;
 					self.touch_sent = now;
+					self.touch_input = now;
 					vec![InputEvent::Touch(f)]
 				} else {
 					to_events(self.touch_mouse.update(now, &f))
@@ -92,6 +103,13 @@ impl ClientPenTouch {
 	/// Keep-alive re-sends and the fallback's hold timer. Call every ~50-100 ms.
 	pub fn tick(&mut self, now: Instant) -> Vec<InputEvent> {
 		let mut out = Vec::new();
+		if self.host_pen && self.pen.in_range && now.duration_since(self.pen_input) >= STALE {
+			let lift = PenState { x: self.pen.x, y: self.pen.y, ..Default::default() };
+			out.extend(self.on_event(now, InputEvent::Pen(lift)));
+		}
+		if self.host_touch && !self.touch.is_empty() && now.duration_since(self.touch_input) >= STALE {
+			out.extend(self.on_event(now, InputEvent::Touch(TouchFrame::default())));
+		}
 		if self.host_pen && self.pen.in_range && now.duration_since(self.pen_sent) >= KEEPALIVE {
 			self.pen_sent = now;
 			out.push(InputEvent::Pen(self.pen));
@@ -139,6 +157,21 @@ mod tests {
 		assert_eq!(r.len(), 2);
 		assert!(c.tick(t + Duration::from_secs(5)).is_empty());
 		assert!(c.release(t + Duration::from_secs(5)).is_empty());
+	}
+
+	#[test]
+	fn a_source_that_went_quiet_is_lifted_after_the_stale_limit() {
+		let t = Instant::now();
+		let mut c = ClientPenTouch::new(true, true, t);
+		c.on_event(t, InputEvent::Touch(one(1, 0.2, 0.2)));
+		// Keep-alives meanwhile do not count as input.
+		let mut now = t;
+		while now < t + STALE - Duration::from_secs(1) {
+			now += KEEPALIVE;
+			assert_eq!(c.tick(now).len(), 1);
+		}
+		assert_eq!(c.tick(t + STALE), vec![InputEvent::Touch(TouchFrame::default())]);
+		assert!(c.tick(t + STALE + KEEPALIVE).is_empty());
 	}
 
 	#[test]
