@@ -7,8 +7,8 @@
 //! dispatch queue when a display id has no cached name yet, and synchronously inside the
 //! reconfiguration callback (which macOS delivers on the main thread). Never a synchronous
 //! hop to the main queue — a host whose main thread waits on this one would deadlock. Until
-//! the cache fills, a CoreGraphics-only fallback name is used ("Built-in display" /
-//! "Display <n>").
+//! the cache fills the name is empty and the app labels the monitor in the UI language
+//! (`Monitor::builtin` tells a built-in panel apart).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -64,14 +64,6 @@ fn request_names() {
 	});
 }
 
-fn fallback_name(d: &CGDisplay, n: usize) -> String {
-	if d.is_builtin() {
-		"Built-in display".into()
-	} else {
-		format!("Display {}", n + 1)
-	}
-}
-
 pub(super) fn list() -> Vec<Monitor> {
 	let Ok(ids) = CGDisplay::active_displays() else {
 		return Vec::new();
@@ -106,7 +98,8 @@ fn monitor(i: usize, id: CGDirectDisplayID, name: Option<String>, any_main: bool
 		})
 		.unwrap_or_default();
 	Monitor {
-		name: name.unwrap_or_else(|| fallback_name(&d, i)),
+		name: name.unwrap_or_default(),
+		builtin: d.is_builtin(),
 		x: b.origin.x.round() as i32,
 		y: b.origin.y.round() as i32,
 		logical_w: b.size.width.round().max(0.0) as u32,

@@ -19,8 +19,13 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
 	/// Human-readable name (macOS: `NSScreen.localizedName`; Wayland: the output description
-	/// or connector name).
+	/// or connector name). EMPTY when the platform gave none (macOS before AppKit's name
+	/// cache filled, a Wayland output without name / description / make): the app labels it
+	/// in the UI language (`builtin` -> "built-in display", else "display N").
 	pub name: String,
+	/// The machine's own panel (macOS `CGDisplayIsBuiltin`; Wayland: an eDP / LVDS / DSI
+	/// connector) — only used to label a nameless monitor.
+	pub builtin: bool,
 	/// Origin in the global layout: macOS = CoreGraphics global display space (points, main
 	/// display at 0,0); Wayland = the compositor's logical space (xdg-output).
 	pub x: i32,
@@ -93,10 +98,13 @@ pub fn platform_id(idx: usize) -> Option<u32> {
 /// `on_change` from a background (or, on macOS, the main) thread for every change; several
 /// calls per physical change are normal — callers debounce and re-read [`list`].
 ///
-/// Returns `false` when this platform has no event source here (Windows: the app has its own
-/// `WM_DISPLAYCHANGE` listener) or it could not be set up synchronously. [`watching`] tells
-/// whether the event source is live right now (it can arm later — macOS registers on the main
-/// queue — and drop out — a lost Wayland/X11 connection), so callers poll while it is not.
+/// Never blocks: the source is set up asynchronously (macOS on the main queue, Linux on its
+/// own thread), so the return value is only whether it is ALREADY live — usually `false` on
+/// the first call. [`watching`] tells whether the event source is live right now (it arms a
+/// moment later and can drop out — a lost Wayland/X11 connection), so callers poll while it
+/// is not. Calling again after it dropped out starts it again (Linux); while it runs or is
+/// starting, a repeat call just returns [`watching`]. Windows: always `false` (the app has
+/// its own `WM_DISPLAYCHANGE` listener).
 pub fn watch(on_change: Box<dyn Fn() + Send + Sync + 'static>) -> bool {
 	#[cfg(target_os = "macos")]
 	{
@@ -202,6 +210,7 @@ mod tests {
 			refresh_hz: 0,
 			modes: Vec::new(),
 			id: 0,
+			builtin: false,
 		}
 	}
 

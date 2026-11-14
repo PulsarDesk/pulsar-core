@@ -162,8 +162,10 @@ fn to_monitor(o: &Out) -> Option<Monitor> {
 	} else if !make_model.is_empty() {
 		make_model
 	} else {
-		format!("Output {}", o.global)
+		// No name at all: the app labels it in the UI language.
+		String::new()
 	};
+	let builtin = is_builtin_connector(&connector);
 	Some(Monitor {
 		name,
 		x,
@@ -176,7 +178,14 @@ fn to_monitor(o: &Out) -> Option<Monitor> {
 		refresh_hz: if o.refresh_mhz > 0 { ((o.refresh_mhz as f64) / 1000.0).round() as u32 } else { 0 },
 		modes: normalize_modes(o.modes.iter().copied()),
 		id: o.global,
+		builtin,
 	})
+}
+
+/// A laptop / tablet's own panel connector (eDP-1, LVDS-1, DSI-1).
+fn is_builtin_connector(connector: &str) -> bool {
+	let c = connector.to_ascii_uppercase();
+	c.starts_with("EDP") || c.starts_with("LVDS") || c.starts_with("DSI")
 }
 
 /// The Wayland outputs, primary (the one at the layout origin) first. Empty without a
@@ -210,33 +219,41 @@ pub(super) fn wayland_list() -> Vec<Monitor> {
 
 type OnChange = Box<dyn Fn() + Send + Sync + 'static>;
 
+/// A watcher thread is running (or starting). Cleared when it ends, so a later [`watch`]
+/// call can start a fresh one after a lost connection.
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Never blocks the caller: the connection is set up on the watcher thread, which flips
+/// [`super::watching`] once it listens.
 pub(super) fn watch(on_change: OnChange) -> bool {
-	static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-	if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+	use std::sync::atomic::Ordering;
+	if STARTED.swap(true, Ordering::SeqCst) {
 		return super::watching();
 	}
 	let wayland = crate::capture::is_wayland();
-	let (tx, rx) = std::sync::mpsc::channel::<bool>();
 	let spawned = std::thread::Builder::new().name("display-watch".into()).spawn(move || {
 		if wayland {
-			wayland_watch(on_change, tx);
+			wayland_watch(on_change);
 		} else {
-			x11_watch(on_change, tx);
+			x11_watch(on_change);
 		}
 		super::set_watching(false);
+		STARTED.store(false, Ordering::SeqCst);
 		tracing::warn!("display watch: event source ended — falling back to polling");
 	});
 	if spawned.is_err() {
+		STARTED.store(false, Ordering::SeqCst);
 		return false;
 	}
-	// The thread reports whether it got its connection set up.
-	rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false)
+	super::watching()
 }
 
 /// Long-lived Wayland connection: fires on an output added / removed and on every
 /// `wl_output.done` after the initial burst (a mode, scale, position or name change).
 struct WatchState {
-	outputs: Vec<u32>,
+	/// The bound outputs by global name — released again when the global goes away, so a
+	/// long-lived connection does not collect one dead proxy per unplug.
+	outputs: Vec<(u32, wl_output::WlOutput)>,
 	initial: bool,
 	on_change: OnChange,
 }
@@ -252,15 +269,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WatchState {
 	) {
 		match event {
 			wl_registry::Event::Global { name, interface, version } if interface == "wl_output" => {
-				registry.bind::<wl_output::WlOutput, u32, Self>(name, version.min(4), qh, name);
-				state.outputs.push(name);
+				let o = registry.bind::<wl_output::WlOutput, u32, Self>(name, version.min(4), qh, name);
+				state.outputs.push((name, o));
 				if !state.initial {
 					(state.on_change)();
 				}
 			}
 			wl_registry::Event::GlobalRemove { name } => {
-				if let Some(i) = state.outputs.iter().position(|n| *n == name) {
-					state.outputs.remove(i);
+				if let Some(i) = state.outputs.iter().position(|(n, _)| *n == name) {
+					let (_, o) = state.outputs.remove(i);
+					// wl_output.release exists from v3; older proxies just drop client-side.
+					if o.version() >= 3 {
+						o.release();
+					}
 					(state.on_change)();
 				}
 			}
@@ -284,9 +305,8 @@ impl Dispatch<wl_output::WlOutput, u32> for WatchState {
 	}
 }
 
-fn wayland_watch(on_change: OnChange, ready: std::sync::mpsc::Sender<bool>) {
+fn wayland_watch(on_change: OnChange) {
 	let Ok(conn) = Connection::connect_to_env() else {
-		let _ = ready.send(false);
 		return;
 	};
 	let mut queue = conn.new_event_queue();
@@ -295,23 +315,20 @@ fn wayland_watch(on_change: OnChange, ready: std::sync::mpsc::Sender<bool>) {
 	let mut state = WatchState { outputs: Vec::new(), initial: true, on_change };
 	// Swallow the initial globals + output burst, then listen.
 	if queue.roundtrip(&mut state).is_err() || queue.roundtrip(&mut state).is_err() {
-		let _ = ready.send(false);
 		return;
 	}
 	state.initial = false;
 	super::set_watching(true);
-	let _ = ready.send(true);
 	tracing::info!(outputs = state.outputs.len(), "display watch: listening for Wayland output changes");
 	while queue.blocking_dispatch(&mut state).is_ok() {}
 }
 
 /// X11: RandR screen / CRTC / output change notifications on the root window.
-fn x11_watch(on_change: OnChange, ready: std::sync::mpsc::Sender<bool>) {
+fn x11_watch(on_change: OnChange) {
 	use x11rb::connection::Connection as _;
 	use x11rb::protocol::randr::{ConnectionExt as _, NotifyMask};
 	use x11rb::protocol::Event;
 	let Ok((conn, screen)) = x11rb::connect(None) else {
-		let _ = ready.send(false);
 		return;
 	};
 	let root = conn.setup().roots[screen].root;
@@ -330,11 +347,9 @@ fn x11_watch(on_change: OnChange, ready: std::sync::mpsc::Sender<bool>) {
 			.is_some();
 	if !armed {
 		tracing::warn!("display watch: X11 RandR not available");
-		let _ = ready.send(false);
 		return;
 	}
 	super::set_watching(true);
-	let _ = ready.send(true);
 	tracing::info!("display watch: listening for X11 RandR changes");
 	loop {
 		match conn.wait_for_event() {
@@ -391,6 +406,19 @@ mod tests {
 		let m = to_monitor(&o).unwrap();
 		assert_eq!(m.name, "Built-in display (eDP-1)");
 		assert_eq!((m.logical_w, m.logical_h), (1440, 900));
+	}
+
+	#[test]
+	fn nameless_output_stays_unnamed_and_edp_is_builtin() {
+		let mut o = Out { global: 9, scale: 1, ..Default::default() };
+		o.mode = (1920, 1080);
+		let m = to_monitor(&o).unwrap();
+		assert_eq!(m.name, "");
+		assert!(!m.builtin);
+		o.xdg_name = "eDP-1".into();
+		let m = to_monitor(&o).unwrap();
+		assert_eq!(m.name, "eDP-1");
+		assert!(m.builtin);
 	}
 
 	#[test]
