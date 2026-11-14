@@ -47,6 +47,8 @@ pub mod key {
 	pub const LEFTSHIFT: u32 = 42;
 	pub const N: u32 = 49;
 	pub const LEFTALT: u32 = 56;
+	pub const F4: u32 = 62;
+	pub const HOME: u32 = 102;
 	pub const UP: u32 = 103;
 	pub const PAGEUP: u32 = 104;
 	pub const LEFT: u32 = 105;
@@ -58,6 +60,10 @@ pub mod key {
 	pub const VOLUMEUP: u32 = 115;
 	/// Left Win / Super / Command.
 	pub const LEFTMETA: u32 = 125;
+	pub const RIGHTMETA: u32 = 126;
+	/// Browser back / forward (Windows VK_BROWSER_BACK / _FORWARD).
+	pub const BACK: u32 = 158;
+	pub const FORWARD: u32 = 159;
 	pub const NEXTSONG: u32 = 163;
 	pub const PLAYPAUSE: u32 = 164;
 	pub const PREVIOUSSONG: u32 = 165;
@@ -131,12 +137,14 @@ pub fn normalize_fingers(fingers: u8) -> Option<u8> {
 }
 
 /// Windows precision touchpad (Settings → Bluetooth & devices → Touchpad → Three-/Four-finger
-/// gestures, and "Advanced gestures").
+/// gestures, and "Advanced gestures"). The value encodings were read from the Windows 11
+/// binaries that write (`SettingsHandlers_nt.dll`) and use (`twinui.dll`, in Explorer) them,
+/// 2026-11-15: every value is a REG_DWORD; HKCU first, then HKLM, then the built-in default.
 pub mod win {
 	use super::{key::*, GestureAction, GestureKind, Mapped};
 	use std::collections::BTreeMap;
 
-	/// Registry key (HKCU) holding the user's touchpad settings.
+	/// Registry key (HKCU, falling back to HKLM) holding the touchpad settings.
 	pub const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad";
 	pub const THREE_SLIDE: &str = "ThreeFingerSlideEnabled";
 	pub const FOUR_SLIDE: &str = "FourFingerSlideEnabled";
@@ -148,51 +156,122 @@ pub mod win {
 	pub const SLIDE_APPS: u32 = 1;
 	pub const SLIDE_DESKTOPS: u32 = 2;
 	pub const SLIDE_AUDIO: u32 = 3;
-	/// `…TapEnabled` values (the "Taps" drop-down).
+	/// `…TapEnabled` values (the "Taps" drop-down), also `Custom…FingerTap` codes 0-4.
 	pub const TAP_NOTHING: u32 = 0;
 	pub const TAP_SEARCH: u32 = 1;
 	pub const TAP_NOTIFICATIONS: u32 = 2;
 	pub const TAP_PLAY_PAUSE: u32 = 3;
 	pub const TAP_MIDDLE_CLICK: u32 = 4;
+	/// `Custom…FingerTap` only: mouse buttons 4 / 5 and a custom keyboard shortcut.
+	pub const TAP_XBUTTON1: u32 = 5;
+	pub const TAP_XBUTTON2: u32 = 6;
+	pub const TAP_SHORTCUT: u32 = 7;
+	/// Any of the four drop-downs: "Custom" (Advanced gestures) — read the per-gesture values.
+	/// A per-direction value of `CUSTOM` is a custom shortcut (`…KeyParams`).
+	pub const CUSTOM: u32 = 0xFFFF;
 
-	/// The registry values that matter. `None` = not set → the Windows 11 default.
+	/// Per-direction ("Advanced gestures") action codes.
+	pub mod adv {
+		pub const NOTHING: u32 = 0;
+		pub const SWITCH_APPS: u32 = 1;
+		pub const TASK_VIEW: u32 = 2;
+		pub const SHOW_DESKTOP: u32 = 3;
+		pub const SWITCH_DESKTOPS: u32 = 4;
+		/// Hide everything other than the app in focus (Win+Home).
+		pub const HIDE_OTHERS: u32 = 5;
+		pub const CREATE_DESKTOP: u32 = 6;
+		pub const REMOVE_DESKTOP: u32 = 7;
+		pub const FORWARD: u32 = 8;
+		pub const BACK: u32 = 9;
+		pub const SNAP_LEFT: u32 = 10;
+		pub const MAXIMIZE: u32 = 11;
+		pub const SNAP_RIGHT: u32 = 12;
+		pub const MINIMIZE: u32 = 13;
+		pub const NEXT_TRACK: u32 = 14;
+		pub const PREV_TRACK: u32 = 15;
+		pub const VOLUME_UP: u32 = 16;
+		pub const VOLUME_DOWN: u32 = 17;
+		pub const MUTE: u32 = 18;
+	}
+
+	/// The raw DWORD values read (name → value); a missing name = not set.
 	#[derive(Clone, Debug, Default, PartialEq, Eq)]
 	pub struct Settings {
-		pub three_slide: Option<u32>,
-		pub four_slide: Option<u32>,
-		pub three_tap: Option<u32>,
-		pub four_tap: Option<u32>,
-		/// "Advanced gestures" per-gesture actions, when the user customised them (see
-		/// [`advanced_action`]); a gesture listed here overrides the drop-down value.
-		pub advanced: BTreeMap<(u8, GestureKind), GestureAction>,
+		pub values: BTreeMap<String, u32>,
 	}
 
-	/// Windows 11 factory defaults: three fingers switch apps, four switch desktops, a
-	/// three-finger tap opens search, a four-finger tap the notification center.
-	pub fn default_slide(fingers: u8) -> u32 {
-		if fingers == 3 { SLIDE_APPS } else { SLIDE_DESKTOPS }
+	impl Settings {
+		pub fn with(pairs: &[(&str, u32)]) -> Self {
+			Self { values: pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect() }
+		}
+		fn get(&self, name: &str) -> Option<u32> {
+			self.values.get(name).copied()
+		}
 	}
-	pub fn default_tap(fingers: u8) -> u32 {
-		if fingers == 3 { TAP_SEARCH } else { TAP_NOTIFICATIONS }
+
+	/// Every value name the mapping reads (the reader fetches these).
+	pub fn value_names() -> Vec<String> {
+		let mut v: Vec<String> = [THREE_SLIDE, FOUR_SLIDE, THREE_TAP, FOUR_TAP].iter().map(|s| s.to_string()).collect();
+		for f in [3u8, 4] {
+			for k in [GestureKind::SwipeUp, GestureKind::SwipeDown, GestureKind::SwipeLeft, GestureKind::SwipeRight, GestureKind::Tap]
+			{
+				let (code, params) = advanced_value_names(f, k);
+				v.push(code);
+				v.push(params);
+			}
+		}
+		v
+	}
+
+	/// Windows' built-in defaults (twinui's settings table): three fingers switch apps, four
+	/// switch desktops, a three-finger tap opens search, a four-finger tap the notification
+	/// center; per direction 3 fingers L/U/R/D = apps / Task View / apps / desktop, 4 fingers =
+	/// desktops / Task View / desktops / desktop.
+	pub fn default_value(name: &str) -> u32 {
+		match name {
+			THREE_SLIDE | THREE_TAP => 1,
+			FOUR_SLIDE | FOUR_TAP => 2,
+			"ThreeFingerLeft" | "ThreeFingerRight" => adv::SWITCH_APPS,
+			"FourFingerLeft" | "FourFingerRight" => adv::SWITCH_DESKTOPS,
+			"ThreeFingerUp" | "FourFingerUp" => adv::TASK_VIEW,
+			"ThreeFingerDown" | "FourFingerDown" => adv::SHOW_DESKTOP,
+			"CustomThreeFingerTap" => TAP_SEARCH,
+			"CustomFourFingerTap" => TAP_NOTIFICATIONS,
+			_ => 0, // every …KeyParams
+		}
 	}
 
 	/// What Windows does for this gesture with these settings.
 	pub fn action(s: &Settings, fingers: u8, kind: GestureKind) -> Mapped {
-		if let Some(a) = s.advanced.get(&(fingers, kind)) {
-			// A custom Task View shortcut still toggles like the built-in one.
-			let ov = *a == GestureAction::chord(&[LEFTMETA, TAB]);
-			return Mapped { action: a.clone(), opens_overview: ov };
-		}
+		let val = |name: &str| s.get(name).unwrap_or_else(|| default_value(name));
 		let three = fingers == 3;
+		let (code_name, params_name) = advanced_value_names(fingers, kind);
 		if kind == GestureKind::Tap {
-			let v = if three { s.three_tap } else { s.four_tap }.unwrap_or(default_tap(fingers));
-			return tap_action(v).into();
+			let v = val(if three { THREE_TAP } else { FOUR_TAP });
+			if v != CUSTOM {
+				return tap_action(v).into();
+			}
+			let code = val(&code_name);
+			if code == TAP_SHORTCUT {
+				return shortcut(val(&params_name)).into();
+			}
+			return tap_action(code).into();
 		}
-		let v = if three { s.three_slide } else { s.four_slide }.unwrap_or(default_slide(fingers));
-		slide_action(v, kind)
+		let v = val(if three { THREE_SLIDE } else { FOUR_SLIDE });
+		if v != CUSTOM {
+			return slide_action(v, kind);
+		}
+		let code = val(&code_name);
+		if code == CUSTOM {
+			let a = shortcut(val(&params_name));
+			// A custom Task View shortcut still toggles like the built-in one.
+			let ov = a == GestureAction::chord(&[LEFTMETA, TAB]);
+			return Mapped { action: a, opens_overview: ov };
+		}
+		advanced_action(code, kind)
 	}
 
-	/// A "Taps" drop-down value.
+	/// A "Taps" drop-down value / `Custom…FingerTap` code.
 	pub fn tap_action(v: u32) -> GestureAction {
 		match v {
 			TAP_SEARCH => GestureAction::chord(&[LEFTMETA, S]),
@@ -200,6 +279,9 @@ pub mod win {
 			TAP_NOTIFICATIONS => GestureAction::chord(&[LEFTMETA, N]),
 			TAP_PLAY_PAUSE => GestureAction::chord(&[PLAYPAUSE]),
 			TAP_MIDDLE_CLICK => GestureAction::Click(2),
+			// The wire has no X buttons: their usual meaning (back / forward) as browser keys.
+			TAP_XBUTTON1 => GestureAction::chord(&[BACK]),
+			TAP_XBUTTON2 => GestureAction::chord(&[FORWARD]),
 			_ => GestureAction::Nothing,
 		}
 	}
@@ -207,26 +289,80 @@ pub mod win {
 	/// A "Swipes" drop-down value for a swipe.
 	pub fn slide_action(v: u32, kind: GestureKind) -> Mapped {
 		use GestureKind::*;
+		let code = match (v, kind) {
+			(SLIDE_APPS | SLIDE_DESKTOPS, SwipeUp) => adv::TASK_VIEW,
+			(SLIDE_APPS | SLIDE_DESKTOPS, SwipeDown) => adv::SHOW_DESKTOP,
+			(SLIDE_APPS, _) => adv::SWITCH_APPS,
+			(SLIDE_DESKTOPS, _) => adv::SWITCH_DESKTOPS,
+			// twinui's own audio preset: L = previous, U = volume up, R = next, D = volume down.
+			(SLIDE_AUDIO, SwipeUp) => adv::VOLUME_UP,
+			(SLIDE_AUDIO, SwipeDown) => adv::VOLUME_DOWN,
+			(SLIDE_AUDIO, SwipeLeft) => adv::PREV_TRACK,
+			(SLIDE_AUDIO, SwipeRight) => adv::NEXT_TRACK,
+			_ => adv::NOTHING,
+		};
+		advanced_action(code, kind)
+	}
+
+	/// A per-direction action code for a swipe in this direction.
+	pub fn advanced_action(code: u32, kind: GestureKind) -> Mapped {
+		use GestureKind::*;
 		let c = GestureAction::chord;
-		match (v, kind) {
-			(SLIDE_APPS | SLIDE_DESKTOPS, SwipeUp) => Mapped::overview(c(&[LEFTMETA, TAB])),
-			(SLIDE_APPS | SLIDE_DESKTOPS, SwipeDown) => c(&[LEFTMETA, D]).into(),
-			// One app switch per swipe (Windows' own swipe walks the Alt+Tab list).
-			(SLIDE_APPS, SwipeLeft) => c(&[LEFTALT, TAB]).into(),
-			(SLIDE_APPS, SwipeRight) => c(&[LEFTALT, LEFTSHIFT, TAB]).into(),
-			// The content follows the fingers: moving left brings in the desktop on the right.
-			(SLIDE_DESKTOPS, SwipeLeft) => c(&[LEFTMETA, LEFTCTRL, RIGHT]).into(),
-			(SLIDE_DESKTOPS, SwipeRight) => c(&[LEFTMETA, LEFTCTRL, LEFT]).into(),
-			(SLIDE_AUDIO, SwipeUp) => c(&[VOLUMEUP]).into(),
-			(SLIDE_AUDIO, SwipeDown) => c(&[VOLUMEDOWN]).into(),
-			(SLIDE_AUDIO, SwipeLeft) => c(&[PREVIOUSSONG]).into(),
-			(SLIDE_AUDIO, SwipeRight) => c(&[NEXTSONG]).into(),
+		// Directional actions: fingers left / up = forwards (the next app in the Alt+Tab list,
+		// the desktop on the right — the content follows the fingers), right / down = back.
+		let forwards = matches!(kind, SwipeLeft | SwipeUp);
+		match code {
+			adv::SWITCH_APPS if forwards => c(&[LEFTALT, TAB]).into(),
+			adv::SWITCH_APPS => c(&[LEFTALT, LEFTSHIFT, TAB]).into(),
+			adv::TASK_VIEW => Mapped::overview(c(&[LEFTMETA, TAB])),
+			adv::SHOW_DESKTOP => c(&[LEFTMETA, D]).into(),
+			adv::SWITCH_DESKTOPS if forwards => c(&[LEFTMETA, LEFTCTRL, RIGHT]).into(),
+			adv::SWITCH_DESKTOPS => c(&[LEFTMETA, LEFTCTRL, LEFT]).into(),
+			adv::HIDE_OTHERS => c(&[LEFTMETA, HOME]).into(),
+			adv::CREATE_DESKTOP => c(&[LEFTMETA, LEFTCTRL, D]).into(),
+			adv::REMOVE_DESKTOP => c(&[LEFTMETA, LEFTCTRL, F4]).into(),
+			adv::FORWARD => c(&[FORWARD]).into(),
+			adv::BACK => c(&[BACK]).into(),
+			adv::SNAP_LEFT => c(&[LEFTMETA, LEFT]).into(),
+			adv::MAXIMIZE => c(&[LEFTMETA, UP]).into(),
+			adv::SNAP_RIGHT => c(&[LEFTMETA, RIGHT]).into(),
+			adv::MINIMIZE => c(&[LEFTMETA, DOWN]).into(),
+			adv::NEXT_TRACK => c(&[NEXTSONG]).into(),
+			adv::PREV_TRACK => c(&[PREVIOUSSONG]).into(),
+			adv::VOLUME_UP => c(&[VOLUMEUP]).into(),
+			adv::VOLUME_DOWN => c(&[VOLUMEDOWN]).into(),
+			adv::MUTE => c(&[MUTE]).into(),
 			_ => GestureAction::Nothing.into(),
 		}
 	}
 
+	/// A custom shortcut (`…KeyParams`): low 16 bits = modifiers (0x01 Ctrl, 0x02 Shift,
+	/// 0x04 left Win, 0x08 right Win, 0x10 Alt), high 16 bits = the virtual-key code. Pressed
+	/// in twinui's order: Ctrl, Shift, LWin, RWin, Alt, then the key.
+	pub fn shortcut(params: u32) -> GestureAction {
+		let mods = params & 0xFFFF;
+		let vk = (params >> 16) as u16;
+		let mut keys = Vec::new();
+		for (bit, k) in [(0x01, LEFTCTRL), (0x02, LEFTSHIFT), (0x04, LEFTMETA), (0x08, RIGHTMETA), (0x10, LEFTALT)] {
+			if mods & bit != 0 {
+				keys.push(k);
+			}
+		}
+		match u8::try_from(vk).ok().and_then(vk_to_evdev) {
+			Some(k) => {
+				if !keys.contains(&k) {
+					keys.push(k);
+				}
+			}
+			// No key, only modifiers (e.g. a bare Win): still a shortcut.
+			None if vk == 0 && !keys.is_empty() => {}
+			None => return GestureAction::Nothing,
+		}
+		GestureAction::Chord(keys)
+	}
+
 	/// The registry value names of the "Advanced gestures" page for one gesture: the action
-	/// code and, for a custom shortcut, its key parameters.
+	/// code and the custom shortcut.
 	pub fn advanced_value_names(fingers: u8, kind: GestureKind) -> (String, String) {
 		let n = if fingers == 3 { "Three" } else { "Four" };
 		let base = match kind {
@@ -238,12 +374,6 @@ pub mod win {
 		};
 		let params = format!("{base}KeyParams");
 		(base, params)
-	}
-
-	/// An "Advanced gestures" action code (+ the custom shortcut's key parameters) → action.
-	/// `None` = unknown code: the caller falls back to the drop-down value.
-	pub fn advanced_action(_code: u32, _params: Option<&[u8]>) -> Option<GestureAction> {
-		None
 	}
 
 	/// Windows virtual-key code → evdev key code (for custom shortcuts).
@@ -296,6 +426,8 @@ pub mod win {
 			0x70..=0x79 => 59 + (vk - 0x70) as u32,
 			0x7A => 87,
 			0x7B => 88,
+			0xA6 => 158,
+			0xA7 => 159,
 			0xAD => 113,
 			0xAE => 114,
 			0xAF => 115,
@@ -319,137 +451,50 @@ pub mod win {
 
 	fn letter(vk: u8) -> Option<u32> {
 		// evdev codes follow the QWERTY rows, not the alphabet.
-		const ROWS: [(u8, u32); 26] = [
-			(b'Q', 16),
-			(b'W', 17),
-			(b'E', 18),
-			(b'R', 19),
-			(b'T', 20),
-			(b'Y', 21),
-			(b'U', 22),
-			(b'I', 23),
-			(b'O', 24),
-			(b'P', 25),
-			(b'A', 30),
-			(b'S', 31),
-			(b'D', 32),
-			(b'F', 33),
-			(b'G', 34),
-			(b'H', 35),
-			(b'J', 36),
-			(b'K', 37),
-			(b'L', 38),
-			(b'Z', 44),
-			(b'X', 45),
-			(b'C', 46),
-			(b'V', 47),
-			(b'B', 48),
-			(b'N', 49),
-			(b'M', 50),
-		];
-		ROWS.iter().find(|(c, _)| *c == vk).map(|(_, e)| *e)
+		const ROWS: &[u8; 26] = b"QWERTYUIOPASDFGHJKLZXCVBNM";
+		const CODES: [u32; 26] =
+			[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47, 48, 49, 50];
+		ROWS.iter().position(|&c| c == vk).map(|i| CODES[i])
 	}
 
-	/// Read the current user's settings (HKCU of the host process — the per-user host app).
+	/// Read the current user's settings (HKCU of the host process — the per-user host app —
+	/// then HKLM, as Explorer does).
 	#[cfg(windows)]
 	pub fn read() -> Option<Settings> {
-		let dw = |name: &str| reg_dword(KEY, name);
-		let present = reg_key_exists(KEY);
-		if !present {
-			return None;
-		}
-		let mut s = Settings {
-			three_slide: dw(THREE_SLIDE),
-			four_slide: dw(FOUR_SLIDE),
-			three_tap: dw(THREE_TAP),
-			four_tap: dw(FOUR_TAP),
-			advanced: BTreeMap::new(),
-		};
-		for fingers in [3u8, 4] {
-			for kind in [
-				GestureKind::SwipeUp,
-				GestureKind::SwipeDown,
-				GestureKind::SwipeLeft,
-				GestureKind::SwipeRight,
-				GestureKind::Tap,
-			] {
-				let (code, params) = advanced_value_names(fingers, kind);
-				if let Some(code) = dw(&code) {
-					let params = reg_binary(KEY, &params);
-					if let Some(a) = advanced_action(code, params.as_deref()) {
-						s.advanced.insert((fingers, kind), a);
-					}
-				}
+		let mut s = Settings::default();
+		for name in value_names() {
+			if let Some(v) = reg::dword(true, KEY, &name).or_else(|| reg::dword(false, KEY, &name)) {
+				s.values.insert(name, v);
 			}
 		}
 		Some(s)
 	}
 
 	#[cfg(windows)]
-	fn wide(s: &str) -> Vec<u16> {
-		s.encode_utf16().chain(std::iter::once(0)).collect()
-	}
-
-	#[cfg(windows)]
-	fn reg_key_exists(key: &str) -> bool {
-		use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ};
-		let k = wide(key);
-		let mut h: HKEY = std::ptr::null_mut();
-		let ok = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, k.as_ptr(), 0, KEY_READ, &mut h) } == 0;
-		if ok {
-			unsafe { RegCloseKey(h) };
+	mod reg {
+		fn wide(s: &str) -> Vec<u16> {
+			s.encode_utf16().chain(std::iter::once(0)).collect()
 		}
-		ok
-	}
 
-	#[cfg(windows)]
-	fn reg_dword(key: &str, name: &str) -> Option<u32> {
-		use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-		let (k, n) = (wide(key), wide(name));
-		let mut v: u32 = 0;
-		let mut len = std::mem::size_of::<u32>() as u32;
-		let r = unsafe {
-			RegGetValueW(
-				HKEY_CURRENT_USER,
-				k.as_ptr(),
-				n.as_ptr(),
-				RRF_RT_REG_DWORD,
-				std::ptr::null_mut(),
-				&mut v as *mut u32 as *mut core::ffi::c_void,
-				&mut len,
-			)
-		};
-		(r == 0).then_some(v)
-	}
-
-	#[cfg(windows)]
-	fn reg_binary(key: &str, name: &str) -> Option<Vec<u8>> {
-		use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
-		let (k, n) = (wide(key), wide(name));
-		let mut len: u32 = 0;
-		let flags = RRF_RT_REG_BINARY;
-		let r = unsafe {
-			RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), flags, std::ptr::null_mut(), std::ptr::null_mut(), &mut len)
-		};
-		if r != 0 || len == 0 || len > 4096 {
-			return None;
+		pub fn dword(user: bool, key: &str, name: &str) -> Option<u32> {
+			use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+			let (k, n) = (wide(key), wide(name));
+			let mut v: u32 = 0;
+			let mut len = std::mem::size_of::<u32>() as u32;
+			let root = if user { HKEY_CURRENT_USER } else { HKEY_LOCAL_MACHINE };
+			let r = unsafe {
+				RegGetValueW(
+					root,
+					k.as_ptr(),
+					n.as_ptr(),
+					RRF_RT_REG_DWORD,
+					std::ptr::null_mut(),
+					&mut v as *mut u32 as *mut core::ffi::c_void,
+					&mut len,
+				)
+			};
+			(r == 0).then_some(v)
 		}
-		let mut buf = vec![0u8; len as usize];
-		let r = unsafe {
-			RegGetValueW(
-				HKEY_CURRENT_USER,
-				k.as_ptr(),
-				n.as_ptr(),
-				flags,
-				std::ptr::null_mut(),
-				buf.as_mut_ptr() as *mut core::ffi::c_void,
-				&mut len,
-			)
-		};
-		(r == 0).then(|| {
-			buf.truncate(len as usize);
-			buf
-		})
 	}
 }
 
@@ -858,30 +903,22 @@ mod tests {
 	fn windows_honours_the_users_drop_downs() {
 		use win::*;
 		// This laptop's settings (2026-11-15): 3 fingers = desktops, 4 = apps, 3-tap = middle.
-		let s = Settings {
-			three_slide: Some(SLIDE_DESKTOPS),
-			four_slide: Some(SLIDE_APPS),
-			three_tap: Some(TAP_MIDDLE_CLICK),
-			four_tap: None,
-			..Default::default()
-		};
+		let s = Settings::with(&[(THREE_SLIDE, SLIDE_DESKTOPS), (FOUR_SLIDE, SLIDE_APPS), (THREE_TAP, TAP_MIDDLE_CLICK)]);
 		assert_eq!(action(&s, 3, SwipeLeft).action, chord(&[LEFTMETA, LEFTCTRL, RIGHT]));
+		assert_eq!(action(&s, 3, SwipeRight).action, chord(&[LEFTMETA, LEFTCTRL, LEFT]));
+		assert_eq!(action(&s, 3, SwipeUp).action, chord(&[LEFTMETA, TAB]));
 		assert_eq!(action(&s, 4, SwipeLeft).action, chord(&[LEFTALT, TAB]));
+		assert_eq!(action(&s, 4, SwipeDown).action, chord(&[LEFTMETA, D]));
 		assert_eq!(action(&s, 3, Tap).action, GestureAction::Click(2));
 		assert_eq!(action(&s, 4, Tap).action, chord(&[LEFTMETA, N]));
-		let audio = Settings { three_slide: Some(SLIDE_AUDIO), three_tap: Some(TAP_PLAY_PAUSE), ..Default::default() };
+		let audio = Settings::with(&[(THREE_SLIDE, SLIDE_AUDIO), (THREE_TAP, TAP_PLAY_PAUSE)]);
 		assert_eq!(action(&audio, 3, SwipeUp).action, chord(&[VOLUMEUP]));
 		assert!(!action(&audio, 3, SwipeUp).opens_overview);
 		assert_eq!(action(&audio, 3, SwipeDown).action, chord(&[VOLUMEDOWN]));
 		assert_eq!(action(&audio, 3, SwipeLeft).action, chord(&[PREVIOUSSONG]));
 		assert_eq!(action(&audio, 3, SwipeRight).action, chord(&[NEXTSONG]));
 		assert_eq!(action(&audio, 3, Tap).action, chord(&[PLAYPAUSE]));
-		let off = Settings {
-			three_slide: Some(SLIDE_NOTHING),
-			three_tap: Some(TAP_NOTHING),
-			four_slide: Some(77),
-			..Default::default()
-		};
+		let off = Settings::with(&[(THREE_SLIDE, SLIDE_NOTHING), (THREE_TAP, TAP_NOTHING), (FOUR_SLIDE, 77)]);
 		for k in [SwipeUp, SwipeDown, SwipeLeft, SwipeRight, Tap] {
 			assert_eq!(action(&off, 3, k).action, GestureAction::Nothing, "{k:?}");
 		}
@@ -889,17 +926,53 @@ mod tests {
 	}
 
 	#[test]
-	fn windows_advanced_entry_overrides_the_drop_down() {
+	fn windows_advanced_gestures() {
 		use win::*;
-		let mut s = Settings::default();
-		s.advanced.insert((3, SwipeDown), chord(&[LEFTCTRL, LEFTSHIFT, 1]));
-		assert_eq!(action(&s, 3, SwipeDown).action, chord(&[LEFTCTRL, LEFTSHIFT, 1]));
-		assert_eq!(action(&s, 4, SwipeDown).action, chord(&[LEFTMETA, D]));
+		// Custom swipes: 3-finger down = minimize, left = custom Ctrl+Shift+1, right unset
+		// (default: switch apps), up = nothing. Custom taps: 4-finger = custom Win+E.
+		let s = Settings::with(&[
+			(THREE_SLIDE, CUSTOM),
+			("ThreeFingerDown", adv::MINIMIZE),
+			("ThreeFingerLeft", CUSTOM),
+			("ThreeFingerLeftKeyParams", (0x31 << 16) | 0x01 | 0x02),
+			("ThreeFingerUp", adv::NOTHING),
+			(FOUR_TAP, CUSTOM),
+			("CustomFourFingerTap", TAP_SHORTCUT),
+			("CustomFourFingerTapKeyParams", (0x45 << 16) | 0x04),
+			(THREE_TAP, CUSTOM),
+			("CustomThreeFingerTap", TAP_XBUTTON1),
+		]);
+		assert_eq!(action(&s, 3, SwipeDown).action, chord(&[LEFTMETA, DOWN]));
+		assert_eq!(action(&s, 3, SwipeLeft).action, chord(&[LEFTCTRL, LEFTSHIFT, 2]));
+		assert_eq!(action(&s, 3, SwipeRight).action, chord(&[LEFTALT, LEFTSHIFT, TAB]));
+		assert_eq!(action(&s, 3, SwipeUp).action, GestureAction::Nothing);
+		assert_eq!(action(&s, 4, Tap).action, chord(&[LEFTMETA, 18]));
+		assert_eq!(action(&s, 3, Tap).action, chord(&[BACK]));
+		// The per-direction values only count in custom mode.
+		let preset = Settings::with(&[("FourFingerDown", adv::MUTE)]);
+		assert_eq!(action(&preset, 4, SwipeDown).action, chord(&[LEFTMETA, D]));
+		// Every advanced code has an action.
+		for code in 1..=18 {
+			assert_ne!(advanced_action(code, SwipeUp).action, GestureAction::Nothing, "{code}");
+		}
+		assert_eq!(advanced_action(adv::REMOVE_DESKTOP, SwipeUp).action, chord(&[LEFTMETA, LEFTCTRL, F4]));
+		assert_eq!(advanced_action(adv::HIDE_OTHERS, SwipeUp).action, chord(&[LEFTMETA, HOME]));
+		assert_eq!(advanced_action(99, SwipeUp).action, GestureAction::Nothing);
 		assert_eq!(advanced_value_names(3, SwipeUp), ("ThreeFingerUp".into(), "ThreeFingerUpKeyParams".into()));
-		assert_eq!(
-			advanced_value_names(4, Tap),
-			("CustomFourFingerTap".into(), "CustomFourFingerTapKeyParams".into())
-		);
+		assert_eq!(advanced_value_names(4, Tap), ("CustomFourFingerTap".into(), "CustomFourFingerTapKeyParams".into()));
+		assert_eq!(value_names().len(), 4 + 2 * 5 * 2);
+	}
+
+	#[test]
+	fn windows_custom_shortcut_encoding() {
+		use win::shortcut;
+		// low 16 = Ctrl 1 | Shift 2 | LWin 4 | RWin 8 | Alt 0x10, high 16 = VK.
+		assert_eq!(shortcut(0x0044_0005), chord(&[LEFTCTRL, LEFTMETA, D])); // Ctrl+Win+D
+		assert_eq!(shortcut(0x0009_0010), chord(&[LEFTALT, TAB]));
+		assert_eq!(shortcut(0x0000_0004), chord(&[LEFTMETA]), "bare Win");
+		assert_eq!(shortcut(0), GestureAction::Nothing);
+		assert_eq!(shortcut(0x00FF_0001), GestureAction::Nothing, "unknown VK");
+		assert_eq!(shortcut(0x005C_0008), chord(&[RIGHTMETA]), "RWin + VK_RWIN once");
 	}
 
 	#[test]

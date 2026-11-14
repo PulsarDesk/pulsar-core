@@ -109,7 +109,7 @@ pub(crate) fn is_extended_vk(vk: u16) -> bool {
 			| 0x6F // VK_DIVIDE
 			| 0x90 // VK_NUMLOCK
 			| 0x2C // VK_SNAPSHOT
-			| 0xAD..=0xB3 // volume mute/down/up, next/prev track, stop, play/pause (E0 scan codes)
+			| 0xA6..=0xB3 // browser back..home, volume, media keys (E0 scan codes)
 	)
 }
 
@@ -212,6 +212,8 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 		163 => 0xB0, // Next track  (VK_MEDIA_NEXT_TRACK)
 		164 => 0xB3, // Play/Pause  (VK_MEDIA_PLAY_PAUSE)
 		165 => 0xB1, // Prev track  (VK_MEDIA_PREV_TRACK)
+		158 => 0xA6, // Back        (VK_BROWSER_BACK)
+		159 => 0xA7, // Forward     (VK_BROWSER_FORWARD)
 		_ => return None,
 	})
 }
