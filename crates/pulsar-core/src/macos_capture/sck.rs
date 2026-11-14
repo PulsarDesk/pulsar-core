@@ -410,14 +410,10 @@ fn ns_error_code(err: *mut AnyObject) -> isize {
 	unsafe { msg_send![err, code] }
 }
 
-/// The UTF-8 text of an NSString.
+/// The text of an NSString, read through its toll-free bridged CFString (no `UTF8String`
+/// message: its `r*` return encoding is not one objc2's debug check takes for a C string).
 unsafe fn ns_string(s: &AnyObject) -> String {
-	let p: *const std::ffi::c_char = msg_send![s, UTF8String];
-	if p.is_null() {
-		String::new()
-	} else {
-		CStr::from_ptr(p).to_string_lossy().into_owned()
-	}
+	ffi::cf_string_to_string((s as *const AnyObject).cast())
 }
 
 fn class(name: &CStr) -> Result<&'static AnyClass, ScError> {

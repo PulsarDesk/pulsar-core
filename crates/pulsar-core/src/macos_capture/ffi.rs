@@ -8,6 +8,8 @@
 
 use std::ffi::{c_char, c_void, CStr};
 
+use objc2::Encode;
+
 pub type CFTypeRef = *const c_void;
 pub type CFStringRef = *const c_void;
 pub type CFDictionaryRef = *const c_void;
@@ -64,14 +66,13 @@ impl CMTime {
 }
 
 // SAFETY: same layout and encoding as CoreMedia's anonymous `CMTime` struct.
-unsafe impl objc2::Encode for CMTime {
+unsafe impl Encode for CMTime {
 	const ENCODING: objc2::Encoding = objc2::Encoding::Struct(
 		"?",
 		&[i64::ENCODING, i32::ENCODING, u32::ENCODING, i64::ENCODING],
 	);
 }
 
-use objc2::Encode as _;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -132,6 +133,29 @@ extern "C" {
 	pub fn CFArrayGetValueAtIndex(a: CFArrayRef, idx: CFIndex) -> *const c_void;
 	pub fn CFDictionaryGetValue(d: CFDictionaryRef, key: *const c_void) -> *const c_void;
 	pub fn CFNumberGetValue(n: CFTypeRef, the_type: CFIndex, value_ptr: *mut c_void) -> Boolean;
+	pub fn CFStringGetLength(s: CFStringRef) -> CFIndex;
+	pub fn CFStringGetMaximumSizeForEncoding(length: CFIndex, encoding: u32) -> CFIndex;
+	pub fn CFStringGetCString(s: CFStringRef, buffer: *mut c_char, size: CFIndex, encoding: u32) -> Boolean;
+}
+
+/// `kCFStringEncodingUTF8`.
+pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+
+/// A CFString (or a toll-free bridged NSString) as a Rust String; empty on failure.
+pub unsafe fn cf_string_to_string(s: CFStringRef) -> String {
+	if s.is_null() {
+		return String::new();
+	}
+	let len = CFStringGetLength(s);
+	let cap = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+	if cap <= 1 {
+		return String::new();
+	}
+	let mut buf = vec![0u8; cap as usize];
+	if CFStringGetCString(s, buf.as_mut_ptr().cast(), cap, kCFStringEncodingUTF8) == 0 {
+		return String::new();
+	}
+	CStr::from_bytes_until_nul(&buf).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// `kCFNumberSInt64Type`.
@@ -230,5 +254,3 @@ pub fn cf_number_i64(n: CFTypeRef) -> Option<i64> {
 	(ok != 0).then_some(v)
 }
 
-/// Make sure the encoding helper import is used even when no CMTime is sent.
-const _: objc2::Encoding = CMTime::ENCODING;
