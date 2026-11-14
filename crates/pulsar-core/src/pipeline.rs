@@ -15,7 +15,9 @@ pub mod gst;
 mod types;
 
 pub use command::{decode_command, encode_command, probe_command, supports_intra_refresh};
-pub use types::{detect, resolve, resolve_codec, CaptureMethod, HwEncoder, StreamPlan, VCodec};
+pub use types::{
+	detect, fit_window_size, resolve, resolve_codec, CaptureMethod, HwEncoder, StreamPlan, VCodec,
+};
 
 #[cfg(test)]
 mod tests;

@@ -134,9 +134,12 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 
 	// Screen capture (platform-specific).
 	a.extend(plan.capture.input_args(plan));
-	// gdigrab captures the desktop at its own size (see CaptureMethod::input_args).
-	if plan.capture == CaptureMethod::Gdigrab {
-		a.extend([s("-vf"), format!("scale={}:{}", plan.width, plan.height)]);
+	// gdigrab captures the desktop at its own size, x11grab -window_id the window at
+	// its own size (see CaptureMethod::input_args): scale both to the plan size. One
+	// `-vf` chain with the upload below: a second `-vf` would replace the first.
+	let mut vf: Vec<String> = Vec::new();
+	if plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window() {
+		vf.push(format!("scale={}:{}", plan.width, plan.height));
 	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
@@ -148,7 +151,10 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 			(false, true) => "p010le",
 			(false, false) => "nv12",
 		};
-		a.extend([s("-vf"), format!("format={up},hwupload")]);
+		vf.push(format!("format={up},hwupload"));
+	}
+	if !vf.is_empty() {
+		a.extend([s("-vf"), vf.join(",")]);
 	}
 
 	// GOP: game mode uses a short GOP (~0.25 s) so the picture self-heals fast after
@@ -460,6 +466,7 @@ mod tests {
 			hdr: false,
 			yuv444: false,
 			loss_recovery: LossRecovery::Normal,
+			window_id: None,
 		}
 	}
 
@@ -469,6 +476,7 @@ mod tests {
 			codec,
 			low_latency,
 			loss_recovery: rec,
+			window_id: None,
 			..sw_av1_plan(false)
 		}
 	}

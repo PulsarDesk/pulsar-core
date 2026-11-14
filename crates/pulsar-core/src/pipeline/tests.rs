@@ -18,6 +18,7 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		hdr: false,
 		yuv444: false,
 		loss_recovery: crate::service::LossRecovery::Normal,
+		window_id: None,
 	}
 }
 
@@ -233,6 +234,41 @@ fn ddagrab_media_foundation_feeds_nv12() {
 		assert!(joined.contains("hwdownload"), "{codec:?}: MF needs a system-memory frame");
 		assert!(!joined.contains("yuv420p"), "{codec:?}: yuv420p fails MF format negotiation");
 	}
+}
+
+#[test]
+fn x11_window_capture_uses_window_id_and_one_scale_chain() {
+	let mut p = plan(HwEncoder::Software);
+	p.capture = CaptureMethod::X11grab;
+	p.window_id = Some(0x3a0000f);
+	let args = encode_command(&p).1;
+	let i = args.iter().position(|a| a == "-window_id").expect("-window_id");
+	assert_eq!(args[i + 1], "0x3a0000f");
+	assert!(!args.iter().any(|a| a == "-video_size"));
+	assert!(args.iter().any(|a| a == &format!("scale={}:{}", p.width, p.height)));
+	// VA-API: the scale and the upload share ONE -vf (a second -vf would drop the scale).
+	p.encoder = HwEncoder::Vaapi;
+	let args = encode_command(&p).1;
+	assert_eq!(args.iter().filter(|a| *a == "-vf").count(), 1);
+	assert!(args.iter().any(|a| a.starts_with("scale=") && a.ends_with("hwupload")));
+	// The window id only applies to x11grab.
+	p.capture = CaptureMethod::AvFoundation;
+	assert!(!encode_command(&p).1.iter().any(|a| a == "-window_id"));
+	// No window: the display grab is unchanged.
+	p.capture = CaptureMethod::X11grab;
+	p.window_id = None;
+	assert!(encode_command(&p).1.iter().any(|a| a == "-video_size"));
+}
+
+#[test]
+fn fit_window_size_keeps_aspect_even_and_never_upscales() {
+	use super::fit_window_size;
+	assert_eq!(fit_window_size(1280, 720, 1920, 1080), (1280, 720));
+	assert_eq!(fit_window_size(2560, 1440, 1920, 1080), (1920, 1080));
+	assert_eq!(fit_window_size(801, 601, 1920, 1080), (800, 600));
+	// A tall window into a wide box: the height binds.
+	assert_eq!(fit_window_size(1000, 2000, 1920, 1080), (540, 1080));
+	assert_eq!(fit_window_size(0, 0, 1920, 1080), (2, 2));
 }
 
 #[test]

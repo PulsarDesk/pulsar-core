@@ -71,16 +71,31 @@ impl CaptureMethod {
 		let fps = plan.fps.to_string();
 		let size = format!("{}x{}", plan.width, plan.height);
 		match self {
-			Self::X11grab => vec![
-				s("-f"),
-				s("x11grab"),
-				s("-framerate"),
-				fps,
-				s("-video_size"),
-				size,
-				s("-i"),
-				plan.display.clone(),
-			],
+			// One X window (same-host co-op): `-window_id` makes x11grab grab that window
+			// at ITS size (a `-video_size` larger than the window fails to open), and
+			// encode_command scales it to the plan size. Needs ffmpeg 5.1+.
+			Self::X11grab => match plan.window_id {
+				Some(xid) => vec![
+					s("-f"),
+					s("x11grab"),
+					s("-framerate"),
+					fps,
+					s("-window_id"),
+					format!("0x{xid:x}"),
+					s("-i"),
+					plan.display.clone(),
+				],
+				None => vec![
+					s("-f"),
+					s("x11grab"),
+					s("-framerate"),
+					fps,
+					s("-video_size"),
+					size,
+					s("-i"),
+					plan.display.clone(),
+				],
+			},
 			Self::Kmsgrab => vec![s("-f"), s("kmsgrab"), s("-framerate"), fps, s("-i"), s("-")],
 			// The whole desktop at ITS size: a `-video_size` larger than the screen (the client
 			// asked for 1080p, the host desktop is 1280×800 — a VM, an RDP session) makes gdigrab
@@ -368,6 +383,27 @@ pub struct StreamPlan {
 	/// periodic-intra-refresh knobs in [`encode_command`](super::encode_command).
 	/// `Normal` = the long remote GOP.
 	pub loss_recovery: crate::service::LossRecovery,
+	/// (Linux X11) capture this one X window (XID) instead of the display: the
+	/// same-host co-op per-window source (`x11grab -window_id`). `None` = the display.
+	/// Ignored by every other capture method.
+	pub window_id: Option<u64>,
+}
+
+impl StreamPlan {
+	/// Does this plan capture a single X window (and so need a scale to the plan size)?
+	pub fn captures_x11_window(&self) -> bool {
+		self.capture == CaptureMethod::X11grab && self.window_id.is_some()
+	}
+}
+
+/// The encode size for a captured window of `win_w`×`win_h`: the window's own aspect,
+/// no larger than the window (no upscale) nor than `max_w`×`max_h`, both even (every
+/// hardware encoder wants even 4:2:0 dimensions), at least 2×2.
+pub fn fit_window_size(win_w: u32, win_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+	let (ww, wh) = (win_w.max(2) as f64, win_h.max(2) as f64);
+	let k = (max_w.max(2) as f64 / ww).min(max_h.max(2) as f64 / wh).min(1.0);
+	let even = |v: f64| ((v.floor() as u32) & !1).max(2);
+	(even(ww * k), even(wh * k))
 }
 
 impl StreamPlan {

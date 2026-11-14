@@ -55,9 +55,36 @@ use super::window_common::{
 const SCRATCH_KEYCODES: usize = 4;
 /// Caps Lock toggles `LockMask` in the event state.
 const LOCK_MASK: u16 = 1 << 1;
-/// Window size / front state are re-read at most this often: each is one or more X
-/// round-trips, and a mouse move would otherwise pay them on every event.
+/// Window size / front / alive state and the child under the pointer are re-read at
+/// most this often: each is one or more synchronous X round-trips, and the host asks
+/// on every input event (mouse moves arrive at 120 Hz and more).
 const CACHE_TTL: Duration = Duration::from_millis(200);
+
+/// The deepest mapped child of the target under the pointer, cached: its origin in
+/// target-window coordinates and its size, so a point that stays inside it needs no
+/// round-trip. Plus the target's own origin in root coordinates.
+#[derive(Clone, Copy)]
+struct Located {
+	at: Instant,
+	child: Window,
+	/// Child origin in target-window coordinates (0,0 when the child IS the target).
+	off_x: i16,
+	off_y: i16,
+	w: i16,
+	h: i16,
+	/// Target-window origin in root coordinates.
+	root_x: i16,
+	root_y: i16,
+}
+
+impl Located {
+	fn contains(&self, x: i16, y: i16) -> bool {
+		x >= self.off_x
+			&& y >= self.off_y
+			&& x < self.off_x.saturating_add(self.w)
+			&& y < self.off_y.saturating_add(self.h)
+	}
+}
 
 pub struct WindowInput {
 	conn: RustConnection,
@@ -86,7 +113,9 @@ pub struct WindowInput {
 	xtest: bool,
 	/// Cached `in_front` / `size` answers and when they were read (see `CACHE_TTL`).
 	front: Cell<Option<(Instant, bool)>>,
+	alive: Cell<Option<(Instant, bool)>>,
 	geom: Cell<Option<(Instant, (f64, f64))>>,
+	located: Cell<Option<Located>>,
 }
 
 impl WindowInput {
@@ -128,7 +157,9 @@ impl WindowInput {
 			scratch_used: HashSet::new(),
 			xtest,
 			front: Cell::new(None),
+			alive: Cell::new(None),
 			geom: Cell::new(None),
+			located: Cell::new(None),
 		};
 		me.refresh_keymap();
 		me.scratch = free_keycodes(&me.keymap, me.syms_per, me.first_keycode, SCRATCH_KEYCODES);
@@ -150,13 +181,21 @@ impl WindowInput {
 		}
 	}
 
-	/// Is the target window still alive?
+	/// Is the target window still alive? (Cached for `CACHE_TTL`.)
 	pub fn is_alive(&self) -> bool {
-		self.conn
+		if let Some((t, v)) = self.alive.get() {
+			if t.elapsed() < CACHE_TTL {
+				return v;
+			}
+		}
+		let v = self
+			.conn
 			.get_geometry(self.win)
 			.ok()
 			.and_then(|c| c.reply().ok())
-			.is_some()
+			.is_some();
+		self.alive.set(Some((Instant::now(), v)));
+		v
 	}
 
 	fn parent_of(&self, w: Window) -> Option<Window> {
@@ -192,7 +231,26 @@ impl WindowInput {
 		v
 	}
 
+	/// `a` and the target are the same window, or one contains the other.
+	fn related(&self, a: Window) -> bool {
+		self.is_ancestor_or_self(a, self.win) || self.is_ancestor_or_self(self.win, a)
+	}
+
+	/// Front = the X input focus is in the target's tree, and (with EWMH) the WM's
+	/// `_NET_ACTIVE_WINDOW` names it too. The focus check matters on XWayland: Mutter /
+	/// KWin can leave `_NET_ACTIVE_WINDOW` stale when focus moves to a native Wayland
+	/// window, while the X focus moves off the target. A stale "front" would send the
+	/// background window's mouse through XTest and move the shared X pointer.
 	fn query_front(&self) -> bool {
+		let Some(focus) = self
+			.conn
+			.get_input_focus()
+			.ok()
+			.and_then(|c| c.reply().ok())
+			.map(|r| r.focus)
+		else {
+			return false;
+		};
 		let active = (self.net_active != 0)
 			.then(|| {
 				self.conn
@@ -204,15 +262,8 @@ impl WindowInput {
 					.next()
 			})
 			.flatten()
-			.filter(|&w| w != 0)
-			.or_else(|| {
-				let f = self.conn.get_input_focus().ok()?.reply().ok()?.focus;
-				(f > 1).then_some(f) // 0 = None, 1 = PointerRoot
-			});
-		match active {
-			Some(a) => self.is_ancestor_or_self(a, self.win) || self.is_ancestor_or_self(self.win, a),
-			None => false,
-		}
+			.filter(|&w| w != 0);
+		front_verdict(focus, active.map(|a| self.related(a)), || self.related(focus))
 	}
 
 	fn size(&self) -> (f64, f64) {
@@ -236,8 +287,43 @@ impl WindowInput {
 	}
 
 	/// The deepest mapped child of the target under window point (x, y), with the
-	/// point in that child's coordinates, plus the point in root coordinates.
+	/// point in that child's coordinates, plus the point in root coordinates. The
+	/// child + offsets are cached for `CACHE_TTL` while the point stays inside it.
 	fn locate(&self, x: i16, y: i16) -> (Window, i16, i16, i16, i16) {
+		let fresh = self.located.get().filter(|l| l.at.elapsed() < CACHE_TTL && l.contains(x, y));
+		let l = match fresh {
+			Some(l) => l,
+			None => {
+				let l = self.query_locate(x, y);
+				self.located.set(Some(l));
+				l
+			}
+		};
+		(
+			l.child,
+			x.saturating_sub(l.off_x),
+			y.saturating_sub(l.off_y),
+			l.root_x.saturating_add(x),
+			l.root_y.saturating_add(y),
+		)
+	}
+
+	/// The target's origin in root coordinates, from the cached `locate` answer when
+	/// it is fresh (keys need it only for the event's root_x/root_y fields).
+	fn root_origin(&self) -> (i16, i16) {
+		match self.located.get().filter(|l| l.at.elapsed() < CACHE_TTL) {
+			Some(l) => (l.root_x, l.root_y),
+			None => {
+				let (x, y) = self.point();
+				let l = self.query_locate(x, y);
+				self.located.set(Some(l));
+				(l.root_x, l.root_y)
+			}
+		}
+	}
+
+	fn query_locate(&self, x: i16, y: i16) -> Located {
+		let (w, h) = self.size();
 		let (mut cur, mut cx, mut cy) = (self.win, x, y);
 		for _ in 0..16 {
 			let Some(r) = self
@@ -263,14 +349,31 @@ impl WindowInput {
 			cx = t.dst_x;
 			cy = t.dst_y;
 		}
-		let (rx, ry) = self
+		let (cw, ch) = if cur == self.win {
+			(w as i16, h as i16)
+		} else {
+			self.conn
+				.get_geometry(cur)
+				.ok()
+				.and_then(|c| c.reply().ok())
+				.map_or((1, 1), |g| (g.width as i16, g.height as i16))
+		};
+		let (root_x, root_y) = self
 			.conn
-			.translate_coordinates(self.win, self.root, x, y)
+			.translate_coordinates(self.win, self.root, 0, 0)
 			.ok()
 			.and_then(|c| c.reply().ok())
-			.map(|r| (r.dst_x, r.dst_y))
-			.unwrap_or((x, y));
-		(cur, cx, cy, rx, ry)
+			.map_or((0, 0), |r| (r.dst_x, r.dst_y));
+		Located {
+			at: Instant::now(),
+			child: cur,
+			off_x: x.saturating_sub(cx),
+			off_y: y.saturating_sub(cy),
+			w: cw.max(1),
+			h: ch.max(1),
+			root_x,
+			root_y,
+		}
 	}
 
 	fn state(&self) -> u16 {
@@ -359,7 +462,8 @@ impl WindowInput {
 	/// to their focus widget from there).
 	fn key_event(&self, keycode: u8, down: bool, state: u16) {
 		let (x, y) = self.point();
-		let (_, _, _, rx, ry) = self.locate(x, y);
+		let (ox, oy) = self.root_origin();
+		let (rx, ry) = (ox.saturating_add(x), oy.saturating_add(y));
 		let kind = if down {
 			xproto::KEY_PRESS_EVENT
 		} else {
@@ -463,6 +567,10 @@ impl WindowInput {
 		let Some(sym) = char_to_keysym(c) else {
 			return;
 		};
+		// The cached keymap includes the scratch keycodes as last remapped, so a char
+		// typed again finds its scratch keycode here and does NOT remap: the
+		// server-global ChangeKeyboardMapping (MappingNotify to every client) runs only
+		// for a char that is on no keycode yet.
 		let found = find_keysym(&self.keymap, self.syms_per, self.first_keycode, sym);
 		let (kc, shift) = match found {
 			Some(f) => f,
@@ -522,8 +630,54 @@ impl Drop for WindowInput {
 	}
 }
 
+/// The front decision from its inputs: the X `focus` window (0 = None, 1 =
+/// PointerRoot), whether `_NET_ACTIVE_WINDOW` (when set) is related to the target, and
+/// a lazy "is `focus` related to the target" check.
+fn front_verdict(focus: Window, active_related: Option<bool>, focus_related: impl FnOnce() -> bool) -> bool {
+	match (focus, active_related) {
+		// Focus None: no X window has the keyboard (XWayland: a Wayland window does).
+		(0, _) => false,
+		// PointerRoot focus follows the pointer: trust the WM's active window.
+		(1, a) => a == Some(true),
+		(_, Some(false)) => false,
+		(_, _) => focus_related(),
+	}
+}
+
 // The host keeps this in its `on_input` closure state (a tokio task) → must be Send.
 const _: fn() = || {
 	fn assert_send<T: Send>() {}
 	assert_send::<WindowInput>();
 };
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn front_needs_focus_inside_target() {
+		// XWayland after focus moved to a native Wayland window: stale active, focus None.
+		assert!(!front_verdict(0, Some(true), || true));
+		// Active names the target but the X focus is elsewhere.
+		assert!(!front_verdict(42, Some(true), || false));
+		// Active names another window.
+		assert!(!front_verdict(42, Some(false), || true));
+		// Both agree.
+		assert!(front_verdict(42, Some(true), || true));
+		// No EWMH: focus alone decides.
+		assert!(front_verdict(42, None, || true));
+		assert!(!front_verdict(42, None, || false));
+		// PointerRoot: the WM's active window decides.
+		assert!(front_verdict(1, Some(true), || false));
+		assert!(!front_verdict(1, None, || true));
+	}
+
+	#[test]
+	fn located_contains_is_half_open() {
+		let l = Located { at: Instant::now(), child: 1, off_x: 10, off_y: 20, w: 5, h: 5, root_x: 0, root_y: 0 };
+		assert!(l.contains(10, 20));
+		assert!(l.contains(14, 24));
+		assert!(!l.contains(15, 20));
+		assert!(!l.contains(9, 20));
+	}
+}
