@@ -88,8 +88,9 @@ enum Msg {
 	/// the client times out and shows no window picker.
 	QueryWindows,
 	/// Host → client reply to `QueryWindows`: the host's visible, titled top-level
-	/// windows (`hwnd` + `title`). Empty on a non-Windows host (no WGC per-window
-	/// source) or when enumeration fails.
+	/// windows (`hwnd` + `title`; per-OS meaning of `hwnd` in [`wire::WindowInfo`]). A
+	/// Wayland host lists one [`wire::WindowInfo::PORTAL_PICK`] entry; empty when the host
+	/// has no per-window source or enumeration fails (an old non-Windows host: always).
 	Windows(Vec<wire::WindowInfo>),
 	/// Client → host: PAKE password attempt (see `pake`) — replaces a non-empty `Auth`
 	/// with a PAKE-capable host. The password itself never travels.

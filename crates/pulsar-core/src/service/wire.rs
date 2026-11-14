@@ -187,14 +187,31 @@ pub struct DisplayInfo {
 /// "window" capture picker and echoes the chosen [`hwnd`](Self::hwnd) back in
 /// [`StreamReq::window_hwnd`]. Mirrors [`DisplayInfo`] for the window case.
 ///
-/// `hwnd` is the raw Win32 `HWND` as an `i64` (stable for the window's lifetime;
-/// the client treats it as an opaque token). `title` is the window caption shown to
-/// the user (`GetWindowTextW`). Windows-only — a non-Windows host replies with an
-/// empty list (it has no per-window WGC source).
+/// `hwnd` is an opaque per-host window token (stable for the window's lifetime; the
+/// client never interprets it, it only echoes it back). What it is depends on the HOST:
+///
+/// | Host | `hwnd` | Capture |
+/// | --- | --- | --- |
+/// | Windows | the raw Win32 `HWND` | WGC (`pulsar-capture`) |
+/// | Linux X11 | the X window id (`_NET_CLIENT_LIST`) | `x11grab -window_id` / `ximagesrc xid=` |
+/// | Linux Wayland | always [`WindowInfo::PORTAL_PICK`] | ScreenCast portal, source type WINDOW |
+/// | macOS | the `CGWindowID` (= `SCWindow.windowID`) | ScreenCaptureKit desktop-independent window |
+///
+/// `title` is the window caption shown to the user (on macOS the app name when the
+/// window has no title). An old host / a host with no visible windows sends `[]`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowInfo {
 	pub hwnd: i64,
 	pub title: String,
+}
+
+impl WindowInfo {
+	/// The one entry a Wayland host lists: Wayland gives no client a list of other
+	/// programs' windows, and the ScreenCast portal lets only the person at the host pick
+	/// the window (in the compositor's own dialog). Requesting this id asks the host to
+	/// open that dialog with only windows offered. Never a real window id on any host
+	/// (HWNDs, X ids and CGWindowIDs are all positive).
+	pub const PORTAL_PICK: i64 = -1;
 }
 
 /// A client's request to start receiving a video stream.
@@ -282,18 +299,18 @@ pub struct StreamReq {
 	#[serde(default)]
 	pub display_idx: u32,
 	/// Per-WINDOW capture target (Phase 2b co-op): when `Some(hwnd)`, the host
-	/// captures that single top-level window via **Windows Graphics Capture** (WGC)
-	/// instead of duplicating a whole monitor — letting two panes share one monitor
-	/// or target two different app windows (the same-monitor couch-co-op case). The
-	/// value is a raw Win32 `HWND` as an `i64` (the host casts it back to `isize`);
-	/// the client gets it from the host's window list (`QueryWindows`) or — in game
-	/// mode — the host resolves it itself from the launched app's process. `None`
-	/// (default) ⇒ the existing full-monitor DXGI/`display_idx` path, unchanged.
+	/// captures that single top-level window instead of a whole monitor — letting two
+	/// panes share one monitor or target two different app windows (the same-monitor
+	/// couch-co-op case). The value is the opaque host window token of
+	/// [`WindowInfo::hwnd`] (per-OS meaning and capture source documented there: WGC on
+	/// Windows, x11grab/ximagesrc on X11, the ScreenCast portal on Wayland,
+	/// ScreenCaptureKit on macOS); the client gets it from the host's window list
+	/// (`QueryWindows`) or — in game mode — the host resolves it itself from the
+	/// launched app's process. `None` (default) ⇒ the full-monitor `display_idx` path.
 	///
 	/// `#[serde(default)]` (None) keeps full back-compat: an old client omits it and
-	/// the host streams the selected monitor exactly as before. Windows-only on the
-	/// host (the native WGC source is Windows-only); a `Some` value reaching a
-	/// non-Windows host is ignored and it falls back to its display path.
+	/// the host streams the selected monitor exactly as before. An old host that has
+	/// no window source for its OS ignores a `Some` and streams its display.
 	#[serde(default)]
 	pub window_hwnd: Option<i64>,
 	/// **Screen adaptation** (Parsec-style): when `Some((w, h))`, ask the host to switch

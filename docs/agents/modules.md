@@ -81,6 +81,27 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   system gst). `self_check(fragment)` = headless in-process encode test (desktop `--selftest`).
   gst VA-API = two families, one wire id `vaapi`: `Vaapi` (gstreamer-vaapi, `vaapih264enc`)
   and `Va` (gst-plugins-bad `va`, `vah264enc`, what gst ≥1.26 distros ship).
+  `start_with(.., Source::Window { max })` = a WINDOW cast (portal offers windows only, the
+  host person picks; frames scaled into `max` via `gst::wayland_pipeline_sized`).
+- `window_capture/` — host **per-window** capture off Windows (Windows = WGC in the desktop's
+  `pulsar-capture`). `backend()` (X11 / Portal / ScreenCaptureKit / None), `list()`, `size()`,
+  `find_for_launch(pid)` (largest window of the pid tree). X11 (`x11.rs`, pure-Rust `x11rb`,
+  `_NET_CLIENT_LIST`): id = X window id, grabbed by `pipeline::WindowInput::X11`
+  (`x11grab -window_id`) or `gst::x11_window_pipeline`. macOS (`mac.rs`, ScreenCaptureKit
+  12.3+): id = `CGWindowID`; `serve_for(session, id, max, fps)` starts a desktop-independent
+  window stream (its aspect fitted into `max`) and serves raw NV12 on loopback TCP for
+  `WindowInput::RawNv12` (`-f rawvideo`), returning url + size from one query;
+  `stop_for(session)` stops it. Wayland lists nothing (`WindowInfo::PORTAL_PICK`).
+  Also: `rect(id)` (X11 root pixels / macOS global points, no SCK query), `pointer_region(id)`
+  (Linux: the window as a 0..1 uinput region of the root), `raise(id)` (X11
+  `_NET_ACTIVE_WINDOW`; macOS app activate + `AXRaise`), `fit(id, pane_w, pane_h)` /
+  `restore(prev)` (X11 `_NET_MOVERESIZE_WINDOW` on the RandR monitor clipped to
+  `_NET_WORKAREA`; macOS Accessibility `AXPosition`/`AXSize`). macOS
+  `input::DesktopInput::set_window_rect` maps absolute moves into a window frame.
+  ScreenCaptureKit is linked strongly by `objc2-screen-capture-kit`: the app binary weak-links
+  it (desktop `src-tauri/build.rs`).
+  Wire meaning of the id per OS: `service/wire.rs` `WindowInfo`. **Untested on Linux / macOS
+  hardware** (2026-11-14, branch `parity/window-capture`).
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks.
