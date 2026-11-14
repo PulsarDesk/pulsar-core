@@ -35,6 +35,40 @@ pub struct HostWindow {
 	pub height: u32,
 }
 
+/// A window's rectangle on the desktop, in the space the host's pointer injector works in:
+/// X11 root-window pixels, macOS global display POINTS (top-left origin, as `CGEvent` and
+/// `CGWindowListCopyWindowInfo` use). The client area only on X11 (what `x11grab -window_id`
+/// grabs); the whole window incl. its title bar on macOS (what ScreenCaptureKit captures).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowRect {
+	pub x: f64,
+	pub y: f64,
+	pub w: f64,
+	pub h: f64,
+}
+
+impl WindowRect {
+	fn centre(&self) -> (f64, f64) {
+		(self.x + self.w / 2.0, self.y + self.h / 2.0)
+	}
+
+	fn contains(&self, (x, y): (f64, f64)) -> bool {
+		x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
+	}
+}
+
+/// Where a window was before [`fit`] resized it ([`restore`] puts it back).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FitPrev {
+	#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+	id: u64,
+	#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+	rect: WindowRect,
+	/// X11: it was maximized vertically / horizontally (re-applied on restore).
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+	maximized: (bool, bool),
+}
+
 /// Which per-window source this host has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -101,29 +135,161 @@ pub fn size(id: u64) -> Option<(u32, u32)> {
 	}
 }
 
+/// Window `id`'s current rectangle on the desktop (see [`WindowRect`]); `None` when it is
+/// gone / no backend. Cheap (no ScreenCaptureKit query): the host's input path polls it.
+pub fn rect(id: u64) -> Option<WindowRect> {
+	match backend() {
+		#[cfg(target_os = "linux")]
+		Backend::X11 => x11::placement(id).map(|(r, _)| r),
+		#[cfg(target_os = "macos")]
+		Backend::ScreenCaptureKit => mac::rect(id),
+		_ => {
+			let _ = id;
+			None
+		}
+	}
+}
+
+/// Linux X11: window `id` as the 0..1 region of the screen the absolute uinput pointer
+/// spans (the X server maps it over the whole root window, every monitor), for
+/// `DesktopInput::set_region`: the client's pointer on the window stream then lands in
+/// that window. `None` = gone / not X11.
+#[cfg(target_os = "linux")]
+pub fn pointer_region(id: u64) -> Option<crate::capture::PointerRegion> {
+	if backend() != Backend::X11 {
+		return None;
+	}
+	let (r, desk) = x11::placement(id)?;
+	let (x, y, w, h) = region_in_desktop(r, desk)?;
+	Some(crate::capture::PointerRegion { x, y, w, h })
+}
+
+/// Bring window `id` to the front and give it the keyboard focus, so a window stream's
+/// input goes to it (X11: EWMH `_NET_ACTIVE_WINDOW`; macOS: activate the owning app and
+/// raise the window through Accessibility when granted). Best effort; no-op elsewhere.
+pub fn raise(id: u64) {
+	match backend() {
+		#[cfg(target_os = "linux")]
+		Backend::X11 => x11::raise(id),
+		#[cfg(target_os = "macos")]
+		Backend::ScreenCaptureKit => mac::raise(id),
+		_ => {
+			let _ = id;
+		}
+	}
+}
+
+/// Resize window `id` to a split pane's `pane_w`×`pane_h` aspect, as large as fits the
+/// monitor's work area (never larger than the pane), and return where it was. `None` when
+/// nothing changed (gone, full-screen, no backend; macOS: no Accessibility grant). The
+/// counterpart of the Windows `display_mode::fit_window`. Blocks for up to ~0.5 s while
+/// it waits for the window manager to apply the new size.
+pub fn fit(id: u64, pane_w: u32, pane_h: u32) -> Option<FitPrev> {
+	if pane_w == 0 || pane_h == 0 {
+		return None;
+	}
+	match backend() {
+		#[cfg(target_os = "linux")]
+		Backend::X11 => x11::fit(id, pane_w, pane_h),
+		#[cfg(target_os = "macos")]
+		Backend::ScreenCaptureKit => mac::fit(id, pane_w, pane_h),
+		_ => {
+			let _ = id;
+			None
+		}
+	}
+}
+
+/// Put a window [`fit`] resized back where it was (no-op when it is gone).
+pub fn restore(prev: FitPrev) {
+	match backend() {
+		#[cfg(target_os = "linux")]
+		Backend::X11 => x11::restore(&prev),
+		#[cfg(target_os = "macos")]
+		Backend::ScreenCaptureKit => mac::restore(&prev),
+		_ => {
+			let _ = prev;
+		}
+	}
+}
+
+/// `r` as fractions of a `desk`-sized layout: the pixel centres of its first and last
+/// pixel, so 1.0 lands on the window's last pixel (the same rule as the Wayland monitor
+/// region). A window partly off screen keeps its true region — the injector clamps the
+/// final position into the layout. `None` for an empty layout / window.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn region_in_desktop(r: WindowRect, (dw, dh): (f64, f64)) -> Option<(f64, f64, f64, f64)> {
+	if dw < 1.0 || dh < 1.0 || r.w < 1.0 || r.h < 1.0 {
+		return None;
+	}
+	Some(((r.x + 0.5) / dw, (r.y + 0.5) / dh, (r.w - 1.0) / dw, (r.h - 1.0) / dh))
+}
+
+/// Largest `w × h` with the pane's aspect that fits `max_w × max_h` and is no larger than the
+/// pane (even, at least 64) — the same rule as the Windows window fit.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn fit_client(pane_w: u32, pane_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+	let scale = (max_w as f64 / pane_w.max(1) as f64).min(max_h as f64 / pane_h.max(1) as f64).min(1.0);
+	let w = ((pane_w as f64 * scale) as u32).max(64) & !1;
+	let h = ((pane_h as f64 * scale) as u32).max(64) & !1;
+	(w, h)
+}
+
+/// The start of a `len`-long span placed as close to `pos` as fits `[lo, lo + room)` (the
+/// window stays on its monitor's work area; a span larger than the room starts at `lo`).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn place(pos: f64, len: f64, lo: f64, room: f64) -> f64 {
+	pos.min(lo + room - len).max(lo)
+}
+
+/// The work area (of `areas`, e.g. monitors) that holds `r`'s centre, else the first one.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn area_of(r: &WindowRect, areas: &[WindowRect]) -> Option<WindowRect> {
+	areas.iter().find(|a| a.contains(r.centre())).or(areas.first()).copied()
+}
+
+/// How far apart two frames are (sum of the position and size differences): macOS matches
+/// an Accessibility window to a window-server window by frame (AX exposes no window id).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn frame_distance(a: WindowRect, b: WindowRect) -> f64 {
+	(a.x - b.x).abs() + (a.y - b.y).abs() + (a.w - b.w).abs() + (a.h - b.h).abs()
+}
+
+/// The overlap of two rectangles (`None` when they do not overlap).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn intersect(a: WindowRect, b: WindowRect) -> Option<WindowRect> {
+	let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+	let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+	(x1 > x0 && y1 > y0).then_some(WindowRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+}
+
 /// The in-process window sources (macOS [`WindowStream`]) of the host's sessions, keyed by
 /// session id: the host app starts one per stream and must stop it on every re-stream and
 /// teardown ([`stop_for`]). One per session at most.
 #[cfg(target_os = "macos")]
 static SESSIONS: std::sync::Mutex<Vec<(u64, WindowStream)>> = std::sync::Mutex::new(Vec::new());
 
-/// Start capturing window `id` for `session` (replacing that session's previous one) at
-/// exactly `width`×`height` and `fps`, and return the url its raw NV12 frames are served
-/// on — the `url` of [`WindowInput::RawNv12`](crate::pipeline::WindowInput::RawNv12).
-/// macOS only (ScreenCaptureKit); every other host has no in-process window source and
-/// gets an error (X11 grabs by id in ffmpeg/gst, Wayland goes through the portal).
-pub fn serve_for(session: u64, id: u64, width: u32, height: u32, fps: u32) -> anyhow::Result<String> {
+/// Start capturing window `id` for `session` (replacing that session's previous one), its
+/// own aspect fitted into the `max` box (never upscaled, even — `pipeline::fit_within`), at
+/// `fps`. Returns the url its raw NV12 frames are served on — the `url` of
+/// [`WindowInput::RawNv12`](crate::pipeline::WindowInput::RawNv12) — and the frame size,
+/// both from ONE ScreenCaptureKit query. Blocks for up to ~10 s (the shareable-content
+/// query and the start each wait up to 5 s, e.g. behind the Screen Recording prompt): call
+/// it off the async runtime. macOS only (ScreenCaptureKit); every other host has no
+/// in-process window source and gets an error (X11 grabs by id in ffmpeg/gst, Wayland goes
+/// through the portal).
+pub fn serve_for(session: u64, id: u64, max: (u32, u32), fps: u32) -> anyhow::Result<(String, (u32, u32))> {
 	#[cfg(target_os = "macos")]
 	{
 		stop_for(session);
-		let stream = WindowStream::start(id, width, height, fps)?;
-		let url = stream.url().to_string();
+		let stream = WindowStream::start(id, max, fps)?;
+		let out = (stream.url().to_string(), stream.size());
 		SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).push((session, stream));
-		Ok(url)
+		Ok(out)
 	}
 	#[cfg(not(target_os = "macos"))]
 	{
-		let _ = (session, id, width, height, fps);
+		let _ = (session, id, max, fps);
 		anyhow::bail!("this host has no in-process window source")
 	}
 }
@@ -270,6 +436,71 @@ fn copy_plane(dst: &mut [u8], width: usize, rows: usize, src: &[u8], src_stride:
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn r(x: f64, y: f64, w: f64, h: f64) -> WindowRect {
+		WindowRect { x, y, w, h }
+	}
+
+	#[test]
+	fn window_region_in_the_desktop() {
+		// A 1001×501 window at (1000, 500) on a 3000×1500 two-monitor root.
+		let (x, y, w, h) = region_in_desktop(r(1000.0, 500.0, 1001.0, 501.0), (3000.0, 1500.0)).unwrap();
+		assert!((x - 1000.5 / 3000.0).abs() < 1e-12);
+		assert!((y - 500.5 / 1500.0).abs() < 1e-12);
+		assert!((w - 1000.0 / 3000.0).abs() < 1e-12);
+		assert!((h - 500.0 / 1500.0).abs() < 1e-12);
+		// 1.0 of the stream lands on the window's last pixel centre.
+		assert!(((x + w) * 3000.0 - 2000.5).abs() < 1e-9);
+		// Partly off screen: the true region (the injector clamps later).
+		let (x, ..) = region_in_desktop(r(-100.0, 0.0, 200.0, 200.0), (1000.0, 1000.0)).unwrap();
+		assert!(x < 0.0);
+		assert_eq!(region_in_desktop(r(0.0, 0.0, 0.0, 10.0), (1000.0, 1000.0)), None);
+		assert_eq!(region_in_desktop(r(0.0, 0.0, 10.0, 10.0), (0.0, 1000.0)), None);
+	}
+
+	#[test]
+	fn fit_keeps_the_pane_aspect_inside_the_work_area() {
+		// A wide top/bottom pane on a 1920×1040 work area: width-bound, aspect kept.
+		let (w, h) = fit_client(2560, 700, 1904, 1009);
+		assert_eq!(w, 1904);
+		assert!((h as i32 - 520).abs() <= 2, "{h}");
+		// Never larger than the pane itself.
+		assert_eq!(fit_client(800, 600, 1904, 1009), (800, 600));
+		// Even sizes, at least 64.
+		assert_eq!(fit_client(10, 10, 1000, 1000), (64, 64));
+	}
+
+	#[test]
+	fn placement_stays_in_the_work_area() {
+		assert_eq!(place(100.0, 500.0, 0.0, 1920.0), 100.0);
+		// Would overflow the right edge: pulled back in.
+		assert_eq!(place(1800.0, 500.0, 0.0, 1920.0), 1420.0);
+		// Left of the area (the next monitor's work area starts at 1920).
+		assert_eq!(place(1000.0, 500.0, 1920.0, 1920.0), 1920.0);
+		// Larger than the room: starts at the area's edge.
+		assert_eq!(place(300.0, 3000.0, 0.0, 1920.0), 0.0);
+	}
+
+	#[test]
+	fn work_area_is_the_one_under_the_window() {
+		let mons = [r(0.0, 0.0, 1920.0, 1080.0), r(1920.0, 0.0, 2560.0, 1440.0)];
+		assert_eq!(area_of(&r(2000.0, 100.0, 800.0, 600.0), &mons), Some(mons[1]));
+		assert_eq!(area_of(&r(100.0, 100.0, 800.0, 600.0), &mons), Some(mons[0]));
+		// Centre off every monitor: the first.
+		assert_eq!(area_of(&r(-5000.0, 0.0, 10.0, 10.0), &mons), Some(mons[0]));
+		assert_eq!(area_of(&r(0.0, 0.0, 10.0, 10.0), &[]), None);
+		// The EWMH work area (all monitors minus panels) clipped to one monitor.
+		let work = r(0.0, 32.0, 4480.0, 1408.0);
+		assert_eq!(intersect(work, mons[0]), Some(r(0.0, 32.0, 1920.0, 1048.0)));
+		assert_eq!(intersect(r(0.0, 0.0, 10.0, 10.0), r(20.0, 0.0, 10.0, 10.0)), None);
+	}
+
+	#[test]
+	fn frame_distance_sums_every_edge() {
+		let a = r(10.0, 20.0, 800.0, 600.0);
+		assert_eq!(frame_distance(a, a), 0.0);
+		assert_eq!(frame_distance(a, r(11.0, 18.0, 800.0, 603.0)), 6.0);
+	}
 
 	#[test]
 	fn copy_plane_strips_stride_and_never_overreads() {

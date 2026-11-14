@@ -45,7 +45,7 @@ use objc2_screen_capture_kit::{
 	SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
-use super::HostWindow;
+use super::{FitPrev, HostWindow, WindowRect};
 
 /// How long a ScreenCaptureKit completion handler may take before we give up.
 const SCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -163,6 +163,261 @@ pub(super) fn size(id: u64) -> Option<(u32, u32)> {
 	list().into_iter().find(|w| w.id == id).map(|w| (w.width, w.height))
 }
 
+/// Window `id`'s bounds (global display points, top-left origin) and its owner's pid,
+/// straight from the window server: no ScreenCaptureKit round trip, and these keys need
+/// no Screen Recording grant. Cheap enough for the input path to poll.
+fn window_info(id: u64) -> Option<(WindowRect, i32)> {
+	use core_foundation::base::{CFType, TCFType};
+	use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+	use core_foundation::number::CFNumber;
+	use core_graphics::geometry::CGRect;
+	use core_graphics::window::{
+		copy_window_info, kCGWindowBounds, kCGWindowListOptionIncludingWindow, kCGWindowNumber, kCGWindowOwnerPID,
+	};
+	use std::ffi::c_void;
+	let wid = u32::try_from(id).ok()?;
+	let list = copy_window_info(kCGWindowListOptionIncludingWindow, wid)?;
+	let number = |dict: &CFDictionary, key: *const c_void| -> Option<i64> {
+		let v = dict.find(key)?;
+		// SAFETY: a CFDictionary value is a CF object; retained by the wrapper.
+		unsafe { CFType::wrap_under_get_rule(*v) }.downcast::<CFNumber>()?.to_i64()
+	};
+	for item in list.iter() {
+		// SAFETY: CGWindowListCopyWindowInfo returns an array of CFDictionaries.
+		let dict: CFDictionary = unsafe { CFDictionary::wrap_under_get_rule(*item as CFDictionaryRef) };
+		if number(&dict, unsafe { kCGWindowNumber } as *const c_void) != Some(id as i64) {
+			continue;
+		}
+		let bounds = dict.find(unsafe { kCGWindowBounds } as *const c_void)?;
+		let bounds: CFDictionary = unsafe { CFDictionary::wrap_under_get_rule(*bounds as CFDictionaryRef) };
+		let r = CGRect::from_dict_representation(&bounds)?;
+		let pid = number(&dict, unsafe { kCGWindowOwnerPID } as *const c_void).unwrap_or(0) as i32;
+		return Some((WindowRect { x: r.origin.x, y: r.origin.y, w: r.size.width, h: r.size.height }, pid));
+	}
+	None
+}
+
+pub(super) fn rect(id: u64) -> Option<WindowRect> {
+	window_info(id).map(|(r, _)| r)
+}
+
+/// Height kept free at the top of every display for the menu bar when a window is fitted
+/// (macOS shows one per display by default; 37 pt on a notched panel). CoreGraphics has no
+/// public "visible frame", and NSScreen is main-thread-only.
+const MENU_BAR_PT: f64 = 38.0;
+
+/// Each active display's area a fitted window may use (global points).
+fn display_areas() -> Vec<WindowRect> {
+	let ids = core_graphics::display::CGDisplay::active_displays().unwrap_or_default();
+	ids.into_iter()
+		.map(|id| {
+			let b = core_graphics::display::CGDisplay::new(id).bounds();
+			let inset = MENU_BAR_PT.min(b.size.height / 4.0);
+			WindowRect { x: b.origin.x, y: b.origin.y + inset, w: b.size.width, h: b.size.height - inset }
+		})
+		.collect()
+}
+
+/// Activate the app owning `pid` (all its windows come forward), like a click on its Dock
+/// icon. NSRunningApplication is looked up at runtime: AppKit is loaded in the desktop app
+/// (Tauri) but not necessarily in a bare pulsar-core binary, which then just skips this.
+fn activate_app(pid: i32) {
+	use objc2::runtime::AnyObject;
+	let Some(cls) = AnyClass::get(c"NSRunningApplication") else { return };
+	objc2::rc::autoreleasepool(|_| {
+		let app: *mut AnyObject = unsafe { msg_send![cls, runningApplicationWithProcessIdentifier: pid] };
+		if let Some(app) = unsafe { app.as_ref() } {
+			// NSApplicationActivateIgnoringOtherApps (1 << 1): come forward even though the
+			// user is "in" another app.
+			let _: bool = unsafe { msg_send![app, activateWithOptions: 2usize] };
+		}
+	});
+}
+
+pub(super) fn raise(id: u64) {
+	let Some((r, pid)) = window_info(id) else { return };
+	if pid > 0 {
+		activate_app(pid);
+	}
+	// The app's OTHER windows may still cover this one: raise it and make it the app's
+	// main (key) window through Accessibility (only with the grant; prompts nothing).
+	if ax::trusted() {
+		if let Some(w) = ax::window_for(pid, r) {
+			ax::raise(&w);
+		}
+	}
+}
+
+/// Wait (up to ~0.5 s) for the app to apply a new size to window `id`.
+fn wait_for_size(id: u64, from: WindowRect) {
+	let until = Instant::now() + Duration::from_millis(500);
+	while Instant::now() < until {
+		match rect(id) {
+			Some(r) if (r.w, r.h) != (from.w, from.h) => return,
+			None => return,
+			_ => std::thread::sleep(Duration::from_millis(25)),
+		}
+	}
+}
+
+pub(super) fn fit(id: u64, pane_w: u32, pane_h: u32) -> Option<FitPrev> {
+	if !ax::trusted() {
+		tracing::info!(id, "window-fit: no Accessibility permission, the window keeps its size");
+		return None;
+	}
+	let (before, pid) = window_info(id)?;
+	let win = ax::window_for(pid, before)?;
+	if ax::flag(&win, "AXFullScreen") {
+		tracing::info!(id, "window-fit: the window is full-screen, left as it is");
+		return None;
+	}
+	let work = super::area_of(&before, &display_areas())?;
+	// The whole window (title bar included) is what ScreenCaptureKit streams, so the whole
+	// window takes the pane's shape. Points, not pixels: the stream is scaled into the
+	// client's box anyway.
+	let (w, h) = super::fit_client(pane_w, pane_h, work.w.max(1.0) as u32, work.h.max(1.0) as u32);
+	let (w, h) = (w as f64, h as f64);
+	let x = super::place(before.x, w, work.x, work.w);
+	let y = super::place(before.y, h, work.y, work.h);
+	if !ax::set_frame(&win, WindowRect { x, y, w, h }) {
+		tracing::warn!(id, "window-fit: the app refused the new window frame");
+		return None;
+	}
+	wait_for_size(id, before);
+	tracing::info!(id, pane = %format!("{pane_w}x{pane_h}"), size = %format!("{w}x{h}"), "window-fit: resized the macOS window to the split pane's shape");
+	Some(FitPrev { id, rect: before, maximized: (false, false) })
+}
+
+pub(super) fn restore(prev: &FitPrev) {
+	let Some((now, pid)) = window_info(prev.id) else {
+		return; // closed meanwhile — nothing to restore
+	};
+	if let Some(w) = ax::window_for(pid, now) {
+		ax::set_frame(&w, prev.rect);
+		wait_for_size(prev.id, now);
+		tracing::info!(id = prev.id, "window-fit: restored the macOS window");
+	}
+}
+
+/// The Accessibility (AX) API: the only public way to move / resize / raise ANOTHER app's
+/// window on macOS. Needs the Accessibility grant (System Settings → Privacy & Security →
+/// Accessibility), the same one remote input already needs for `CGEventPost`.
+mod ax {
+	use std::ffi::c_void;
+
+	use core_foundation::base::{CFType, CFTypeRef, TCFType};
+	use core_foundation::boolean::CFBoolean;
+	use core_foundation::string::{CFString, CFStringRef};
+	use core_graphics::geometry::{CGPoint, CGSize};
+
+	use super::super::WindowRect;
+
+	type AXError = i32;
+	const AX_OK: AXError = 0;
+	const AX_VALUE_CGPOINT: u32 = 1;
+	const AX_VALUE_CGSIZE: u32 = 2;
+
+	#[link(name = "ApplicationServices", kind = "framework")]
+	extern "C" {
+		fn AXIsProcessTrusted() -> u8;
+		fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+		fn AXUIElementCopyAttributeValue(element: CFTypeRef, attribute: CFStringRef, value: *mut CFTypeRef) -> AXError;
+		fn AXUIElementSetAttributeValue(element: CFTypeRef, attribute: CFStringRef, value: CFTypeRef) -> AXError;
+		fn AXUIElementPerformAction(element: CFTypeRef, action: CFStringRef) -> AXError;
+		fn AXValueCreate(ty: u32, value: *const c_void) -> CFTypeRef;
+		fn AXValueGetValue(value: CFTypeRef, ty: u32, out: *mut c_void) -> u8;
+	}
+
+	/// This process holds the Accessibility grant (never prompts).
+	pub(super) fn trusted() -> bool {
+		unsafe { AXIsProcessTrusted() != 0 }
+	}
+
+	fn attr(element: &CFType, name: &'static str) -> Option<CFType> {
+		let key = CFString::from_static_string(name);
+		let mut out: CFTypeRef = std::ptr::null();
+		let err = unsafe { AXUIElementCopyAttributeValue(element.as_CFTypeRef(), key.as_concrete_TypeRef(), &mut out) };
+		// SAFETY: a "Copy" function: the value comes +1.
+		(err == AX_OK && !out.is_null()).then(|| unsafe { CFType::wrap_under_create_rule(out) })
+	}
+
+	/// A boolean attribute (`false` when unset / not a boolean).
+	pub(super) fn flag(element: &CFType, name: &'static str) -> bool {
+		attr(element, name).and_then(|v| v.downcast::<CFBoolean>()).is_some_and(bool::from)
+	}
+
+	fn point(element: &CFType, name: &'static str) -> Option<(f64, f64)> {
+		let v = attr(element, name)?;
+		let mut p = CGPoint::new(0.0, 0.0);
+		(unsafe { AXValueGetValue(v.as_CFTypeRef(), AX_VALUE_CGPOINT, (&mut p as *mut CGPoint).cast()) } != 0)
+			.then_some((p.x, p.y))
+	}
+
+	fn size(element: &CFType, name: &'static str) -> Option<(f64, f64)> {
+		let v = attr(element, name)?;
+		let mut s = CGSize::new(0.0, 0.0);
+		(unsafe { AXValueGetValue(v.as_CFTypeRef(), AX_VALUE_CGSIZE, (&mut s as *mut CGSize).cast()) } != 0)
+			.then_some((s.width, s.height))
+	}
+
+	fn set(element: &CFType, name: &'static str, ty: u32, value: *const c_void) -> bool {
+		let v = unsafe { AXValueCreate(ty, value) };
+		if v.is_null() {
+			return false;
+		}
+		// SAFETY: AXValueCreate returns +1.
+		let v = unsafe { CFType::wrap_under_create_rule(v) };
+		let key = CFString::from_static_string(name);
+		unsafe { AXUIElementSetAttributeValue(element.as_CFTypeRef(), key.as_concrete_TypeRef(), v.as_CFTypeRef()) == AX_OK }
+	}
+
+	/// Move + resize: position, size, then position again (an app that clamps the window to
+	/// its screen during the resize would otherwise end up off the wanted origin).
+	pub(super) fn set_frame(element: &CFType, r: WindowRect) -> bool {
+		let p = CGPoint::new(r.x, r.y);
+		let s = CGSize::new(r.w, r.h);
+		let pos = |e: &CFType| set(e, "AXPosition", AX_VALUE_CGPOINT, (&p as *const CGPoint).cast());
+		let moved = pos(element);
+		let sized = set(element, "AXSize", AX_VALUE_CGSIZE, (&s as *const CGSize).cast());
+		pos(element);
+		moved || sized
+	}
+
+	pub(super) fn raise(element: &CFType) {
+		let action = CFString::from_static_string("AXRaise");
+		unsafe { AXUIElementPerformAction(element.as_CFTypeRef(), action.as_concrete_TypeRef()) };
+		let yes = CFBoolean::true_value();
+		let key = CFString::from_static_string("AXMain");
+		unsafe { AXUIElementSetAttributeValue(element.as_CFTypeRef(), key.as_concrete_TypeRef(), yes.as_CFTypeRef()) };
+	}
+
+	/// The AX window of app `pid` whose frame matches the window server's `r` (AX has no
+	/// public CGWindowID: match on position + size, the closest within a few points).
+	pub(super) fn window_for(pid: i32, r: WindowRect) -> Option<CFType> {
+		if pid <= 0 {
+			return None;
+		}
+		let app = unsafe { AXUIElementCreateApplication(pid) };
+		if app.is_null() {
+			return None;
+		}
+		// SAFETY: a "Create" function: +1.
+		let app = unsafe { CFType::wrap_under_create_rule(app) };
+		let windows = attr(&app, "AXWindows")?.downcast::<core_foundation::array::CFArray>()?;
+		let mut best: Option<(f64, CFType)> = None;
+		for item in windows.iter() {
+			// SAFETY: AXWindows is an array of AXUIElements.
+			let w = unsafe { CFType::wrap_under_get_rule(*item) };
+			let (Some((x, y)), Some((ww, hh))) = (point(&w, "AXPosition"), size(&w, "AXSize")) else { continue };
+			let d = super::super::frame_distance(r, WindowRect { x, y, w: ww, h: hh });
+			if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+				best = Some((d, w));
+			}
+		}
+		best.filter(|(d, _)| *d <= 8.0).map(|(_, w)| w)
+	}
+}
+
 /// `(pid, parent pid)` of every process (`proc_listallpids` + `PROC_PIDTBSDINFO`).
 pub(super) fn process_edges() -> Vec<(u32, u32)> {
 	let mut pids: Vec<libc::pid_t> = vec![0; 4096];
@@ -276,6 +531,8 @@ impl Output {
 /// One window being captured and served as raw NV12 on a loopback socket.
 pub struct WindowStream {
 	url: String,
+	/// The frame size (pixels, even) the stream is configured for.
+	size: (u32, u32),
 	shared: Arc<Shared>,
 	stream: SendBox<Retained<SCStream>>,
 	_output: SendBox<Retained<Output>>,
@@ -284,12 +541,11 @@ pub struct WindowStream {
 }
 
 impl WindowStream {
-	/// Start capturing window `id` (a `CGWindowID`) at exactly `width`×`height` (even;
-	/// the window is scaled into it keeping its aspect) and serve it at `fps`. The url
-	/// ([`Self::url`]) serves one reader (ffmpeg) at a time; each must connect within 20 s
-	/// of the previous one leaving.
-	pub fn start(id: u64, width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
-		let (w, h) = ((width.max(2) & !1) as usize, (height.max(2) & !1) as usize);
+	/// Start capturing window `id` (a `CGWindowID`), its pixel size fitted into the `max`
+	/// box keeping its aspect (never upscaled, even — [`Self::size`]), and serve it at
+	/// `fps`. The url ([`Self::url`]) serves one reader (ffmpeg) at a time; each must
+	/// connect within 20 s of the previous one leaving. Blocking (see `serve_for`).
+	pub fn start(id: u64, max: (u32, u32), fps: u32) -> anyhow::Result<Self> {
 		let fps = fps.clamp(1, 240);
 		objc2::rc::autoreleasepool(|_| {
 			let content = shareable()?;
@@ -297,6 +553,12 @@ impl WindowStream {
 			let Some(window) = windows.iter().find(|x| unsafe { x.windowID() } as u64 == id) else {
 				anyhow::bail!("window {id} is not on screen any more");
 			};
+			// The window's own pixel size from THIS query (no second listing for it).
+			let f = unsafe { window.frame() };
+			let scale = backing_scale(&content, f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
+			let px = ((f.size.width * scale).round().max(2.0) as u32, (f.size.height * scale).round().max(2.0) as u32);
+			let (fw, fh) = crate::pipeline::fit_within(px, max);
+			let (w, h) = ((fw.max(2) & !1) as usize, (fh.max(2) & !1) as usize);
 			let filter =
 				unsafe { SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window) };
 			let config = unsafe { SCStreamConfiguration::new() };
@@ -368,6 +630,7 @@ impl WindowStream {
 			tracing::info!(id, w, h, fps, %url, "ScreenCaptureKit window capture started");
 			Ok(WindowStream {
 				url,
+				size: (w as u32, h as u32),
 				shared,
 				stream: SendBox(stream),
 				_output: SendBox(output),
@@ -380,6 +643,11 @@ impl WindowStream {
 	/// The loopback url ffmpeg reads the frames from (`tcp://127.0.0.1:PORT`).
 	pub fn url(&self) -> &str {
 		&self.url
+	}
+
+	/// The frame size every served frame has (`width`, `height`).
+	pub fn size(&self) -> (u32, u32) {
+		self.size
 	}
 
 	/// The window stream still runs (not stopped by macOS, and a reader came in time).

@@ -184,6 +184,9 @@ pub struct DesktopInput {
 	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
 	/// (the menu-bar corner); we fall back to this last-known position instead.
 	last_point: CGPoint,
+	/// Per-window capture: the streamed window's frame (global points); absolute moves map
+	/// onto it instead of the main display (see [`Self::set_window_rect`]).
+	window: Option<crate::window_capture::WindowRect>,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -217,6 +220,7 @@ impl DesktopInput {
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
 			last_point: CGPoint::new(0.0, 0.0),
+			window: None,
 		})
 	}
 
@@ -280,12 +284,26 @@ impl DesktopInput {
 	/// TODO(multi-monitor): this maps onto the MAIN display only. A capture of a
 	/// non-primary display would land the pointer on the wrong screen — a full fix
 	/// needs the captured display's bounds/origin threaded through here.
+	///
+	/// A window stream ([`Self::set_window_rect`]) maps onto that window's frame instead.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let bounds = CGDisplay::main().bounds();
-		let px = bounds.origin.x + x.clamp(0.0, 1.0) * bounds.size.width;
-		let py = bounds.origin.y + y.clamp(0.0, 1.0) * bounds.size.height;
+		let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+		let (px, py) = match self.window {
+			Some(r) => window_point(r, x, y),
+			None => {
+				let bounds = CGDisplay::main().bounds();
+				(bounds.origin.x + x * bounds.size.width, bounds.origin.y + y * bounds.size.height)
+			}
+		};
 		let ty = self.move_event_type();
 		self.post_mouse(ty, CGPoint::new(px, py));
+	}
+
+	/// Map absolute moves onto a streamed WINDOW's frame (global display points, as
+	/// `window_capture::rect` reports it; the stream shows exactly that frame), or back onto
+	/// the main display with `None`. The host refreshes it while the window moves.
+	pub fn set_window_rect(&mut self, r: Option<crate::window_capture::WindowRect>) {
+		self.window = r.filter(|r| r.w >= 1.0 && r.h >= 1.0);
 	}
 
 	/// Move the pointer by a raw relative delta (native renderer / games). Added
@@ -501,5 +519,26 @@ mod tests {
 			Some(CGEventFlags::CGEventFlagCommand)
 		);
 		assert_eq!(evdev_modifier_flag(30), None); // 'A' is not a modifier
+	}
+}
+
+/// A normalized (0..1) stream position on window `r`: the centres of its first and last
+/// point, so 1.0 stays inside the window (a click on its right/bottom edge must not land on
+/// whatever is next to it).
+fn window_point(r: crate::window_capture::WindowRect, x: f64, y: f64) -> (f64, f64) {
+	(r.x + 0.5 + x * (r.w - 1.0).max(0.0), r.y + 0.5 + y * (r.h - 1.0).max(0.0))
+}
+
+#[cfg(test)]
+mod window_point_tests {
+	use super::window_point;
+	use crate::window_capture::WindowRect;
+
+	#[test]
+	fn maps_into_the_window_frame() {
+		let r = WindowRect { x: 100.0, y: 50.0, w: 801.0, h: 601.0 };
+		assert_eq!(window_point(r, 0.0, 0.0), (100.5, 50.5));
+		assert_eq!(window_point(r, 1.0, 1.0), (900.5, 650.5));
+		assert_eq!(window_point(r, 0.5, 0.5), (500.5, 350.5));
 	}
 }
