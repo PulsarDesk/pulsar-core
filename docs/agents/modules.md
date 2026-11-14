@@ -73,6 +73,18 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   system gst). `self_check(fragment)` = headless in-process encode test (desktop `--selftest`).
   gst VA-API = two families, one wire id `vaapi`: `Vaapi` (gstreamer-vaapi, `vaapih264enc`)
   and `Va` (gst-plugins-bad `va`, `vah264enc`, what gst ≥1.26 distros ship).
+  `start_with(.., Source::Window { max })` = a WINDOW cast (portal offers windows only, the
+  host person picks; frames scaled into `max` via `gst::wayland_pipeline_sized`).
+- `window_capture/` — host **per-window** capture off Windows (Windows = WGC in the desktop's
+  `pulsar-capture`). `backend()` (X11 / Portal / ScreenCaptureKit / None), `list()`, `size()`,
+  `find_for_launch(pid)` (largest window of the pid tree). X11 (`x11.rs`, pure-Rust `x11rb`,
+  `_NET_CLIENT_LIST`): id = X window id, grabbed by `pipeline::WindowInput::X11`
+  (`x11grab -window_id`) or `gst::x11_window_pipeline`. macOS (`mac.rs`, ScreenCaptureKit
+  12.3+): id = `CGWindowID`; `serve_for(session, id, w, h, fps)` starts a desktop-independent
+  window stream and serves raw NV12 on loopback TCP for `WindowInput::RawNv12`
+  (`-f rawvideo`), `stop_for(session)` stops it. Wayland lists nothing (`WindowInfo::PORTAL_PICK`).
+  Wire meaning of the id per OS: `service/wire.rs` `WindowInfo`. **Untested on Linux / macOS
+  hardware** (2026-11-14, branch `parity/window-capture`).
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks.
