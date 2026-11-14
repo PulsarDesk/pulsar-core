@@ -80,6 +80,18 @@ pub struct MacDisplay {
 	pub refresh_hz: u32,
 }
 
+/// CoreGraphics' active display list, in its own order (the order ffmpeg's avfoundation input
+/// numbers its "Capture screen N" devices in).
+pub fn active_display_ids() -> Vec<u32> {
+	let mut ids = [0u32; 32];
+	let mut count = 0u32;
+	// SAFETY: plain CoreGraphics query into a local array.
+	if unsafe { ffi::CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) } != 0 {
+		return Vec::new();
+	}
+	ids[..(count as usize).min(ids.len())].to_vec()
+}
+
 /// The active displays, main display first, then CoreGraphics order. This order is the
 /// display index the host advertises and the native capture takes.
 pub fn displays() -> Vec<MacDisplay> {

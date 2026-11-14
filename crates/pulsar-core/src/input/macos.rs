@@ -269,7 +269,9 @@ impl DesktopInput {
 		}
 	}
 
-	/// Move the pointer to a normalized (0..1) position on the main display.
+	/// Move the pointer to a normalized (0..1) position on the streamed display
+	/// ([`crate::macos_capture::streamed_display`]; the main display when none is published
+	/// or it is gone).
 	///
 	/// CGEvent global coordinates live in the **points** space (the desktop's logical
 	/// coordinate system), NOT backing pixels. Using `pixels_wide()/pixels_high()`
@@ -277,13 +279,26 @@ impl DesktopInput {
 	/// backing on a 1440pt display). `CGDisplay::bounds()` is in points, so map the
 	/// normalized position onto its `size` for a correct Retina mapping.
 	///
-	/// TODO(multi-monitor): this maps onto the MAIN display only. A capture of a
-	/// non-primary display would land the pointer on the wrong screen — a full fix
-	/// needs the captured display's bounds/origin threaded through here.
+	///
+	/// Multi-monitor: the capture (native ScreenCaptureKit path or the ffmpeg avfoundation
+	/// fallback) publishes the display it streams; its bounds carry the origin in the global
+	/// space, so a non-main display maps right too. Untested on macOS hardware.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let bounds = CGDisplay::main().bounds();
-		let px = bounds.origin.x + x.clamp(0.0, 1.0) * bounds.size.width;
-		let py = bounds.origin.y + y.clamp(0.0, 1.0) * bounds.size.height;
+		let streamed = crate::macos_capture::streamed_display();
+		let bounds = Some(streamed)
+			.filter(|&id| id != 0)
+			.map(|id| CGDisplay::new(id).bounds())
+			// An unplugged display reports an empty rect: fall back to the main one.
+			.filter(|b| b.size.width > 0.0 && b.size.height > 0.0)
+			.unwrap_or_else(|| CGDisplay::main().bounds());
+		let (px, py) = crate::macos_capture::map_to_display(
+			x,
+			y,
+			bounds.origin.x,
+			bounds.origin.y,
+			bounds.size.width,
+			bounds.size.height,
+		);
 		let ty = self.move_event_type();
 		self.post_mouse(ty, CGPoint::new(px, py));
 	}
