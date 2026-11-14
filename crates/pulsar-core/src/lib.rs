@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod displays;
 pub mod input;
+pub mod macos_capture;
 pub mod media;
 pub mod netwatch;
 pub mod pipeline;

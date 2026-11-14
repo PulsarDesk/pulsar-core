@@ -280,14 +280,15 @@ impl DesktopInput {
 	}
 
 	/// Aim absolute pointer moves at the streamed monitor (`CGDirectDisplayID`, from
-	/// [`crate::displays::Monitor::id`]); `None` = the main display. A display that went away
-	/// falls back to the main display at the next move.
+	/// [`crate::displays::Monitor::id`]); `None` = the display the capture published
+	/// ([`crate::macos_capture::streamed_display`]), else the main display. A display that
+	/// went away falls back the same way at the next move.
 	pub fn set_display(&mut self, display: Option<u32>) {
 		self.display = display;
 	}
 
-	/// Move the pointer to a normalized (0..1) position on the streamed display (the main
-	/// display unless [`Self::set_display`] picked another).
+	/// Move the pointer to a normalized (0..1) position on the streamed display (the one
+	/// [`Self::set_display`] picked, else the one the capture published, else the main one).
 	///
 	/// CGEvent global coordinates live in the **points** space (the desktop's logical
 	/// coordinate system), NOT backing pixels. Using `pixels_wide()/pixels_high()`
@@ -297,18 +298,30 @@ impl DesktopInput {
 	/// origin + `size` ([`Self::set_display`]; the main display when none is set).
 	///
 	/// A window stream ([`Self::set_window_rect`]) maps onto that window's frame instead.
+	///
+	/// Multi-monitor: the capture (native ScreenCaptureKit path or the ffmpeg avfoundation
+	/// fallback) publishes the display it streams; its bounds carry the origin in the global
+	/// space, so a non-main display maps right too. Untested on macOS hardware.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
 		let (px, py) = match self.window {
-			Some(r) => window_point(r, x, y),
+			Some(r) => window_point(r, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)),
 			None => {
-				let display = self
+				let bounds = self
 					.display
-					.map(CGDisplay::new)
-					.filter(|d| d.is_active())
-					.unwrap_or_else(CGDisplay::main);
-				let bounds = display.bounds();
-				(bounds.origin.x + x * bounds.size.width, bounds.origin.y + y * bounds.size.height)
+					.filter(|&id| id != 0)
+					.or_else(|| Some(crate::macos_capture::streamed_display()).filter(|&id| id != 0))
+					.map(|id| CGDisplay::new(id).bounds())
+					// An unplugged display reports an empty rect: fall back to the main one.
+					.filter(|b| b.size.width > 0.0 && b.size.height > 0.0)
+					.unwrap_or_else(|| CGDisplay::main().bounds());
+				crate::macos_capture::map_to_display(
+					x,
+					y,
+					bounds.origin.x,
+					bounds.origin.y,
+					bounds.size.width,
+					bounds.size.height,
+				)
 			}
 		};
 		let ty = self.move_event_type();

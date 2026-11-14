@@ -102,9 +102,24 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   it (desktop `src-tauri/build.rs`).
   Wire meaning of the id per OS: `service/wire.rs` `WindowInfo`. **Untested on Linux / macOS
   hardware** (2026-11-14, branch `parity/window-capture`).
+- `macos_capture/` — **macOS ScreenCaptureKit capture** (2026-11-14, untested on macOS
+  hardware): `sck::ScStream` (one display: NV12 frames with the cursor at the client's fps,
+  and/or the system audio without this process — macOS 13+), `displays()` (main first = the
+  host's display index), `screen_capture_access(prompt)` (TCC Screen Recording). ScreenCaptureKit
+  is **dlopen'ed, never linked** (objc2 runtime only, no objc2-* framework crates — they link
+  strongly and the app would not start on macOS < 12.3); newer constants via `dlsym`.
+  `pcm.rs` (planar → interleaved stereo) is pure and tested everywhere. The encoder that eats
+  the frames is in the desktop app (`pulsar-capture/src/mac/vt.rs`, VideoToolbox). Frames are
+  stretched to the output size (`preservesAspectRatio = NO`), never letterboxed.
+  `set_streamed_display` / `streamed_display` publish the display being streamed (process-wide)
+  so `input/macos.rs` maps the absolute pointer onto it instead of always the main display;
+  `avfoundation_screen_number` gives the ffmpeg fallback's `"Capture screen N"`.
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
-  force-mutes the captured endpoint), endpoint redirect sinks.
+  force-mutes the captured endpoint), endpoint redirect sinks. macOS: `sck_loopback.rs`
+  (`run_system_audio_capture`, the system mix via ScreenCaptureKit — the counterpart of the
+  Windows process loopback in `Exclude` mode); `Config::audio_loopback()` = "system mix" on
+  Windows and macOS when no device is named.
 - `displays.rs` (+ `displays/{macos,linux}.rs`) — the host's monitors for the platforms the app
   can't enumerate itself: macOS (`CGGetActiveDisplayList` order = avfoundation `Capture screen N`,
   `NSScreen.localizedName` names, `CGDirectDisplayID` as `Monitor::id`) and Linux Wayland

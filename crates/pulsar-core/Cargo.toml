@@ -142,11 +142,15 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 # window_capture.rs: proc_listchildpids (a launched game's child processes).
+# macos_capture: dlopen/dlsym of ScreenCaptureKit (macOS 12.3+, never linked) + sysctl.
 libc = "0.2"
 # displays/macos.rs: NSScreen.localizedName for monitor names (main-thread AppKit, reached via
 # the main dispatch queue).
 # Per-window host capture (window_capture/mac.rs): ScreenCaptureKit lists the windows and
-# streams one (SCContentFilter desktopIndependentWindow) as NV12 CVPixelBuffers.
+# streams one (SCContentFilter desktopIndependentWindow) as NV12 CVPixelBuffers. It links
+# ScreenCaptureKit strongly; the app binary weak-links it (desktop src-tauri/build.rs).
+# macos_capture/sck.rs (display capture + system audio) only uses the objc2 runtime and
+# dlopen's ScreenCaptureKit itself.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSValue"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen", "NSGraphics"] }

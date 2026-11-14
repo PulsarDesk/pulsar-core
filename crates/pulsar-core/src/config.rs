@@ -272,7 +272,10 @@ impl Config {
 	/// override resolves to the platform default.
 	pub fn audio_input(&self) -> crate::audio::AudioInput {
 		let dev = self.audio_input.trim();
-		if dev.is_empty() {
+		// A system-mix sentinel is no device name: when the native system-mix capture cannot
+		// start, the ffmpeg fallback takes the OS default instead of `Dshow("system")` (no
+		// such device) or `AvFoundation(0)` (usually the microphone).
+		if is_system_mix_choice(dev) {
 			crate::audio::AudioInput::default_for_os()
 		} else if cfg!(windows) {
 			crate::audio::AudioInput::Dshow(dev.to_string())
@@ -283,17 +286,18 @@ impl Config {
 		}
 	}
 
-	/// Windows only: capture system audio via **WASAPI loopback** (the default render
-	/// endpoint) rather than an ffmpeg dshow device. True when no explicit device is set
-	/// or it's the `loopback`/`wasapi` sentinel — so audio streams out of the box without
-	/// a `virtual-audio-capturer` / Stereo Mix device installed. A named device opts back
-	/// into the dshow path ([`Self::audio_input`]).
+	/// Capture the host's **system mix** instead of a named capture device: WASAPI loopback /
+	/// process loopback on Windows, ScreenCaptureKit (all apps but Pulsar, macOS 13+) on macOS.
+	/// True when no explicit device is set or it is one of the sentinels (`loopback`, `wasapi`,
+	/// `system`) — so audio streams out of the box without a `virtual-audio-capturer` / Stereo
+	/// Mix / BlackHole device installed. A named device (a dshow name, an AVFoundation index)
+	/// opts back into the ffmpeg capture of [`Self::audio_input`]. Always false on Linux (the
+	/// PulseAudio default monitor already is the system mix).
 	pub fn audio_loopback(&self) -> bool {
-		if !cfg!(windows) {
+		if !cfg!(any(windows, target_os = "macos")) {
 			return false;
 		}
-		let d = self.audio_input.trim();
-		d.is_empty() || d.eq_ignore_ascii_case("loopback") || d.eq_ignore_ascii_case("wasapi")
+		is_system_mix_choice(&self.audio_input)
 	}
 
 	/// Returns true if the relay endpoint looks like a usable `host:port`.
@@ -364,6 +368,12 @@ fn default_device_name() -> String {
 		.ok()
 		.filter(|h| !h.trim().is_empty())
 		.unwrap_or_else(|| "Pulsar Cihazı".to_string())
+}
+
+/// Whether a configured capture device string asks for the system mix (empty or a sentinel).
+pub fn is_system_mix_choice(dev: &str) -> bool {
+	let d = dev.trim();
+	d.is_empty() || ["loopback", "wasapi", "system"].iter().any(|s| d.eq_ignore_ascii_case(s))
 }
 
 #[cfg(test)]
@@ -476,6 +486,30 @@ mod tests {
 		// A named dshow device opts back out of loopback.
 		c.audio_input = "Stereo Mix".into();
 		assert!(!c.audio_loopback());
+	}
+
+	#[test]
+	fn system_mix_is_the_default_until_a_device_is_named() {
+		assert!(is_system_mix_choice(""));
+		assert!(is_system_mix_choice("  "));
+		assert!(is_system_mix_choice("loopback"));
+		assert!(is_system_mix_choice("WASAPI"));
+		assert!(is_system_mix_choice("system"));
+		// A dshow name or an AVFoundation index (macOS: "0" is usually the microphone) opts out.
+		assert!(!is_system_mix_choice("Stereo Mix"));
+		assert!(!is_system_mix_choice("0"));
+		let c = Config::default();
+		assert_eq!(c.audio_loopback(), cfg!(any(windows, target_os = "macos")));
+	}
+
+	#[test]
+	fn system_mix_sentinel_falls_back_to_the_os_default_input() {
+		for dev in ["", "system", "Loopback", "wasapi"] {
+			let c = Config { audio_input: dev.to_string(), ..Config::default() };
+			assert_eq!(c.audio_input(), crate::audio::AudioInput::default_for_os(), "{dev:?}");
+		}
+		let named = Config { audio_input: "Stereo Mix".to_string(), ..Config::default() };
+		assert_ne!(named.audio_input(), crate::audio::AudioInput::default_for_os());
 	}
 
 	#[test]
