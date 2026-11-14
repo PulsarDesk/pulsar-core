@@ -3,22 +3,21 @@
 //! Enumerates `/dev/input/event*` for a Sony (VID `0x054C`) touchpad device
 //! — specifically one whose kernel device name contains `"Touchpad"` AND
 //! whose USB VID matches Sony, or whose PID matches a known DS4/DS5 PID (see
-//! [`crate::input::GamepadKind::from_vid_pid`]). Reads ABS_MT_POSITION_X/Y
-//! (falls back to ABS_X/Y) for finger tracking, BTN_TOUCH for finger
-//! down/up, and BTN_LEFT for the physical click pad, then synthesizes
-//! `InputEvent::PointerRelative` and `InputEvent::PointerButton` events on
-//! the provided channel — zero wire changes needed.
+//! [`crate::input::GamepadKind::from_vid_pid`]). Reads the two multitouch
+//! slots (ABS_MT_SLOT / ABS_MT_TRACKING_ID / ABS_MT_POSITION_X/Y, falling back
+//! to single-touch ABS_X/Y + BTN_TOUCH) and BTN_LEFT for the physical click
+//! pad, and feeds each report into [`TouchpadMouse`] — the same gesture logic
+//! the Windows and macOS clients use (one finger = pointer, two = scroll,
+//! press = left click, two-finger press = right click). Zero wire changes.
 //!
 //! **Permissions**: the calling process (or its user) must be in the `input`
 //! group (or otherwise have read access to `/dev/input/event*`). If the
 //! device is absent or not accessible the reader silently exits without
 //! panicking or logging errors visible to the user.
 //!
-//! **Follow-ups (not implemented here)**:
-//! - Windows: raw HID via `hidapi` (`hid_read` on the DS4/DS5 HID interface,
-//!   touchpad report ID 0x01 for DS4 or 0x31 for DualSense).
-//! - macOS: `IOHIDManager` callback on the matching Usage Page/Usage
-//!   `GD/Multiaxis Controller`, reading touchpad usage pages.
+//! Windows and macOS read the touchpad through the desktop app's SDL3 pad
+//! subsystem (or the DualSense raw-HID passthrough) instead — see
+//! `pulsar-desktop/src-tauri/src/touchpad_mouse.rs`.
 //!
 //! # cfg gate
 //! This module is `#[cfg(target_os = "linux")]` — it will not compile (or be
@@ -29,17 +28,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use evdev::{AbsoluteAxisCode, Device, EventSummary, EventType, KeyCode};
+use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode};
 
-use crate::input::touch_to_delta;
+use crate::input::touchpad_mouse::{Finger, TouchFrame, TouchpadMouse, DEFAULT_SENS};
 use crate::service::InputEvent;
-
-/// Sensitivity multiplier applied to raw ABS_MT/ABS_X/Y deltas.
-///
-/// DS4 touchpad resolution is roughly 1920 × 942 raw units for a ~50 × 25 mm
-/// surface. A sens of 0.35 maps ~2.9 raw units to one screen pixel on a 1080p
-/// display — a reasonable default that the user can override in Settings later.
-const DEFAULT_SENS: f64 = 0.35;
 
 /// Well-known Sony DS4/DS5 USB PIDs for evdev ID matching.
 /// Matches the set in [`crate::input::GamepadKind::from_vid_pid`].
@@ -112,9 +104,10 @@ fn find_touchpad() -> Option<Device> {
 	None
 }
 
-/// Spawn a blocking reader thread that forwards DS4/DS5 touchpad events as
-/// synthesized [`InputEvent::PointerRelative`] / [`InputEvent::PointerButton`]
-/// messages on `tx`.
+
+/// Spawn a blocking reader thread that forwards DS4/DS5 touchpad gestures as
+/// synthesized [`InputEvent::PointerRelative`] / [`InputEvent::Scroll`] /
+/// [`InputEvent::PointerButton`] messages on `tx`.
 ///
 /// # Parameters
 /// - `tx`: an `mpsc::Sender<InputEvent>` (the same channel the gamepad reader
@@ -150,17 +143,8 @@ pub fn spawn_touchpad_reader(
 	);
 
 	std::thread::spawn(move || {
-		// Previous finger position (raw ABS_MT / ABS_X/Y coordinates).
-		let mut prev: Option<(i32, i32)> = None;
-		// In-progress finger position accumulated across the current EV_SYN batch.
-		let mut cur_x: Option<i32> = None;
-		let mut cur_y: Option<i32> = None;
-		// Whether a finger is currently touching the pad.
-		let mut finger_down = false;
-		// Touchpad left-click currently held (so we can release it on a capture-gate edge,
-		// avoiding a stuck host drag), and the last capture-active state (to detect edges).
-		let mut held_left = false;
-		let mut was_active = false;
+		let mut mouse = TouchpadMouse::new(sens);
+		let mut mt = MtState::default();
 
 		'outer: while running.load(Ordering::SeqCst) {
 			// `fetch_events` blocks until at least one event is available.
@@ -172,84 +156,104 @@ pub fn spawn_touchpad_reader(
 					break 'outer;
 				}
 			};
-			// Consult the capture gate once per batch. On any active<->inactive edge, release
-			// a held click (so the host doesn't keep a drag) and drop the motion seed so the
-			// cursor doesn't jump by the delta accumulated while gated off.
+			// Consult the capture gate once per batch; `TouchpadMouse` releases a held
+			// click and drops the motion seed on every gate edge.
 			let active = (is_active)();
-			if active != was_active {
-				if !active && held_left {
-					let _ = tx.blocking_send(InputEvent::PointerButton { button: 0, down: false });
-					held_left = false;
-				}
-				prev = None;
-				was_active = active;
-			}
 			for ev in events {
 				if !running.load(Ordering::SeqCst) {
 					break 'outer;
 				}
 				match ev.destructure() {
-					// Finger position (multi-touch slot 0; we track one finger).
-					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, _) => {
-						cur_x = Some(ev.value());
-					}
-					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_Y, _) => {
-						cur_y = Some(ev.value());
-					}
-					// Fall back to single-touch ABS_X / ABS_Y.
-					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, _) => {
-						cur_x = cur_x.or(Some(ev.value()));
-					}
-					EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, _) => {
-						cur_y = cur_y.or(Some(ev.value()));
-					}
-					// BTN_TOUCH: finger placed / lifted.
-					EventSummary::Key(_, KeyCode::BTN_TOUCH, _) => {
-						if ev.value() == 0 {
-							// Lift — reset tracking so there's no jump on the next touch.
-							finger_down = false;
-							prev = None;
-						} else {
-							finger_down = true;
-						}
-					}
-					// BTN_LEFT (physical click pad) → left mouse button.
-					EventSummary::Key(_, KeyCode::BTN_LEFT, _) => {
-						let down = ev.value() != 0;
-							held_left = down;
-							if !active {
-								continue; // gated off → don't forward the click (held_left tracked for release)
-							}
-						let _ = tx.blocking_send(InputEvent::PointerButton {
-							button: 0,
-							down,
-						});
-					}
-					// EV_SYN / SYN_REPORT: commit the accumulated position.
+					EventSummary::AbsoluteAxis(_, axis, value) => mt.abs(axis, value),
+					EventSummary::Key(_, key, value) => mt.key(key, value),
+					// EV_SYN / SYN_REPORT: one complete report.
 					EventSummary::Synchronization(..) => {
-						if finger_down {
-							if let (Some(x), Some(y)) = (cur_x, cur_y) {
-								if active {
-									if let Some(p) = prev {
-									let (dx, dy) = touch_to_delta(p, (x, y), sens);
-									if dx != 0.0 || dy != 0.0 {
-										let _ = tx.blocking_send(
-											InputEvent::PointerRelative { dx, dy },
-										);
-									}
-								}
-								}
-									prev = Some((x, y));
-							}
+						for out in mouse.update(&mt.frame(), active) {
+							let _ = tx.blocking_send(out);
 						}
-						// Reset per-SYN accumulators; keep prev for next delta.
-						cur_x = None;
-						cur_y = None;
 					}
 					_ => {}
 				}
 			}
 		}
+		// Never leave the host holding a button when the reader stops.
+		for out in mouse.release() {
+			let _ = tx.blocking_send(out);
+		}
 		tracing::debug!("touchpad_linux: reader thread exiting");
 	});
+}
+
+/// The evdev touchpad node's state, accumulated across events and read at each
+/// SYN_REPORT. Multitouch protocol B: `ABS_MT_SLOT` selects the slot the following
+/// events describe, `ABS_MT_TRACKING_ID` -1 lifts that slot's finger.
+#[derive(Default)]
+struct MtState {
+	slot: usize,
+	fingers: [Finger; 2],
+	/// Any multitouch event was seen → ignore the single-touch fallback axes.
+	uses_mt: bool,
+	/// Single-touch fallback (ABS_X/Y + BTN_TOUCH).
+	st: Finger,
+	click: bool,
+}
+
+impl MtState {
+	fn abs(&mut self, axis: AbsoluteAxisCode, value: i32) {
+		match axis {
+			AbsoluteAxisCode::ABS_MT_SLOT => {
+				self.uses_mt = true;
+				self.slot = value.max(0) as usize;
+			}
+			AbsoluteAxisCode::ABS_MT_TRACKING_ID => {
+				self.uses_mt = true;
+				if let Some(f) = self.fingers.get_mut(self.slot) {
+					f.down = value >= 0;
+					// Protocol B emits a tracking id only when it changes, so any id >= 0
+					// is a new contact — also when the slot went straight from one finger
+					// to the next inside one SYN frame (count unchanged): re-seed it.
+					if value >= 0 {
+						f.new_contact = true;
+					}
+				}
+			}
+			AbsoluteAxisCode::ABS_MT_POSITION_X => {
+				self.uses_mt = true;
+				if let Some(f) = self.fingers.get_mut(self.slot) {
+					f.x = value as f64;
+				}
+			}
+			AbsoluteAxisCode::ABS_MT_POSITION_Y => {
+				self.uses_mt = true;
+				if let Some(f) = self.fingers.get_mut(self.slot) {
+					f.y = value as f64;
+				}
+			}
+			AbsoluteAxisCode::ABS_X => self.st.x = value as f64,
+			AbsoluteAxisCode::ABS_Y => self.st.y = value as f64,
+			_ => {}
+		}
+	}
+
+	fn key(&mut self, key: KeyCode, value: i32) {
+		match key {
+			KeyCode::BTN_TOUCH => self.st.down = value != 0,
+			// BTN_LEFT = the physical click pad.
+			KeyCode::BTN_LEFT => self.click = value != 0,
+			_ => {}
+		}
+	}
+
+	/// The report at a SYN_REPORT. Clears the per-report "new contact" marks.
+	fn frame(&mut self) -> TouchFrame {
+		let fingers = if self.uses_mt {
+			self.fingers
+		} else {
+			[self.st, Finger::default()]
+		};
+		for f in &mut self.fingers {
+			f.new_contact = false;
+		}
+		TouchFrame { fingers, click: self.click }
+	}
 }

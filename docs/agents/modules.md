@@ -59,7 +59,12 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   CGEventPostToPid; pure helpers + tests in `window_common.rs`; native Wayland is
   impossible; Linux/macOS untested on hardware; `is_alive`/`in_front`/size/X11 child
   under the pointer are cached 200 ms — the host asks per input event),
-  DS4/DS5 touchpad-as-mouse. `input/pen_touch/` = pen + multi-touch:
+  DS4/DS5 touchpad-as-mouse (`touchpad_mouse.rs` = the shared,
+  unit-tested gesture machine — pointer / two-finger scroll / click / two-finger right
+  click — used by the Linux evdev reader `touchpad_linux.rs` and by the desktop app's
+  SDL3-based Windows/macOS reader; untested on hardware; `pad_route.rs` = which client
+  session a local pad drives — tabs / split panes / locks / press-to-join — shared by the
+  desktop app's gamepad forward gate and its touchpad readers). `input/pen_touch/` = pen + multi-touch:
   wire state types (`PenState`, `TouchFrame` — `InputEvent::Pen` / `Touch`, host features
   `FEAT_PEN` / `FEAT_TOUCH`), the host `Driver` (sanitize, slot tracking, 1 s silence lift,
   keep-alive refresh) on a worker thread (`PenTouch`) feeding a platform `Sink` — Windows
