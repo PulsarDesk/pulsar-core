@@ -26,7 +26,7 @@ pub mod mouse;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::WinSink;
+pub use windows::{pointer_info, LocalDevices, PointerBackend, SynthContact, WinSink};
 
 #[cfg(target_os = "linux")]
 mod linux;

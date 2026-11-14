@@ -140,26 +140,87 @@ pub(crate) fn pen_steps(prev: &PenState, next: &PenState) -> Vec<(u32, PenState)
 	steps
 }
 
-pub(crate) struct WinSink {
+/// One contact of an injected pointer frame as plain data: what [`WinSink`] hands its
+/// [`PointerBackend`] (and what the host forwards to the SYSTEM helper, which injects it on
+/// the secure desktop). Coordinates are physical virtual-desktop pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SynthContact {
+	/// Pen: always 0. Touch: the slot (0..[`MAX_TOUCH`]).
+	pub id: u32,
+	/// `POINTER_FLAG_*`.
+	pub flags: u32,
+	pub x: i32,
+	pub y: i32,
+	/// 0..=1024 (pen: 0 while hovering; touch: 512 when the client has no pressure).
+	pub pressure: u32,
+	/// Pen rotation, 0..360 degrees.
+	pub rotation: u32,
+	/// Pen tilt, -90..=90 degrees.
+	pub tilt_x: i32,
+	pub tilt_y: i32,
+	/// `PEN_FLAG_*` (pen only).
+	pub pen_flags: u32,
+}
+
+/// Where [`WinSink`] injects: this process's synthetic pointer devices ([`LocalDevices`]) or
+/// the in-session SYSTEM helper (the desktop app's `pulsar-sysagent` path), which reaches
+/// UAC prompts and the lock screen.
+pub trait PointerBackend {
+	/// Inject one frame on the pen device (`pen`, exactly one contact) or the touch device.
+	/// `false` = the injection failed.
+	fn inject(&mut self, pen: bool, contacts: &[SynthContact]) -> bool;
+}
+
+/// A [`SynthContact`] as the `POINTER_TYPE_INFO` that `InjectSyntheticPointerInput` takes.
+pub fn pointer_info(pen: bool, frame: u32, c: &SynthContact) -> POINTER_TYPE_INFO {
+	let at = POINT { x: c.x, y: c.y };
+	if pen {
+		let mut p = POINTER_PEN_INFO::default();
+		p.pointerInfo.pointerType = PT_PEN;
+		p.pointerInfo.pointerId = c.id;
+		p.pointerInfo.frameId = frame;
+		p.pointerInfo.pointerFlags = c.flags;
+		p.pointerInfo.ptPixelLocation = at;
+		p.penMask = PEN_MASK_PRESSURE | PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
+		p.penFlags = c.pen_flags;
+		p.pressure = c.pressure;
+		p.rotation = c.rotation;
+		p.tiltX = c.tilt_x;
+		p.tiltY = c.tilt_y;
+		POINTER_TYPE_INFO { r#type: PT_PEN, Anonymous: POINTER_TYPE_INFO_0 { penInfo: p } }
+	} else {
+		let mut t = POINTER_TOUCH_INFO::default();
+		t.pointerInfo.pointerType = PT_TOUCH;
+		t.pointerInfo.pointerId = c.id;
+		t.pointerInfo.frameId = frame;
+		t.pointerInfo.pointerFlags = c.flags;
+		t.pointerInfo.ptPixelLocation = at;
+		t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+		t.rcContact = RECT { left: at.x - 4, top: at.y - 4, right: at.x + 4, bottom: at.y + 4 };
+		t.orientation = 90;
+		t.pressure = c.pressure;
+		POINTER_TYPE_INFO { r#type: PT_TOUCH, Anonymous: POINTER_TYPE_INFO_0 { touchInfo: t } }
+	}
+}
+
+/// This process's synthetic `PT_PEN` / `PT_TOUCH` devices (created on first use).
+pub struct LocalDevices {
 	api: Api,
 	pen_dev: Option<HSYNTHETICPOINTERDEVICE>,
 	touch_dev: Option<HSYNTHETICPOINTERDEVICE>,
-	geom: Option<MonitorRect>,
-	/// Last frame id per device (monotonic, as real digitizers stamp it).
+	/// Last frame id (monotonic, as real digitizers stamp it).
 	frame: u32,
 	logged: bool,
 }
 
 // SAFETY: the device handles are only used on the worker thread that created them; the
 // sink is built there (`PenTouch::spawn`'s factory) and never leaves it.
-unsafe impl Send for WinSink {}
+unsafe impl Send for LocalDevices {}
 
-impl WinSink {
+impl LocalDevices {
 	/// `None` when this Windows has no synthetic pointer API (before 10 1809).
-	pub(crate) fn new() -> Option<Self> {
-		per_monitor_dpi();
-		let api = Api::load()?;
-		Some(Self { api, pen_dev: None, touch_dev: None, geom: None, frame: 0, logged: false })
+	pub fn new() -> Option<Self> {
+		Some(Self { api: Api::load()?, pen_dev: None, touch_dev: None, frame: 0, logged: false })
 	}
 
 	fn device(&mut self, pen: bool) -> Option<HSYNTHETICPOINTERDEVICE> {
@@ -180,66 +241,22 @@ impl WinSink {
 		}
 		*slot
 	}
+}
 
-	fn primary() -> (i32, i32) {
-		// SAFETY: no arguments besides the metric index.
-		unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
-	}
-
-	fn inject(&mut self, pen: bool, infos: &[POINTER_TYPE_INFO]) {
-		if infos.is_empty() {
-			return;
+impl PointerBackend for LocalDevices {
+	fn inject(&mut self, pen: bool, contacts: &[SynthContact]) -> bool {
+		if contacts.is_empty() {
+			return true;
 		}
-		let Some(dev) = self.device(pen) else { return };
-		// SAFETY: `infos` is a valid slice of initialized POINTER_TYPE_INFO for this device.
-		if unsafe { (self.api.inject)(dev, infos.as_ptr(), infos.len() as u32) } == 0 && !self.logged {
-			self.logged = true;
-			tracing::warn!(err = %std::io::Error::last_os_error(), pen, "InjectSyntheticPointerInput failed");
-		}
-	}
-
-	fn pen_info(&mut self, flags: u32, s: &PenState) -> POINTER_TYPE_INFO {
-		let mut p = POINTER_PEN_INFO::default();
-		p.pointerInfo.pointerType = PT_PEN;
-		p.pointerInfo.pointerId = 0;
+		let Some(dev) = self.device(pen) else { return false };
 		self.frame = self.frame.wrapping_add(1);
-		p.pointerInfo.frameId = self.frame;
-		p.pointerInfo.pointerFlags = flags;
-		p.pointerInfo.ptPixelLocation = to_px(self.geom, Self::primary(), s.x, s.y);
-		p.penMask = PEN_MASK_PRESSURE | PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
-		if s.eraser {
-			p.penFlags |= PEN_FLAG_INVERTED;
-			if s.contact {
-				p.penFlags |= PEN_FLAG_ERASER;
-			}
-		}
-		if s.barrel {
-			p.penFlags |= PEN_FLAG_BARREL;
-		}
-		p.pressure = if s.contact { (s.pressure * 1024.0).round().clamp(1.0, 1024.0) as u32 } else { 0 };
-		p.rotation = (s.twist as u32) % 360;
-		p.tiltX = s.tilt_x.round() as i32;
-		p.tiltY = s.tilt_y.round() as i32;
-		POINTER_TYPE_INFO { r#type: PT_PEN, Anonymous: POINTER_TYPE_INFO_0 { penInfo: p } }
-	}
-
-	fn touch_info(&mut self, slot: usize, flags: u32, pt: &TouchPoint) -> POINTER_TYPE_INFO {
-		let mut t = POINTER_TOUCH_INFO::default();
-		t.pointerInfo.pointerType = PT_TOUCH;
-		t.pointerInfo.pointerId = slot as u32;
-		t.pointerInfo.frameId = self.frame;
-		t.pointerInfo.pointerFlags = flags;
-		let at = to_px(self.geom, Self::primary(), pt.x, pt.y);
-		t.pointerInfo.ptPixelLocation = at;
-		t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
-		t.rcContact = RECT { left: at.x - 4, top: at.y - 4, right: at.x + 4, bottom: at.y + 4 };
-		t.orientation = 90;
-		t.pressure = if pt.pressure > 0.0 { (pt.pressure * 1024.0).round().clamp(1.0, 1024.0) as u32 } else { 512 };
-		POINTER_TYPE_INFO { r#type: PT_TOUCH, Anonymous: POINTER_TYPE_INFO_0 { touchInfo: t } }
+		let infos: Vec<POINTER_TYPE_INFO> = contacts.iter().map(|c| pointer_info(pen, self.frame, c)).collect();
+		// SAFETY: `infos` is a valid slice of initialized POINTER_TYPE_INFO for this device.
+		unsafe { (self.api.inject)(dev, infos.as_ptr(), infos.len() as u32) != 0 }
 	}
 }
 
-impl Drop for WinSink {
+impl Drop for LocalDevices {
 	fn drop(&mut self) {
 		for h in [self.pen_dev.take(), self.touch_dev.take()].into_iter().flatten() {
 			// SAFETY: a handle CreateSyntheticPointerDevice returned, destroyed once.
@@ -248,23 +265,103 @@ impl Drop for WinSink {
 	}
 }
 
+/// The Windows [`Sink`]: turns pen / touch edges into synthetic pointer frames for a
+/// [`PointerBackend`].
+pub struct WinSink<B: PointerBackend = LocalDevices> {
+	backend: B,
+	geom: Option<MonitorRect>,
+	logged: bool,
+}
+
+impl WinSink<LocalDevices> {
+	/// In-process injection; `None` when this Windows has no synthetic pointer API.
+	pub fn new() -> Option<Self> {
+		Some(Self::with_backend(LocalDevices::new()?))
+	}
+}
+
+impl<B: PointerBackend> WinSink<B> {
+	/// Any backend. Call on the worker thread: it makes that thread per-monitor-v2 DPI aware
+	/// (pixel coordinates are physical).
+	pub fn with_backend(backend: B) -> Self {
+		per_monitor_dpi();
+		Self { backend, geom: None, logged: false }
+	}
+
+	fn primary() -> (i32, i32) {
+		// SAFETY: no arguments besides the metric index.
+		unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+	}
+
+	fn inject(&mut self, pen: bool, contacts: &[SynthContact]) {
+		if contacts.is_empty() {
+			return;
+		}
+		if !self.backend.inject(pen, contacts) && !self.logged {
+			self.logged = true;
+			tracing::warn!(err = %std::io::Error::last_os_error(), pen, "pen/touch pointer injection failed");
+		}
+	}
+
+	fn pen_contact(&self, flags: u32, s: &PenState) -> SynthContact {
+		let at = to_px(self.geom, Self::primary(), s.x, s.y);
+		pen_contact(flags, s, at)
+	}
+
+	fn touch_contact(&self, slot: usize, flags: u32, pt: &TouchPoint) -> SynthContact {
+		let at = to_px(self.geom, Self::primary(), pt.x, pt.y);
+		SynthContact {
+			id: slot as u32,
+			flags,
+			x: at.x,
+			y: at.y,
+			pressure: if pt.pressure > 0.0 { (pt.pressure * 1024.0).round().clamp(1.0, 1024.0) as u32 } else { 512 },
+			..Default::default()
+		}
+	}
+}
+
+/// The pen contact for one injection step at pixel `at`.
+pub(crate) fn pen_contact(flags: u32, s: &PenState, at: POINT) -> SynthContact {
+	let mut pen_flags = 0;
+	if s.eraser {
+		pen_flags |= PEN_FLAG_INVERTED;
+		if s.contact {
+			pen_flags |= PEN_FLAG_ERASER;
+		}
+	}
+	if s.barrel {
+		pen_flags |= PEN_FLAG_BARREL;
+	}
+	SynthContact {
+		id: 0,
+		flags,
+		x: at.x,
+		y: at.y,
+		pressure: if s.contact { (s.pressure * 1024.0).round().clamp(1.0, 1024.0) as u32 } else { 0 },
+		rotation: (s.twist.max(0.0) as u32) % 360,
+		tilt_x: (s.tilt_x.round() as i32).clamp(-90, 90),
+		tilt_y: (s.tilt_y.round() as i32).clamp(-90, 90),
+		pen_flags,
+	}
+}
+
 const TOUCH_DOWN: u32 = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
 const TOUCH_MOVE: u32 = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
 
-impl Sink for WinSink {
+impl<B: PointerBackend> Sink for WinSink<B> {
 	type Geom = Option<MonitorRect>;
 	fn set_geom(&mut self, g: Self::Geom) {
 		self.geom = g;
 	}
 	fn pen(&mut self, prev: &PenState, next: &PenState) {
 		for (flags, s) in pen_steps(prev, next) {
-			let info = self.pen_info(flags, &s);
-			self.inject(true, &[info]);
+			let c = self.pen_contact(flags, &s);
+			self.inject(true, &[c]);
 		}
 	}
 	fn touch(&mut self, _now: Instant, _frame: &TouchFrame, changes: &[SlotChange]) {
-		self.frame = self.frame.wrapping_add(1);
-		let infos: Vec<POINTER_TYPE_INFO> = changes
+		let contacts: Vec<SynthContact> = changes
 			.iter()
 			.map(|c| {
 				let f = match c.phase {
@@ -272,10 +369,10 @@ impl Sink for WinSink {
 					Contact::Move => TOUCH_MOVE,
 					Contact::Up => POINTER_FLAG_UP,
 				};
-				self.touch_info(c.slot, f, &c.pt)
+				self.touch_contact(c.slot, f, &c.pt)
 			})
 			.collect();
-		self.inject(false, &infos);
+		self.inject(false, &contacts);
 	}
 	fn refresh(&mut self, pen: &PenState, touch: &[(usize, TouchPoint)]) {
 		if pen.in_range {
@@ -286,13 +383,12 @@ impl Sink for WinSink {
 			if pen.barrel {
 				f |= POINTER_FLAG_SECONDBUTTON;
 			}
-			let info = self.pen_info(f, pen);
-			self.inject(true, &[info]);
+			let c = self.pen_contact(f, pen);
+			self.inject(true, &[c]);
 		}
 		if !touch.is_empty() {
-			self.frame = self.frame.wrapping_add(1);
-			let infos: Vec<_> = touch.iter().map(|(slot, pt)| self.touch_info(*slot, TOUCH_MOVE, pt)).collect();
-			self.inject(false, &infos);
+			let contacts: Vec<_> = touch.iter().map(|(slot, pt)| self.touch_contact(*slot, TOUCH_MOVE, pt)).collect();
+			self.inject(false, &contacts);
 		}
 	}
 	fn refresh_every(&self) -> Option<Duration> {
@@ -330,6 +426,16 @@ mod tests {
 		let s = pen_steps(&pen, &eraser);
 		assert_eq!(s.iter().map(|s| s.0).collect::<Vec<_>>(), vec![POINTER_FLAG_UPDATE, POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE]);
 		assert!(!s[0].1.eraser && s[1].1.eraser);
+	}
+
+	#[test]
+	fn pen_contact_carries_tool_buttons_and_pressure() {
+		let s = PenState { x: 0.1, y: 0.1, in_range: true, contact: true, pressure: 0.5, eraser: true, barrel: true, twist: 370.0, tilt_x: 120.0, ..Default::default() };
+		let c = pen_contact(TOUCH_MOVE, &s, POINT { x: 3, y: 4 });
+		assert_eq!((c.x, c.y, c.pressure, c.rotation, c.tilt_x), (3, 4, 512, 10, 90));
+		assert_eq!(c.pen_flags, PEN_FLAG_INVERTED | PEN_FLAG_ERASER | PEN_FLAG_BARREL);
+		let hover = pen_contact(POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE, &PenState { contact: false, ..s }, POINT { x: 0, y: 0 });
+		assert_eq!((hover.pressure, hover.pen_flags), (0, PEN_FLAG_INVERTED | PEN_FLAG_BARREL));
 	}
 
 	#[test]
