@@ -57,6 +57,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
+  - `input/local_pointer_macos.rs` — macOS host: listen-only `CGEventTap` noticing the
+    person at the host using their own mouse (desktop `host::takeover`); skips events tagged
+    `INJECTED_TAG` and events from our own pid; `request_listen_access`,
+    `pointer_on_main_display`. **Tag contract:** every event `input/macos.rs` posts carries
+    `INJECTED_TAG` (`"PULS"`) in `kCGEventSourceUserData` — a new injection path must set it
+    too or its events count as the local user. Untested on macOS hardware.
+- `overlay_macos.rs` — macOS: `make_overlay_window` turns an NSWindow (the desktop's host-side
+  remote-cursor ghost) into a system-wide click-through overlay (status level, all Spaces).
+  Over another app's full-screen Space unverified (may need an NSPanel). Untested on macOS
+  hardware.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
   **for tests only**. Real encoders live in the apps (see below).
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`

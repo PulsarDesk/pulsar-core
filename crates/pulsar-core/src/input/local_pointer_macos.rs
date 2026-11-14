@@ -5,11 +5,14 @@
 //! A **listen-only** `CGEventTap` at the session tap sees every mouse move / click / scroll
 //! after the HID layer. Pulsar's own injected events (`input::macos`) carry
 //! [`super::macos::INJECTED_TAG`] in `kCGEventSourceUserData`, so they are skipped; as a second
-//! guard, events whose source process is this process are skipped too. Listen-only mouse taps
-//! need no extra TCC grant beyond the Accessibility permission injection already requires (on
-//! some macOS versions "Input Monitoring" is asked for; without it `CGEventTapCreate` returns
-//! NULL and [`watch_local_pointer`] reports an error — nothing is detected, remote input always
-//! applies, as before).
+//! guard, events whose source process is this process are skipped too.
+//!
+//! Permission: on macOS 10.15+ a listen-only tap for **mouse** events needs no TCC grant (only
+//! keyboard taps need "Input Monitoring"); [`request_listen_access`] still asks for the
+//! listen-event grant once, because some releases gate every listen tap behind it. When
+//! `CGEventTapCreate` returns NULL anyway, [`watch_local_pointer`] reports an error, nothing
+//! is detected and remote input always applies, as before; the desktop app retries every few
+//! seconds so a grant given later takes effect without a restart.
 //!
 //! Untested on macOS hardware.
 
@@ -27,6 +30,16 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
 	fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+	// macOS 10.15+.
+	fn CGPreflightListenEventAccess() -> bool;
+	fn CGRequestListenEventAccess() -> bool;
+}
+
+/// Ask for the listen-event (Input Monitoring) grant if it is not given yet; the system
+/// shows its prompt at most once per app. Returns whether access is granted now.
+pub fn request_listen_access() -> bool {
+	// SAFETY: plain CoreGraphics calls without arguments.
+	unsafe { CGPreflightListenEventAccess() || CGRequestListenEventAccess() }
 }
 
 /// The live tap's mach port, so the callback can re-enable it after the system disabled it
