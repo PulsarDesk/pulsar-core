@@ -159,22 +159,10 @@ fn process_edges() -> Vec<(u32, u32)> {
 		.collect()
 }
 
-/// `(pid, parent pid)` of every process: walks the tree from pid 1 with `proc_listchildpids`.
+/// `(pid, parent pid)` of every process (`proc_listallpids` + `proc_pidinfo`).
 #[cfg(target_os = "macos")]
 fn process_edges() -> Vec<(u32, u32)> {
-	let mut edges = Vec::new();
-	let mut frontier = vec![1u32];
-	let mut seen = std::collections::HashSet::new();
-	while let Some(p) = frontier.pop() {
-		if !seen.insert(p) {
-			continue;
-		}
-		for c in mac::child_pids(p) {
-			edges.push((c, p));
-			frontier.push(c);
-		}
-	}
-	edges
+	mac::process_edges()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -191,9 +179,65 @@ fn parent_from_stat(stat: &str) -> Option<u32> {
 	rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// The caption the picker shows for a window: "Title — App", or the app name alone for an
+/// untitled window (macOS apps often leave their main window untitled); `None` when both
+/// are empty (such a window is not offered).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn display_title(title: &str, app: &str) -> Option<String> {
+	let (t, a) = (title.trim(), app.trim());
+	match (t.is_empty(), a.is_empty()) {
+		(true, true) => None,
+		(true, false) => Some(a.to_string()),
+		(false, true) => Some(t.to_string()),
+		(false, false) if t == a => Some(t.to_string()),
+		(false, false) => Some(format!("{t} — {a}")),
+	}
+}
+
+/// Copy `rows` rows of `width` bytes from a strided plane into a tightly packed one. Rows
+/// or bytes the source lacks (a smaller buffer than configured) stay as they were, so a
+/// short frame never reads out of bounds.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn copy_plane(dst: &mut [u8], width: usize, rows: usize, src: &[u8], src_stride: usize, src_rows: usize, src_width: usize) {
+	let n = width.min(src_width).min(src_stride);
+	for r in 0..rows.min(src_rows) {
+		let (d, s) = (r * width, r * src_stride);
+		if d + n > dst.len() || s + n > src.len() {
+			break;
+		}
+		dst[d..d + n].copy_from_slice(&src[s..s + n]);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn copy_plane_strips_stride_and_never_overreads() {
+		// 4×2 picture in a 6-byte-stride buffer.
+		let src = [1, 2, 3, 4, 0, 0, 5, 6, 7, 8, 0, 0];
+		let mut dst = [9u8; 8];
+		copy_plane(&mut dst, 4, 2, &src, 6, 2, 4);
+		assert_eq!(dst, [1, 2, 3, 4, 5, 6, 7, 8]);
+		// The source is narrower and shorter than the target: the rest stays untouched.
+		let mut dst = [9u8; 8];
+		copy_plane(&mut dst, 4, 2, &[1, 2, 3], 3, 1, 3);
+		assert_eq!(dst, [1, 2, 3, 9, 9, 9, 9, 9]);
+		// A lying stride / row count never reads past the slice.
+		let mut dst = [0u8; 8];
+		copy_plane(&mut dst, 4, 2, &[1, 2, 3, 4], 6, 2, 4);
+		assert_eq!(dst, [1, 2, 3, 4, 0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn picker_title_falls_back_to_the_app() {
+		assert_eq!(display_title("Doc.txt", "TextEdit").as_deref(), Some("Doc.txt — TextEdit"));
+		assert_eq!(display_title("  ", "Finder").as_deref(), Some("Finder"));
+		assert_eq!(display_title("Steam", "Steam").as_deref(), Some("Steam"));
+		assert_eq!(display_title("Untitled", "").as_deref(), Some("Untitled"));
+		assert_eq!(display_title("", " "), None);
+	}
 
 	fn w(id: u64, pid: u32, width: u32, height: u32) -> HostWindow {
 		HostWindow { id, title: format!("w{id}"), pid, width, height }

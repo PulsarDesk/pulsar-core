@@ -172,6 +172,29 @@ pub fn encoder_fragment_with(
 /// NVENC/VAAPI link fail and the host silently fell back to **software x264**. `x264enc`
 /// accepts NV12 too (verified), so NV12 works for every gst encoder on this path.
 pub fn wayland_pipeline(fd: i32, node_id: u32, fragment: &str, ip: &str, port: u16) -> String {
+	wayland_pipeline_sized(fd, node_id, fragment, ip, port, None)
+}
+
+/// [`wayland_pipeline`] with an optional FIXED output size. A window cast (portal source
+/// type WINDOW) changes size whenever the window is resized, and the encoder must never
+/// see a size change mid-stream: `Some((w, h))` scales every frame into an even `w`×`h`
+/// box, keeping the aspect (`add-borders`). `None` = the cast's own size (a monitor).
+pub fn wayland_pipeline_sized(
+	fd: i32,
+	node_id: u32,
+	fragment: &str,
+	ip: &str,
+	port: u16,
+	size: Option<(u32, u32)>,
+) -> String {
+	let scale = match size {
+		Some((w, h)) => format!(
+			"! videoscale add-borders=true ! video/x-raw,width={},height={},pixel-aspect-ratio=1/1 ",
+			w.max(2) & !1,
+			h.max(2) & !1
+		),
+		None => String::new(),
+	};
 	// NB: keep autoconnect at its default (true). It sets PW_STREAM_FLAG_AUTOCONNECT, which is
 	// what actually LINKS pipewiresrc to the `path` node — with autoconnect=false the stream
 	// connects to PipeWire but never links to node `path`, so it sits SUSPENDED and no frames
@@ -183,7 +206,7 @@ pub fn wayland_pipeline(fd: i32, node_id: u32, fragment: &str, ip: &str, port: u
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
 		 ! videoconvert ! video/x-raw,format=NV12 \
-		 ! {fragment} \
+		 {scale}! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
 }

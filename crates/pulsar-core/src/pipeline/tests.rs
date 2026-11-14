@@ -754,3 +754,16 @@ fn gst_x11_window_pipeline_targets_the_window_at_a_fixed_size() {
 	assert!(p.contains("width=1280,height=720"), "even fixed size: {p}");
 	assert!(p.contains("! x264enc name=venc ! udpsink host=10.0.0.5 port=9000"), "{p}");
 }
+
+#[test]
+fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
+	let screen = gst::wayland_pipeline(7, 42, "x264enc name=venc", "10.0.0.5", 9000);
+	assert!(!screen.contains("videoscale"), "{screen}");
+	assert_eq!(screen, gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, None));
+	let win = gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, Some((1281, 719)));
+	assert!(
+		win.contains("format=NV12 ! videoscale add-borders=true ! video/x-raw,width=1280,height=718,pixel-aspect-ratio=1/1 ! x264enc name=venc"),
+		"{win}"
+	);
+	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
+}

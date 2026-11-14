@@ -23,6 +23,7 @@ pub mod netwatch;
 pub mod pipeline;
 pub mod service;
 pub mod totp;
+pub mod window_capture;
 
 pub use config::{Config, Language, NetworkMode};
 pub use connection::{ConnError, Node, RelayCreds, Session, SessionSender, Transport};

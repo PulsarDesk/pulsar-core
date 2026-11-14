@@ -213,6 +213,21 @@ impl Drop for SessionCloseGuard {
 	}
 }
 
+/// What the portal offers the person at the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+	/// The screen stream: monitors (and windows — the dialog's own choice), restored from
+	/// the persisted token after the first pick.
+	#[default]
+	Screen,
+	/// ONE application window (the client's "Pencere" pick): the dialog offers windows
+	/// only and the pick is never persisted (another window next time; the screen token is
+	/// left alone). Wayland lets no program list or choose other programs' windows, so the
+	/// person at the host picks it. Frames are scaled into an even `max` box keeping the
+	/// window's aspect, so a resize never changes the encoded size.
+	Window { max: (u32, u32) },
+}
+
 /// Open the portal (with the persisted restore token, if any, so the share dialog is
 /// skipped after the first time), then run the pipeline in-process — or under the system
 /// `gst-launch-1.0` when `system_gst` is set (the caller validated the encoder only there).
@@ -224,16 +239,40 @@ pub async fn start(
 	restore_token: Option<String>,
 	system_gst: bool,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	start_with(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen).await
+}
+
+/// [`start`] for a chosen [`Source`]. For [`Source::Window`] the restore token is
+/// ignored and the returned token is always `None`.
+pub async fn start_with(
+	ip: &str,
+	port: u16,
+	encoder_fragment: &str,
+	restore_token: Option<String>,
+	system_gst: bool,
+	source: Source,
+) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	let window = matches!(source, Source::Window { .. });
+	// Fixed output size for a window cast: the window's aspect fitted into `max` once the
+	// portal says how big it is, else the `max` box itself (letterboxed by `add-borders`).
+	let size_for = |cast: Option<(i32, i32)>| match source {
+		Source::Screen => None,
+		Source::Window { max } => Some(match cast {
+			Some((w, h)) if w > 0 && h > 0 => crate::pipeline::fit_within((w as u32, h as u32), max),
+			_ => crate::pipeline::fit_within((0, 0), max),
+		}),
+	};
 	// Can the in-process GStreamer build this pipeline at all? (The fd/node/address don't
 	// change which elements it needs.) If not, run it under the system gst-launch-1.0.
 	let in_process = !system_gst && match gst::init() {
 		Ok(()) => {
-			let missing = missing_elements(&crate::pipeline::gst::wayland_pipeline(
+			let missing = missing_elements(&crate::pipeline::gst::wayland_pipeline_sized(
 				0,
 				0,
 				encoder_fragment,
 				ip,
 				port,
+				size_for(None),
 			));
 			if !missing.is_empty() {
 				tracing::warn!(?missing, "in-process GStreamer lacks elements — using the system gst-launch-1.0");
@@ -245,7 +284,19 @@ pub async fn start(
 			false
 		}
 	};
-	let (mut guard, node_id, pw_fd, token, stream_rect) = open_portal(restore_token).await?;
+	let (mut guard, node_id, pw_fd, token, stream_rect, cast_size) =
+		open_portal(if window { None } else { restore_token }, window).await?;
+	let token = if window { None } else { token };
+	let size = size_for(cast_size);
+	if window {
+		tracing::info!(?cast_size, ?size, "wayland window cast");
+	}
+	let desc = |fd: i32| {
+		crate::pipeline::gst::wayland_pipeline_sized(fd, node_id, encoder_fragment, ip, port, size)
+	};
+	// A window cast has no place in the output layout (the pointer can't be confined to
+	// it through uinput), so no pointer region.
+	let stream_rect = if window { None } else { stream_rect };
 	let pointer_region = stream_rect.and_then(|r| {
 		let region = outputs::bounds().and_then(|b| region_in(r, b));
 		tracing::info!(?r, ?region, "wayland pointer region");
@@ -260,11 +311,11 @@ pub async fn start(
 			tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
 		}
 		let started = if in_process {
-			run_pipeline(pw_fd.as_raw_fd(), node_id, encoder_fragment, ip, port)
+			run_pipeline(&desc(pw_fd.as_raw_fd()))
 				.await
 				.map(|(pipeline, venc)| Backend::InProcess { pipeline, venc })
 		} else {
-			run_child(pw_fd.as_raw_fd(), node_id, encoder_fragment, ip, port)
+			run_child(&desc(pw_fd.as_raw_fd()))
 				.await
 				.map(|child| Backend::Child(std::sync::Mutex::new(child)))
 		};
@@ -404,16 +455,9 @@ pub fn use_system_gst_env(cmd: &mut std::process::Command) {
 /// Run the pipeline under the system `gst-launch-1.0` (the in-process GStreamer can't).
 /// The PipeWire fd is inherited (its CLOEXEC is cleared in `open_portal`). Up once the
 /// child is still alive after a short grace period; its stderr goes to the log.
-async fn run_child(
-	fd: i32,
-	node_id: u32,
-	encoder_fragment: &str,
-	ip: &str,
-	port: u16,
-) -> anyhow::Result<std::process::Child> {
+async fn run_child(desc: &str) -> anyhow::Result<std::process::Child> {
 	use std::io::BufRead;
 	use std::os::unix::process::CommandExt;
-	let desc = crate::pipeline::gst::wayland_pipeline(fd, node_id, encoder_fragment, ip, port);
 	let mut cmd = std::process::Command::new("gst-launch-1.0");
 	cmd.arg("-q")
 		.args(desc.split_whitespace())
@@ -449,23 +493,31 @@ async fn run_child(
 	}
 }
 
-async fn open_portal(
-	restore_token: Option<String>,
-) -> anyhow::Result<(SessionCloseGuard, u32, OwnedFd, Option<String>, Option<Rect>)> {
+/// The portal's answer: session guard, PipeWire node, remote fd, restore token, the
+/// monitor's layout rect, and the cast's size (any source type).
+type PortalCast = (SessionCloseGuard, u32, OwnedFd, Option<String>, Option<Rect>, Option<(i32, i32)>);
+
+/// `window`: offer windows only and never persist the pick (see [`Source::Window`]).
+async fn open_portal(restore_token: Option<String>, window: bool) -> anyhow::Result<PortalCast> {
 	let proxy: Screencast = Screencast::new().await?;
 	let session: Session<Screencast> = proxy.create_session(Default::default()).await?;
 	let guard = SessionCloseGuard(Some(session));
-	let (node_id, pw_fd, token, rect) = async {
+	let (sources, persist) = if window {
+		(SourceType::Window.into(), PersistMode::DoNot)
+	} else {
+		(SourceType::Monitor | SourceType::Window, PersistMode::Application)
+	};
+	let (node_id, pw_fd, token, rect, size) = async {
 		let session = guard.0.as_ref().expect("session present");
 		proxy
 			.select_sources(
 				session,
 				SelectSourcesOptions::default()
 					.set_cursor_mode(CursorMode::Embedded)
-					.set_sources(SourceType::Monitor | SourceType::Window)
+					.set_sources(sources)
 					.set_multiple(false)
 					.set_restore_token(restore_token.as_deref())
-					.set_persist_mode(PersistMode::Application),
+					.set_persist_mode(persist),
 			)
 			.await?;
 		let response = proxy
@@ -482,16 +534,17 @@ async fn open_portal(
 			(Some((x, y)), Some((w, h))) if w > 0 && h > 0 => Some(Rect { x, y, w, h }),
 			_ => None,
 		};
+		let size = stream.size();
 		let token = response.restore_token().map(|s| s.to_string());
 
 		let pw_fd: OwnedFd = proxy
 			.open_pipe_wire_remote(session, Default::default())
 			.await?;
 		clear_cloexec(pw_fd.as_raw_fd())?;
-		Ok::<_, anyhow::Error>((node_id, pw_fd, token, rect))
+		Ok::<_, anyhow::Error>((node_id, pw_fd, token, rect, size))
 	}
 	.await?;
-	Ok((guard, node_id, pw_fd, token, rect))
+	Ok((guard, node_id, pw_fd, token, rect, size))
 }
 
 /// A rectangle in the compositor's logical coordinates.
@@ -655,15 +708,8 @@ mod tests {
 /// Build the pipeline from the same description string the `gst-launch` path used, set it
 /// PLAYING and confirm it really got there (a PipeWire node that isn't ready fails the
 /// state change instead of streaming). Returns the pipeline + the encoder element.
-async fn run_pipeline(
-	fd: i32,
-	node_id: u32,
-	encoder_fragment: &str,
-	ip: &str,
-	port: u16,
-) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
-	let desc = crate::pipeline::gst::wayland_pipeline(fd, node_id, encoder_fragment, ip, port);
-	let element = gst::parse::launch(&desc)
+async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
+	let element = gst::parse::launch(desc)
 		.map_err(|e| anyhow::anyhow!("gst pipeline parse failed (gstreamer plugins kurulu mu?): {e}"))?;
 	let pipeline = element
 		.downcast::<gst::Pipeline>()
