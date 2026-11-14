@@ -72,7 +72,12 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
 - `capture.rs` — **Linux-only** (`cfg`): Wayland XDG ScreenCast portal →
   PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
   `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev
-  headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`). If the in-process
+  headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
+  `start_with_frames(.., Some(factory))` (`capture/frames.rs`, 2026-11-14, untested on
+  hardware): the pipeline ends in NV12 frames (`fakesink` handoff) for an app-supplied
+  `FrameEncoder` (the desktop's NVENC SDK encoder — reference-frame invalidation via
+  `WaylandCapture::request_rfi`), built on the first frame; on failure / no frame in 4 s the
+  gst-encoder pipeline runs on the same portal session. If the in-process
   GStreamer lacks an element of the pipeline, the same description runs under the system
   `gst-launch-1.0` (fd inherited; no live controls, `is_in_process() == false`);
   `use_system_gst_env` strips an AppImage's bundled-GStreamer env (incl. `$APPDIR` entries of

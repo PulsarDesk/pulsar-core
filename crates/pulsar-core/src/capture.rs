@@ -17,8 +17,16 @@
 //! but a picture instead of a black screen. The caller can also force it (`system_gst`):
 //! the element exists in-process but can't open the hardware (the AppImage's 1.20 NVENC
 //! plugin on a newer NVIDIA driver) while the system plugin can.
+//!
+//! Raw frames ([`start_with_frames`], `frames.rs`): the app can hand in its own encoder
+//! (the desktop's NVENC SDK encoder, which can invalidate reference frames); the pipeline then
+//! ends in NV12 frames for it instead of a gst encoder, and falls back to the gst encoder
+//! pipeline on the same portal session when that encoder cannot be built.
 
 #![cfg(target_os = "linux")]
+
+mod frames;
+pub use frames::{FrameEncoder, FrameEncoderFactory, RawFrame};
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,20 +89,32 @@ enum Backend {
 		venc: Option<gst::Element>,
 	},
 	Child(std::sync::Mutex<std::process::Child>),
+	/// The raw-frame pipeline feeding the app's encoder (`frames.rs`).
+	Frames {
+		pipeline: gst::Pipeline,
+		slot: Arc<frames::Slot>,
+	},
 }
 
 impl Backend {
 	fn venc(&self) -> Option<&gst::Element> {
 		match self {
 			Backend::InProcess { venc, .. } => venc.as_ref(),
-			Backend::Child(_) => None,
+			Backend::Child(_) | Backend::Frames { .. } => None,
+		}
+	}
+
+	fn frames(&self) -> Option<&frames::Slot> {
+		match self {
+			Backend::Frames { slot, .. } => Some(slot),
+			_ => None,
 		}
 	}
 
 	/// Tear the pipeline down. Runs BEFORE the portal session closes (see `gst.rs`).
 	fn shutdown(&self) {
 		match self {
-			Backend::InProcess { pipeline, .. } => {
+			Backend::InProcess { pipeline, .. } | Backend::Frames { pipeline, .. } => {
 				let _ = pipeline.set_state(gst::State::Null);
 			}
 			Backend::Child(child) => {
@@ -110,7 +130,7 @@ impl WaylandCapture {
 	/// Whether the pipeline is still running (no bus error / EOS seen, child not exited).
 	pub fn is_alive(&self) -> bool {
 		match &self.backend {
-			Backend::InProcess { .. } => !self.dead.load(Ordering::Relaxed),
+			Backend::InProcess { .. } | Backend::Frames { .. } => !self.dead.load(Ordering::Relaxed),
 			Backend::Child(child) => matches!(
 				child.lock().unwrap_or_else(|e| e.into_inner()).try_wait(),
 				Ok(None)
@@ -121,7 +141,18 @@ impl WaylandCapture {
 	/// Whether the encoder can be driven live (`false` on the `gst-launch-1.0` fallback:
 	/// a bitrate change then needs a pipeline restart).
 	pub fn is_in_process(&self) -> bool {
-		matches!(self.backend, Backend::InProcess { .. })
+		matches!(self.backend, Backend::InProcess { .. } | Backend::Frames { .. })
+	}
+
+	/// Whether the app's own encoder (raw frames) runs this capture, not a gst encoder.
+	pub fn is_raw_frames(&self) -> bool {
+		matches!(self.backend, Backend::Frames { .. })
+	}
+
+	/// Reference-frame invalidation for the lost RTP packets `first..=last` — only the app's
+	/// raw-frame encoder can (`false` on a gst encoder, or when it declined).
+	pub fn request_rfi(&self, first: u16, last: u16) -> bool {
+		self.backend.frames().and_then(|s| s.with(|e| e.request_rfi(first, last))).unwrap_or(false)
 	}
 
 	/// Change the encoder's target bitrate (kbit/s) **live** — no restart. Handles the
@@ -129,6 +160,9 @@ impl WaylandCapture {
 	/// (`bitrate` in kbit/s on x264enc / vaapih26xenc / nvh26xenc, `bps` in bit/s on the
 	/// Rockchip mpp encoders). `false` when the element has no such property.
 	pub fn set_bitrate(&self, kbps: u32) -> bool {
+		if let Some(slot) = self.backend.frames() {
+			return slot.with(|e| e.set_bitrate(kbps.max(1))).unwrap_or(false);
+		}
 		let Some(enc) = self.backend.venc() else { return false };
 		if enc.find_property("bitrate").is_some() {
 			enc.set_property_from_str("bitrate", &kbps.max(1).to_string());
@@ -144,6 +178,9 @@ impl WaylandCapture {
 	/// Force the next frame to be a keyframe (a client keyframe request after an
 	/// unrepaired loss) — an upstream force-key-unit event into the encoder.
 	pub fn request_keyframe(&self) -> bool {
+		if let Some(slot) = self.backend.frames() {
+			return slot.with(|e| e.request_keyframe()).is_some();
+		}
 		let Some(enc) = self.backend.venc() else { return false };
 		let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
 			.all_headers(true)
@@ -252,7 +289,7 @@ pub async fn start(
 	restore_token: Option<String>,
 	system_gst: bool,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
-	start_with(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen).await
+	start_inner(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, None).await
 }
 
 /// [`start`] for a chosen [`Source`] (the restore token is of that source's kind).
@@ -263,6 +300,33 @@ pub async fn start_with(
 	restore_token: Option<String>,
 	system_gst: bool,
 	source: Source,
+) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	start_inner(ip, port, encoder_fragment, restore_token, system_gst, source, None).await
+}
+
+/// [`start`], but first try the app's own encoder on raw NV12 frames (`frames`, see
+/// `frames.rs`); when it cannot be built (or the frames never come) the gst-encoder pipeline
+/// (`encoder_fragment` to `ip:port`) runs on the same portal session, exactly as `start`.
+/// Screen casts only (a window cast keeps the gst pipeline, which scales it into its box).
+pub async fn start_with_frames(
+	ip: &str,
+	port: u16,
+	encoder_fragment: &str,
+	restore_token: Option<String>,
+	system_gst: bool,
+	frames: Option<FrameEncoderFactory>,
+) -> anyhow::Result<(WaylandCapture, Option<String>)> {
+	start_inner(ip, port, encoder_fragment, restore_token, system_gst, Source::Screen, frames).await
+}
+
+async fn start_inner(
+	ip: &str,
+	port: u16,
+	encoder_fragment: &str,
+	restore_token: Option<String>,
+	system_gst: bool,
+	source: Source,
+	frames: Option<FrameEncoderFactory>,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
 	let window = matches!(source, Source::Window { .. });
 	// Fixed output size for a window cast: the window's aspect fitted into `max` once the
@@ -312,6 +376,35 @@ pub async fn start_with(
 		tracing::info!(?r, ?region, "wayland pointer region");
 		region
 	});
+
+	// The app's own encoder on raw frames first (in-process GStreamer only, screen casts).
+	if let Some(factory) = frames.filter(|_| !window && gst::init().is_ok() && missing_elements(&frames::pipeline_desc(0, 0)).is_empty()) {
+		let dead = Arc::new(AtomicBool::new(false));
+		match frames::run(pw_fd.as_raw_fd(), node_id, factory, dead.clone()).await {
+			Ok((pipeline, slot)) => {
+				let session = guard.0.take().expect("session present on success");
+				let short_gop = Arc::new(AtomicBool::new(false));
+				let stopped = Arc::new(AtomicBool::new(false));
+				spawn_watchers(&pipeline, None, dead.clone(), short_gop.clone(), stopped.clone());
+				spawn_frames_short_gop(slot.clone(), dead.clone(), short_gop.clone(), stopped.clone());
+				tracing::info!("wayland capture on the app's raw-frame encoder");
+				return Ok((
+					WaylandCapture {
+						backend: Backend::Frames { pipeline, slot },
+						session: Some(session),
+						_pw_fd: pw_fd,
+						dead,
+						short_gop,
+						stopped,
+						pointer_region,
+						stream_rect: stream_rect.map(|r| (r.x, r.y, r.w, r.h)),
+					},
+					token,
+				));
+			}
+			Err(e) => tracing::warn!("raw-frame encoder unavailable, using the gst encoder pipeline: {e}"),
+		}
+	}
 
 	// The PipeWire node can lag the portal reply by a moment: retry the pipeline start a
 	// few times before giving up (each attempt tears its pipeline down cleanly).
@@ -745,6 +838,27 @@ async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::
 		));
 	}
 	Ok((pipeline, venc))
+}
+
+/// The short-GOP timer of a raw-frame capture: a keyframe request to the app's encoder every
+/// 500 ms while recovery mode is on (the gst path sends force-key-unit events instead).
+fn spawn_frames_short_gop(
+	slot: Arc<frames::Slot>,
+	dead: Arc<AtomicBool>,
+	short_gop: Arc<AtomicBool>,
+	stopped: Arc<AtomicBool>,
+) {
+	let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+	handle.spawn(async move {
+		let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+		tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+		while !stopped.load(Ordering::Relaxed) {
+			tick.tick().await;
+			if short_gop.load(Ordering::Relaxed) && !dead.load(Ordering::Relaxed) {
+				slot.with(|e| e.request_keyframe());
+			}
+		}
+	});
 }
 
 /// Helper tasks for a running pipeline: (1) drain the bus and flag errors / EOS, (2) the
