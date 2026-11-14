@@ -16,7 +16,8 @@
 //! event stream to post into.)
 
 use core_graphics::event::{
-	CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
+	CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+	ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -137,6 +138,17 @@ fn evdev_to_vk(code: u32) -> Option<u16> {
 		// 127 Context Menu — no macOS equivalent
 		_ => return None,
 	})
+}
+
+/// Stamped into `kCGEventSourceUserData` of every event this backend posts, so a listener
+/// (the host's "local user took the mouse" watch, `local_pointer_macos`) can tell Pulsar's own
+/// injected input from the person at the host. ASCII "PULS".
+pub(crate) const INJECTED_TAG: i64 = 0x5055_4C53;
+
+/// Post one synthetic event at the HID tap, tagged as Pulsar's own ([`INJECTED_TAG`]).
+fn post(ev: &CGEvent) {
+	ev.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_TAG);
+	ev.post(CGEventTapLocation::HID);
 }
 
 /// Modifier evdev codes → the CGEventFlags bit they assert. Used to rebuild the
@@ -312,7 +324,7 @@ impl DesktopInput {
 		};
 		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, btn).ok()) {
 			ev.set_flags(self.flags);
-			ev.post(CGEventTapLocation::HID);
+			post(&ev);
 		}
 	}
 
@@ -379,7 +391,7 @@ impl DesktopInput {
 			Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
 		{
 			ev.set_flags(self.flags);
-			ev.post(CGEventTapLocation::HID);
+			post(&ev);
 		}
 	}
 
@@ -402,7 +414,7 @@ impl DesktopInput {
 		if let Some(ev) = Self::source()
 			.and_then(|s| CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, -v, -h, 0).ok())
 		{
-			ev.post(CGEventTapLocation::HID);
+			post(&ev);
 		}
 	}
 
@@ -448,7 +460,7 @@ impl DesktopInput {
 		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, down).ok())
 		{
 			ev.set_flags(self.flags);
-			ev.post(CGEventTapLocation::HID);
+			post(&ev);
 		}
 	}
 
@@ -470,7 +482,7 @@ impl DesktopInput {
 				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, 0, down).ok())
 			{
 				ev.set_string_from_utf16_unchecked(units);
-				ev.post(CGEventTapLocation::HID);
+				post(&ev);
 			}
 		}
 	}
@@ -493,7 +505,7 @@ impl DesktopInput {
 			if let Some(ev) =
 				Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
 			{
-				ev.post(CGEventTapLocation::HID);
+				post(&ev);
 			}
 		}
 		self.held_buttons.clear();
@@ -507,7 +519,7 @@ impl DesktopInput {
 			if let Some(ev) =
 				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, false).ok())
 			{
-				ev.post(CGEventTapLocation::HID);
+				post(&ev);
 			}
 		}
 		self.held_keys.clear();
