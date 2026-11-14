@@ -54,7 +54,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `NetworkMode`; `relay_keys` holds the access key each relay issued this device.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
   ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, per-window `PostMessage`
-  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
+  (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. `input/pen_touch/` = pen + multi-touch:
+  wire state types (`PenState`, `TouchFrame` — `InputEvent::Pen` / `Touch`, host features
+  `FEAT_PEN` / `FEAT_TOUCH`), the host `Driver` (sanitize, slot tracking, 1 s silence lift,
+  keep-alive refresh) on a worker thread (`PenTouch`) feeding a platform `Sink` — Windows
+  synthetic pointer devices (`CreateSyntheticPointerDevice`, resolved at run time), Linux uinput
+  tablet + multitouch type B, macOS CGEvent tablet events for the pen and touch-as-mouse
+  (`mouse::TouchMouse`; macOS has no public touch injection) — plus the client gate
+  `client::ClientPenTouch` (feature check, mouse fallback for old hosts, 250 ms keep-alive,
+  30 s stale lift). `DesktopInput::pen` / `touch` on every platform (no-ops in the stub).
+  Untested on pen / touch hardware. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
