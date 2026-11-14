@@ -420,6 +420,12 @@ pub const FEAT_FEC_RS: &str = "fec_rs";
 /// Feature id: the host injects real pinch gestures (`InputEvent::Pinch`) instead of the
 /// client's Ctrl + wheel fallback.
 pub const FEAT_PINCH: &str = "pinch";
+/// Feature id: the host injects real pen input (`InputEvent::Pen`: pressure, tilt, eraser,
+/// barrel button, hover) instead of the client's mouse fallback.
+pub const FEAT_PEN: &str = "pen";
+/// Feature id: the host takes multi-touch frames (`InputEvent::Touch`) — injected as real
+/// touch on Windows / Linux, mapped to mouse + scroll on macOS (no public touch injection).
+pub const FEAT_TOUCH: &str = "touch";
 /// Feature id: the host recovers a lost frame by reference-frame invalidation
 /// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
 /// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.

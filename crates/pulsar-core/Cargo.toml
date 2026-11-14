@@ -63,6 +63,8 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 windows-sys = { version = "0.61", features = [
 	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_UI_Input_Pointer", # InjectTouchInput: real two-finger pinch on the host
+	# input/pen_touch/windows.rs: synthetic pointer devices (pen + multi-touch injection).
+	"Win32_UI_Controls",
 	"Win32_UI_Input_XboxController", # vigem.rs: find a virtual pad's real XInput slot (co-op)
 	"Win32_UI_WindowsAndMessaging",
 	"Win32_Foundation",

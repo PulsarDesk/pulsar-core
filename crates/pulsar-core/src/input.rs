@@ -16,6 +16,11 @@ mod types;
 /// DualSense passthrough (triggers, HD haptics, speaker/mic) — see `docs/dualsense.md`.
 pub mod ds5;
 
+/// Pen (stylus) and multi-touch: wire state types, the host injectors (Windows synthetic
+/// pointer devices, Linux uinput tablet + multitouch, macOS CGEvent tablet / touch-as-mouse)
+/// and the client-side gate + mouse fallback.
+pub mod pen_touch;
+
 pub use types::{
 	axis_to_i16, button, create_virtual_pad, create_virtual_pad_target, ds4_report_fields,
 	touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo,
