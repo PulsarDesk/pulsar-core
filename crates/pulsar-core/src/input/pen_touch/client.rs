@@ -22,6 +22,12 @@ pub const FALLBACK_SCROLL_PX: f32 = 1500.0;
 /// a lift) — the keep-alive stops and the pen / fingers are lifted on the host.
 pub const STALE: Duration = Duration::from_secs(30);
 
+/// The same for a pen that only hovers (in range, no contact): a webview that never
+/// delivers `pointerleave` when the pen leaves proximity would otherwise hold the host pen
+/// "in range" — and its cursor pinned against the host user's mouse — for [`STALE`].
+/// A hovering pen moves constantly, so a short limit costs nothing.
+pub const STALE_HOVER: Duration = Duration::from_millis(2500);
+
 pub struct ClientPenTouch {
 	host_pen: bool,
 	host_touch: bool,
@@ -103,7 +109,8 @@ impl ClientPenTouch {
 	/// Keep-alive re-sends and the fallback's hold timer. Call every ~50-100 ms.
 	pub fn tick(&mut self, now: Instant) -> Vec<InputEvent> {
 		let mut out = Vec::new();
-		if self.host_pen && self.pen.in_range && now.duration_since(self.pen_input) >= STALE {
+		let pen_stale = if self.pen.contact { STALE } else { STALE_HOVER };
+		if self.host_pen && self.pen.in_range && now.duration_since(self.pen_input) >= pen_stale {
 			let lift = PenState { x: self.pen.x, y: self.pen.y, ..Default::default() };
 			out.extend(self.on_event(now, InputEvent::Pen(lift)));
 		}
@@ -172,6 +179,23 @@ mod tests {
 		}
 		assert_eq!(c.tick(t + STALE), vec![InputEvent::Touch(TouchFrame::default())]);
 		assert!(c.tick(t + STALE + KEEPALIVE).is_empty());
+	}
+
+	#[test]
+	fn a_hover_that_went_quiet_is_lifted_after_the_short_limit() {
+		let t = Instant::now();
+		let mut c = ClientPenTouch::new(true, false, t);
+		let hover = PenState { x: 0.5, y: 0.5, in_range: true, ..Default::default() };
+		c.on_event(t, InputEvent::Pen(hover));
+		assert_eq!(c.tick(t + KEEPALIVE), vec![InputEvent::Pen(hover)]);
+		let out = c.tick(t + STALE_HOVER);
+		assert_eq!(out, vec![InputEvent::Pen(PenState { x: 0.5, y: 0.5, ..Default::default() })]);
+		assert!(c.tick(t + STALE_HOVER + KEEPALIVE).is_empty());
+		// In contact the long limit applies.
+		let tip = PenState { contact: true, pressure: 0.5, ..hover };
+		let t2 = t + Duration::from_secs(10);
+		c.on_event(t2, InputEvent::Pen(tip));
+		assert_eq!(c.tick(t2 + STALE_HOVER), vec![InputEvent::Pen(tip)]);
 	}
 
 	#[test]
