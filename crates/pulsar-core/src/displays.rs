@@ -61,6 +61,19 @@ pub fn list() -> Vec<Monitor> {
 	}
 }
 
+/// How many monitors [`list`] would return, without names / modes (macOS: the active
+/// display count; elsewhere the full list's length).
+pub fn count() -> usize {
+	#[cfg(target_os = "macos")]
+	{
+		core_graphics::display::CGDisplay::active_displays().map(|d| d.len()).unwrap_or(0)
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		list().len()
+	}
+}
+
 /// The platform id ([`Monitor::id`]) of the monitor at `idx` in [`list`], without the full
 /// enumeration (names, modes) — the input path resolves the streamed monitor with it. macOS
 /// only (the `CGDirectDisplayID`); `None` elsewhere or when `idx` is out of range.
