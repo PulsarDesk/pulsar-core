@@ -426,6 +426,9 @@ pub const FEAT_PEN: &str = "pen";
 /// Feature id: the host takes multi-touch frames (`InputEvent::Touch`) — injected as real
 /// touch on Windows / Linux, mapped to mouse + scroll on macOS (no public touch injection).
 pub const FEAT_TOUCH: &str = "touch";
+/// Feature id: the host performs 3 / 4-finger touchpad gestures (`InputEvent::Gesture`) as
+/// its own OS defines them (`input::gesture::HostGestures`).
+pub const FEAT_GESTURE: &str = "gesture";
 /// Feature id: the host recovers a lost frame by reference-frame invalidation
 /// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
 /// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.

@@ -109,6 +109,7 @@ pub(crate) fn is_extended_vk(vk: u16) -> bool {
 			| 0x6F // VK_DIVIDE
 			| 0x90 // VK_NUMLOCK
 			| 0x2C // VK_SNAPSHOT
+			| 0xAD..=0xB3 // volume mute/down/up, next/prev track, stop, play/pause (E0 scan codes)
 	)
 }
 
@@ -204,6 +205,13 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 		125 => 0x5B, // Left Win
 		126 => 0x5C, // Right Win
 		127 => 0x5D, // Context Menu (VK_APPS)
+		// Media keys (touchpad gestures' "change audio and volume", play/pause tap).
+		113 => 0xAD, // Mute        (VK_VOLUME_MUTE)
+		114 => 0xAE, // Volume Down (VK_VOLUME_DOWN)
+		115 => 0xAF, // Volume Up   (VK_VOLUME_UP)
+		163 => 0xB0, // Next track  (VK_MEDIA_NEXT_TRACK)
+		164 => 0xB3, // Play/Pause  (VK_MEDIA_PLAY_PAUSE)
+		165 => 0xB1, // Prev track  (VK_MEDIA_PREV_TRACK)
 		_ => return None,
 	})
 }

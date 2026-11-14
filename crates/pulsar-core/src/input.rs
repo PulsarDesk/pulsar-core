@@ -21,6 +21,10 @@ pub mod ds5;
 /// and the client-side gate + mouse fallback.
 pub mod pen_touch;
 
+/// Multi-finger touchpad gestures: the wire kind and the host's per-OS action (what the host
+/// user configured for the gesture — Windows registry, macOS trackpad prefs, GNOME / KDE).
+pub mod gesture;
+
 /// macOS host: the display behind an avfoundation capture device (pointer / pen geometry).
 pub mod avf_screens;
 

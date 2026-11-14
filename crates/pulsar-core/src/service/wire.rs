@@ -92,6 +92,13 @@ pub enum InputEvent {
 	/// Sent only to hosts that advertise [`FEAT_TOUCH`](crate::service::media::FEAT_TOUCH);
 	/// others get the touch as mouse events (tap = click, drag, two-finger scroll).
 	Touch(crate::input::pen_touch::TouchFrame),
+	/// A 3- or 4-finger touchpad gesture the client recognised (swipe or tap). The host does
+	/// what ITS user configured for that gesture ([`crate::input::gesture::HostGestures`]):
+	/// Windows reads the precision-touchpad settings, macOS the trackpad prefs, Linux the
+	/// GNOME / KDE defaults. Additive new->new variant: sent only to hosts that advertise
+	/// [`FEAT_GESTURE`](crate::service::media::FEAT_GESTURE) (old hosts drop an unknown
+	/// variant anyway); other hosts get nothing.
+	Gesture { fingers: u8, kind: crate::input::gesture::GestureKind },
 }
 
 /// How the client wants the host to bias the encode: minimize latency, balance,
@@ -1433,6 +1440,25 @@ mod tests {
 		#[allow(dead_code)]
 		enum OldInputEvent {
 			PointerMotion { x: f64, y: f64 },
+		}
+		assert!(serde_json::from_str::<OldInputEvent>(&json).is_err());
+	}
+
+	/// Touchpad gestures: literal JSON form locked; an old host rejects (drops) them.
+	#[test]
+	fn gesture_wire_form() {
+		use crate::input::gesture::GestureKind;
+		let ev = InputEvent::Gesture { fingers: 3, kind: GestureKind::SwipeDown };
+		let json = serde_json::to_string(&ev).unwrap();
+		assert_eq!(json, r#"{"Gesture":{"fingers":3,"kind":"SwipeDown"}}"#);
+		assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), ev);
+		let tap: InputEvent = serde_json::from_str(r#"{"Gesture":{"fingers":4,"kind":"Tap"}}"#).unwrap();
+		assert_eq!(tap, InputEvent::Gesture { fingers: 4, kind: GestureKind::Tap });
+		#[derive(serde::Deserialize)]
+		#[allow(dead_code)]
+		enum OldInputEvent {
+			PointerMotion { x: f64, y: f64 },
+			Pinch { phase: u8, scale: f64 },
 		}
 		assert!(serde_json::from_str::<OldInputEvent>(&json).is_err());
 	}
