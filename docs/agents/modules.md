@@ -73,9 +73,20 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   system gst). `self_check(fragment)` = headless in-process encode test (desktop `--selftest`).
   gst VA-API = two families, one wire id `vaapi`: `Vaapi` (gstreamer-vaapi, `vaapih264enc`)
   and `Va` (gst-plugins-bad `va`, `vah264enc`, what gst ≥1.26 distros ship).
+- `macos_capture/` — **macOS ScreenCaptureKit capture** (2026-11-14, untested on macOS
+  hardware): `sck::ScStream` (one display: NV12 frames with the cursor at the client's fps,
+  and/or the system audio without this process — macOS 13+), `displays()` (main first = the
+  host's display index), `screen_capture_access(prompt)` (TCC Screen Recording). ScreenCaptureKit
+  is **dlopen'ed, never linked** (objc2 runtime only, no objc2-* framework crates — they link
+  strongly and the app would not start on macOS < 12.3); newer constants via `dlsym`.
+  `pcm.rs` (planar → interleaved stereo) is pure and tested everywhere. The encoder that eats
+  the frames is in the desktop app (`pulsar-capture/src/mac/vt.rs`, VideoToolbox).
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
-  force-mutes the captured endpoint), endpoint redirect sinks.
+  force-mutes the captured endpoint), endpoint redirect sinks. macOS: `sck_loopback.rs`
+  (`run_system_audio_capture`, the system mix via ScreenCaptureKit — the counterpart of the
+  Windows process loopback in `Exclude` mode); `Config::audio_loopback()` = "system mix" on
+  Windows and macOS when no device is named.
 - `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC.
 - `service/` — the app protocol over the encrypted session: OTP auth (non-empty
   passwords via **SPAKE2 PAKE** in `service/pake.rs`, MAC'd over the channel binding —
