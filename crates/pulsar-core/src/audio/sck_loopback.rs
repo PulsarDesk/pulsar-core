@@ -65,8 +65,18 @@ fn macos_13_or_newer() -> bool {
 /// Silence is written after this long without a buffer from SCK, so the encoder's timeline
 /// keeps moving while nothing plays (SCK may stop sending buffers then).
 const IDLE_FILL_AFTER: Duration = Duration::from_millis(60);
-/// Silence is written in steps of this many frames (10 ms).
-const FILL_FRAMES: usize = 480;
+/// At most this many frames of silence go out in one write (100 ms at 48 kHz), so a long stall
+/// of this thread does not turn into one huge burst.
+const MAX_FILL_FRAMES: u64 = 4800;
+
+/// Frames of silence still owed `elapsed` after the idle fill began, when `written` frames of
+/// it went out already: the wall clock times the rate, minus what was written, capped at
+/// [`MAX_FILL_FRAMES`]. Based on the wall clock, so the silence keeps exact real-time pace
+/// however late the 10 ms loop wakes up.
+fn silence_frames_due(elapsed: Duration, written: u64, rate: u32) -> u64 {
+	let owed = (elapsed.as_nanos() * rate as u128 / 1_000_000_000) as u64;
+	owed.saturating_sub(written).min(MAX_FILL_FRAMES)
+}
 
 /// Capture the system mix (all apps but this one) and write 48 kHz stereo f32le PCM to `sink`
 /// until a write fails (the encoder retired / the pipe broke — a clean `Ok(())`) or the stream
@@ -101,10 +111,12 @@ pub fn run_system_audio_capture<W: Write>(mut sink: W, display_id: u32, started:
 		e => e.to_string(),
 	})?;
 	started();
-	let silence = vec![0u8; FILL_FRAMES * fmt.channels as usize * 4];
+	let frame_bytes = fmt.channels as usize * 4;
+	let silence = vec![0u8; MAX_FILL_FRAMES as usize * frame_bytes];
 	let mut bytes: Vec<u8> = Vec::with_capacity(8192);
 	let mut last_audio = Instant::now();
-	let mut last_fill = Instant::now();
+	// Frames of silence written since the current idle stretch began (reset by real audio).
+	let mut filled: u64 = 0;
 	let result = loop {
 		match rx.recv_timeout(Duration::from_millis(10)) {
 			Ok(Some(pcm)) => {
@@ -114,19 +126,44 @@ pub fn run_system_audio_capture<W: Write>(mut sink: W, display_id: u32, started:
 					break Ok(());
 				}
 				last_audio = Instant::now();
+				filled = 0;
 			}
 			Ok(None) => break Err("ScreenCaptureKit stopped the audio stream".to_string()),
 			Err(mpsc::RecvTimeoutError::Timeout) => {}
 			Err(mpsc::RecvTimeoutError::Disconnected) => break Err("audio stream ended".to_string()),
 		}
-		// Idle: keep the timeline moving with 10 ms of silence per 10 ms of wall clock.
-		if last_audio.elapsed() >= IDLE_FILL_AFTER && last_fill.elapsed() >= Duration::from_millis(10) {
-			if sink.write_all(&silence).is_err() {
-				break Ok(());
+		// Idle: keep the timeline moving with silence at the wall clock's pace, counted from
+		// the moment the idle fill began (the first IDLE_FILL_AFTER of a gap is not filled, so
+		// a short pause between SCK buffers never doubles up with the real audio).
+		let idle = last_audio.elapsed();
+		if idle >= IDLE_FILL_AFTER {
+			let due = silence_frames_due(idle - IDLE_FILL_AFTER, filled, fmt.rate);
+			if due > 0 {
+				if sink.write_all(&silence[..due as usize * frame_bytes]).is_err() {
+					break Ok(());
+				}
+				filled += due;
 			}
-			last_fill = Instant::now();
 		}
 	};
 	stream.stop();
 	result
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn silence_follows_the_wall_clock() {
+		// 10 ms at 48 kHz = 480 frames owed, none written yet.
+		assert_eq!(silence_frames_due(Duration::from_millis(10), 0, 48_000), 480);
+		// A late wake-up (25 ms) after 480 frames: the missing 720 go out now, no drift.
+		assert_eq!(silence_frames_due(Duration::from_millis(25), 480, 48_000), 720);
+		// Already ahead (or exactly on time): nothing owed.
+		assert_eq!(silence_frames_due(Duration::from_millis(10), 480, 48_000), 0);
+		assert_eq!(silence_frames_due(Duration::from_millis(5), 480, 48_000), 0);
+		// A long stall is capped per write; the rest follows on the next loop turns.
+		assert_eq!(silence_frames_due(Duration::from_secs(2), 0, 48_000), MAX_FILL_FRAMES);
+	}
 }

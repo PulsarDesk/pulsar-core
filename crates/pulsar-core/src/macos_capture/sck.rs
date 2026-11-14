@@ -12,14 +12,15 @@
 //! Untested on macOS hardware.
 
 use std::ffi::{c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, Sel};
-use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass};
+use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, NSObject, Sel};
+use objc2::{define_class, msg_send, sel, AllocAnyThread, ClassType, DefinedClass};
 
 use super::ffi;
 use super::pcm;
@@ -155,7 +156,9 @@ pub fn screen_capture_access(prompt: bool) -> bool {
 /// The video side of a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoSpec {
-	/// Output size in pixels (SCK scales the display into it, keeping the aspect ratio).
+	/// Output size in pixels. SCK stretches the display to exactly this size (the aspect ratio
+	/// is not kept, like the ffmpeg path), so normalized pointer positions map onto the whole
+	/// display.
 	pub width: u32,
 	pub height: u32,
 	/// Highest frame rate delivered (`minimumFrameInterval` = 1/fps). SCK only sends a frame
@@ -240,6 +243,10 @@ pub struct OutputIvars {
 	status_key: ffi::CFStringRef,
 	/// Scratch buffers of the audio path (only the dispatch queue touches them).
 	scratch: Mutex<(Vec<f32>, Vec<f32>)>,
+	/// Set after the first video / audio sample has been logged (so the first run on a Mac
+	/// shows whether SCK calls back at all).
+	seen_video: AtomicBool,
+	seen_audio: AtomicBool,
 }
 
 // SAFETY: `status_key` is an immutable CFString constant; the rest is Send + Sync.
@@ -284,9 +291,40 @@ define_class!(
 
 impl ScOutput {
 	fn new(ivars: OutputIvars) -> Retained<Self> {
+		declare_protocols(Self::class());
 		let this = Self::alloc().set_ivars(ivars);
 		// SAFETY: NSObject's designated initializer.
 		unsafe { msg_send![super(this), init] }
+	}
+}
+
+/// Mark the output class as conforming to `SCStreamOutput` and `SCStreamDelegate`, so a
+/// `conformsToProtocol:` check inside SCK answers yes. The protocols are looked up at run time
+/// (ScreenCaptureKit is loaded with dlopen); a protocol the runtime does not know is skipped.
+fn declare_protocols(cls: &'static AnyClass) {
+	static ONCE: Once = Once::new();
+	ONCE.call_once(|| {
+		for name in [c"SCStreamOutput", c"SCStreamDelegate"] {
+			match AnyProtocol::get(name) {
+				Some(proto) => {
+					// SAFETY: adding a protocol to a registered class is allowed at any time;
+					// the class implements the protocol's (optional) methods it needs.
+					unsafe {
+						if !objc2::ffi::class_conformsToProtocol(cls, proto).as_bool() {
+							objc2::ffi::class_addProtocol(cls as *const AnyClass as *mut AnyClass, proto);
+						}
+					}
+				}
+				None => tracing::debug!(protocol = ?name, "ScreenCaptureKit protocol not in the runtime"),
+			}
+		}
+	});
+}
+
+/// Log once per stream that the first sample of a kind arrived.
+fn note_first(flag: &AtomicBool, kind: &str) {
+	if !flag.swap(true, Ordering::Relaxed) {
+		tracing::info!(kind, "ScreenCaptureKit: first sample arrived");
 	}
 }
 
@@ -295,6 +333,7 @@ unsafe fn on_video_sample(iv: &OutputIvars, sample: *mut c_void) {
 	if sample.is_null() || ffi::CMSampleBufferIsValid(sample) == 0 {
 		return;
 	}
+	note_first(&iv.seen_video, "video");
 	// Only "complete" frames carry new content; idle/blank ones have no image buffer.
 	let atts = ffi::CMSampleBufferGetSampleAttachmentsArray(sample, 0);
 	if !atts.is_null() && ffi::CFArrayGetCount(atts) > 0 && !iv.status_key.is_null() {
@@ -317,6 +356,7 @@ unsafe fn on_audio_sample(iv: &OutputIvars, sample: *mut c_void) {
 	if sample.is_null() || ffi::CMSampleBufferIsValid(sample) == 0 || ffi::CMSampleBufferDataIsReady(sample) == 0 {
 		return;
 	}
+	note_first(&iv.seen_audio, "audio");
 	let desc = ffi::CMSampleBufferGetFormatDescription(sample);
 	if desc.is_null() {
 		return;
@@ -538,6 +578,13 @@ impl ScStream {
 			};
 			let _: () = msg_send![&*cfg, setWidth: w as usize];
 			let _: () = msg_send![&*cfg, setHeight: h as usize];
+			// macOS 14+ keeps the display's aspect ratio by default and letterboxes it inside
+			// width × height. The output size is clamped per axis (policy::output_size), and the
+			// pointer maps normalized positions onto the whole display, so stretch instead (what
+			// the ffmpeg avfoundation path does). Older macOS always stretches.
+			if responds(&cfg, sel!(setPreservesAspectRatio:)) {
+				let _: () = msg_send![&*cfg, setPreservesAspectRatio: Bool::NO];
+			}
 			let _: () = msg_send![&*cfg, setMinimumFrameInterval: ffi::CMTime::new(1, fps as i32)];
 			let _: () = msg_send![&*cfg, setPixelFormat: ffi::PIXEL_FORMAT_NV12_VIDEO];
 			let _: () = msg_send![&*cfg, setShowsCursor: Bool::new(cursor)];
@@ -559,6 +606,8 @@ impl ScStream {
 				on_stop,
 				status_key: ffi::cf_string_const(c"SCStreamFrameInfoStatus").unwrap_or(std::ptr::null()),
 				scratch: Mutex::new((Vec::new(), Vec::new())),
+				seen_video: AtomicBool::new(false),
+				seen_audio: AtomicBool::new(false),
 			});
 			// The object lives on the heap until `ScStream` drops it; SCK retains it too.
 			let out_ptr: *const AnyObject = Retained::as_ptr(&output).cast::<AnyObject>();

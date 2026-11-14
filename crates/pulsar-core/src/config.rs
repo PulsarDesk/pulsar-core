@@ -272,7 +272,10 @@ impl Config {
 	/// override resolves to the platform default.
 	pub fn audio_input(&self) -> crate::audio::AudioInput {
 		let dev = self.audio_input.trim();
-		if dev.is_empty() {
+		// A system-mix sentinel is no device name: when the native system-mix capture cannot
+		// start, the ffmpeg fallback takes the OS default instead of `Dshow("system")` (no
+		// such device) or `AvFoundation(0)` (usually the microphone).
+		if is_system_mix_choice(dev) {
 			crate::audio::AudioInput::default_for_os()
 		} else if cfg!(windows) {
 			crate::audio::AudioInput::Dshow(dev.to_string())
@@ -497,6 +500,16 @@ mod tests {
 		assert!(!is_system_mix_choice("0"));
 		let c = Config::default();
 		assert_eq!(c.audio_loopback(), cfg!(any(windows, target_os = "macos")));
+	}
+
+	#[test]
+	fn system_mix_sentinel_falls_back_to_the_os_default_input() {
+		for dev in ["", "system", "Loopback", "wasapi"] {
+			let c = Config { audio_input: dev.to_string(), ..Config::default() };
+			assert_eq!(c.audio_input(), crate::audio::AudioInput::default_for_os(), "{dev:?}");
+		}
+		let named = Config { audio_input: "Stereo Mix".to_string(), ..Config::default() };
+		assert_ne!(named.audio_input(), crate::audio::AudioInput::default_for_os());
 	}
 
 	#[test]
