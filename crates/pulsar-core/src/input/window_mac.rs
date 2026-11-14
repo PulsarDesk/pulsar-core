@@ -40,12 +40,14 @@ use core_graphics::event::{
 	ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use core_graphics::display::CGDisplay;
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::window::{
 	copy_window_info, kCGWindowBounds, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
 	kCGWindowListOptionIncludingWindow, kCGWindowListOptionOnScreenOnly, kCGWindowNumber,
 	kCGWindowOwnerPID, CGWindowID,
 };
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -90,14 +92,59 @@ fn window_info(id: CGWindowID) -> Option<WinInfo> {
 	ok.then_some(WinInfo { pid, bounds })
 }
 
-/// The front-most normal (layer 0) on-screen window — CGWindowList returns
-/// on-screen windows front to back.
-fn front_window() -> Option<i64> {
+/// The pid of the frontmost (active) application, from `NSWorkspace`.
+fn frontmost_pid() -> Option<i32> {
+	use objc2_app_kit::NSWorkspace;
+	let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+	let pid = app.processIdentifier();
+	(pid > 0).then_some(pid)
+}
+
+/// The top normal (layer 0) on-screen window of process `pid` — CGWindowList returns
+/// on-screen windows front to back, so the first match is that app's front window.
+fn top_window_of(pid: i32) -> Option<i64> {
 	let arr = copy_window_info(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, 0)?;
 	dicts(&arr)
 		.into_iter()
-		.find(|d| dict_i64(d, unsafe { kCGWindowLayer }) == Some(0))
+		.find(|d| {
+			dict_i64(d, unsafe { kCGWindowLayer }) == Some(0)
+				&& dict_i64(d, unsafe { kCGWindowOwnerPID }) == Some(pid as i64)
+		})
 		.and_then(|d| dict_i64(&d, unsafe { kCGWindowNumber }))
+}
+
+/// Is window `id` (owned by `pid`) the key window of the active app? The active app
+/// must be `pid`, and `id` must be that app's top window. The first on-screen layer-0
+/// window alone is not enough: it can be a non-activating window of another app.
+fn is_front(id: CGWindowID, pid: i32) -> bool {
+	frontmost_pid() == Some(pid) && top_window_of(pid) == Some(id as i64)
+}
+
+/// Backing scale factor (pixels per point) of the display under `pt`; 1.0 if unknown.
+/// Client relative-mouse deltas are in host PIXELS (what the client sees in the stream),
+/// window coordinates here are POINTS, so a Retina host divides by 2.
+fn backing_scale_at(pt: CGPoint) -> f64 {
+	let id = CGDisplay::displays_with_point(pt, 1)
+		.ok()
+		.and_then(|(ids, n)| (n > 0).then(|| ids.first().copied()).flatten())
+		.unwrap_or_else(|| CGDisplay::main().id);
+	CGDisplay::new(id)
+		.display_mode()
+		.map(|m| (m.width(), m.pixel_width()))
+		.filter(|&(w, px)| w > 0 && px > 0)
+		.map_or(1.0, |(w, px)| px as f64 / w as f64)
+}
+
+/// One `CACHE_TTL`-cached boolean query.
+fn cached(slot: &Cell<Option<(Instant, bool)>>, query: impl FnOnce() -> bool) -> bool {
+	if let Some((t, v)) = slot.get() {
+		if t.elapsed() < CACHE_TTL {
+			return v;
+		}
+	}
+	let v = query();
+	slot.set(Some((Instant::now(), v)));
+	v
 }
 
 fn button_events(button: u8, down: bool) -> (CGMouseButton, CGEventType) {
@@ -116,8 +163,12 @@ pub struct WindowInput {
 	pid: i32,
 	bounds: CGRect,
 	bounds_at: Instant,
-	front: bool,
-	front_at: Option<Instant>,
+	/// Pixels per point of the window's display (refreshed with `bounds`).
+	scale: f64,
+	/// Cached `in_front` / `is_alive` answers and when they were read (see `CACHE_TTL`):
+	/// the host asks both on every input event, and each is a window-server query.
+	front: Cell<Option<(Instant, bool)>>,
+	alive: Cell<Option<(Instant, bool)>>,
 	/// Last pointer position in window-local points.
 	last_x: f64,
 	last_y: f64,
@@ -138,10 +189,11 @@ impl WindowInput {
 		Some(Self {
 			id,
 			pid: info.pid,
+			scale: backing_scale_at(info.bounds.origin),
 			bounds: info.bounds,
 			bounds_at: Instant::now(),
-			front: false,
-			front_at: None,
+			front: Cell::new(None),
+			alive: Cell::new(None),
 			last_x: 0.0,
 			last_y: 0.0,
 			held_buttons: HashSet::new(),
@@ -156,17 +208,14 @@ impl WindowInput {
 		CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()
 	}
 
+	/// Is the target window still alive? (Cached for `CACHE_TTL`.)
 	pub fn is_alive(&self) -> bool {
-		window_info(self.id).is_some()
+		cached(&self.alive, || window_info(self.id).is_some())
 	}
 
-	/// Is the target the front-most window? (Cached for `CACHE_TTL`.)
-	pub fn in_front(&mut self) -> bool {
-		if self.front_at.map_or(true, |t| t.elapsed() > CACHE_TTL) {
-			self.front = front_window() == Some(self.id as i64);
-			self.front_at = Some(Instant::now());
-		}
-		self.front
+	/// Is the target the key window of the active app? (Cached for `CACHE_TTL`.)
+	pub fn in_front(&self) -> bool {
+		cached(&self.front, || is_front(self.id, self.pid))
 	}
 
 	fn refresh_bounds(&mut self) {
@@ -174,6 +223,7 @@ impl WindowInput {
 			if let Some(i) = window_info(self.id) {
 				self.bounds = i.bounds;
 				self.pid = i.pid;
+				self.scale = backing_scale_at(i.bounds.origin);
 			}
 			self.bounds_at = Instant::now();
 		}
@@ -185,7 +235,7 @@ impl WindowInput {
 	}
 
 	/// Deliver one event: HID tap when the window is in front, else its process.
-	fn post(&mut self, ev: &CGEvent, mouse: bool) {
+	fn post(&self, ev: &CGEvent, mouse: bool) {
 		if mouse {
 			let id = self.id as i64;
 			ev.set_integer_value_field(EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER, id);
@@ -236,12 +286,13 @@ impl WindowInput {
 		self.post_move();
 	}
 
-	/// Advance the cached pointer by a raw delta (points).
+	/// Advance the cached pointer by a raw pixel delta (scaled to points).
 	pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
 		self.refresh_bounds();
+		let k = 1.0 / self.scale.max(1.0);
 		(self.last_x, self.last_y) = clamp_to_area(
-			self.last_x + dx,
-			self.last_y + dy,
+			self.last_x + dx * k,
+			self.last_y + dy * k,
 			self.bounds.size.width,
 			self.bounds.size.height,
 		);

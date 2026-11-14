@@ -140,6 +140,10 @@ windows-core = "0.62"
 # per-window co-op injector (input/window_mac.rs) posts into one process.
 core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
+# input/window_mac.rs: the frontmost application's pid (NSWorkspace) — the co-op injector
+# decides "is the target window in front" by owner pid + that pid's top window, since the
+# first on-screen layer-0 window can belong to a non-activating window of another app.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
 libc = "0.2"
 
