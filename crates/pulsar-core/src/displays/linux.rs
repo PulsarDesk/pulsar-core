@@ -153,6 +153,7 @@ fn to_monitor(o: &Out) -> Option<Monitor> {
 	let connector = if !o.connector.is_empty() { o.connector.clone() } else { o.xdg_name.clone() };
 	let description = if !o.description.is_empty() { o.description.clone() } else { o.xdg_description.clone() };
 	let make_model = format!("{} {}", o.make.trim(), o.model.trim()).trim().to_string();
+	let builtin = is_builtin_connector(&connector);
 	let name = if !description.trim().is_empty() {
 		description.trim().to_string()
 	} else if !make_model.is_empty() && !connector.is_empty() {
@@ -165,7 +166,6 @@ fn to_monitor(o: &Out) -> Option<Monitor> {
 		// No name at all: the app labels it in the UI language.
 		String::new()
 	};
-	let builtin = is_builtin_connector(&connector);
 	Some(Monitor {
 		name,
 		x,
