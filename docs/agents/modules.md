@@ -57,6 +57,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (co-op), macOS CGEvent, DS4/DS5 touchpad-as-mouse. **Controller *reading*
   moved to SDL3 in the desktop app — gilrs is gone** (ignore stale doc comments
   saying otherwise). macOS virtual pad = no-op stub.
+  **Touchpad pinch injection** (`DesktopInput::pinch`, `InputEvent::Pinch`, advertised by the
+  desktop host as `FEAT_PINCH`): Windows = two-finger touch injection (`windows.rs`); Linux =
+  a lazily created virtual uinput TOUCHPAD ("Pulsar Virtual Touchpad", `uinput.rs`) whose two
+  contacts a worker thread spreads/narrows at ~60 Hz so libinput reports a real pinch to the
+  app under the pointer (held ≥ 260 ms so it never reads as a two-finger tap; fingers lift
+  after 1.5 s of client silence); macOS = a trackpad magnify gesture posted with the window
+  server's private gesture event layout (`kCGSEventGesture` 29, fields 110/113/132 — the same
+  one Hammerspoon posts; `macos.rs`). Linux and macOS: **untested on hardware**.
 - `media.rs` — capture→encode→transport→decode traits + RLE software baseline
   **for tests only**. Real encoders live in the apps (see below).
 - `pipeline/` — **pure** ffmpeg/gst arg builders + `HwEncoder`/`VCodec`
