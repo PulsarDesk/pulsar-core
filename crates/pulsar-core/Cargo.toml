@@ -135,7 +135,10 @@ windows-core = "0.62"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
+# input/mac_hid.rs: dlopen/dlsym of the IOHIDUserDevice API (macOS 10.15+).
 libc = "0.2"
+# input/mac_hid.rs: the IOHIDUserDevice get/set-report + cancel handlers are Clang blocks.
+block2 = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }

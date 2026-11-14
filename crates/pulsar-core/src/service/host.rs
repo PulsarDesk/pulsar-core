@@ -329,7 +329,8 @@ pub async fn serve_with(
 				| DataMsg::CursorHidden
 				| DataMsg::PointerLock(_)
 				| DataMsg::HostPointer { .. }
-				| DataMsg::Displays(_) => {}
+				| DataMsg::Displays(_)
+				| DataMsg::PadUnavailable { .. } => {}
 				DataMsg::Rumble { .. } => {}
 				m @ (DataMsg::Ds5Caps { .. } | DataMsg::Ds5Feature { .. }) => (data.on_ds5)(m),
 				// host→client only; ignore if echoed back

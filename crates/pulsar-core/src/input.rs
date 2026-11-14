@@ -4,8 +4,8 @@
 //! (`gilrs` was removed; this crate only holds the shared types/normalization
 //! and the virtual-pad backends). The app normalizes them into a
 //! transport-friendly [`GamepadState`], and the **host** replays them through a
-//! [`VirtualGamepad`] backend (ViGEm on Windows, uinput on Linux, a no-op stub
-//! on macOS).
+//! [`VirtualGamepad`] backend (ViGEm on Windows, uinput on Linux, an
+//! `IOHIDUserDevice` virtual HID pad on macOS).
 //!
 //! DualShock 3/4, DualSense, Xbox and generic pads are all supported; the
 //! controller *kind* is detected from its USB vendor/product id so the host can
@@ -17,11 +17,20 @@ mod types;
 pub mod ds5;
 
 pub use types::{
-	axis_to_i16, button, create_virtual_pad, create_virtual_pad_target, ds4_report_fields,
-	touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo,
-	EmulationTarget, GamepadKind, GamepadState, RecordingPad, ResolvedTarget, RumbleReader,
-	VirtualGamepad,
+	axis_to_i16, button, create_virtual_pad, create_virtual_pad_checked, create_virtual_pad_target,
+	ds4_report_fields, touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons,
+	ControllerInfo, EmulationTarget, GamepadKind, GamepadState, PadFailure, RecordingPad,
+	ResolvedTarget, RumbleReader, VirtualGamepad,
 };
+
+/// Pure virtual-HID gamepad building blocks (report descriptors, input/feature reports,
+/// rumble decoding) for the macOS `IOHIDUserDevice` backend; platform-independent so the
+/// layouts are unit-tested everywhere.
+pub mod virtual_hid;
+
+/// macOS host-side virtual gamepad via `IOHIDUserDevice` — see [`mac_hid::MacHidGamepad`].
+#[cfg(target_os = "macos")]
+mod mac_hid;
 
 /// Leftover virtual pads of a dead Pulsar: the pad record + pure cleanup decisions.
 pub mod pad_registry;
