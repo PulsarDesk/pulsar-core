@@ -98,6 +98,24 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   after 1.5 s of client silence); macOS = a trackpad magnify gesture posted with the window
   server's private gesture event layout (`kCGSEventGesture` 29, fields 110/113/132 — the same
   one Hammerspoon posts; `macos.rs`). Linux and macOS: **untested on hardware**.
+  **Touchpad gestures** (`input/gesture.rs`, `InputEvent::Gesture { fingers: 3|4, kind:
+  SwipeUp|SwipeDown|SwipeLeft|SwipeRight|Tap }`, advertised as `FEAT_GESTURE`; old hosts drop
+  the unknown variant): the host does what ITS user configured for the gesture.
+  `HostGestures::action` reads the settings on every gesture and returns a `GestureAction`
+  (`Chord` of evdev keys / `Click` / `Nothing`) that the app injects with its ordinary key /
+  button calls. Pure, unit-tested parsers per OS: `win` (HKCU, then HKLM, then twinui's
+  defaults, of `…\PrecisionTouchPad`: `Three/FourFingerSlideEnabled` 0 nothing / 1 apps /
+  2 desktops / 3 audio / 0xFFFF custom, `Three/FourFingerTapEnabled` 0 nothing / 1 search /
+  2 notification center / 3 play-pause / 4 middle click / 0xFFFF custom; custom per-direction
+  `ThreeFingerUp`… codes 0-18 and `CustomThreeFingerTap`… codes 0-7, `…KeyParams` = DWORD low 16
+  bits modifiers (1 Ctrl, 2 Shift, 4 LWin, 8 RWin, 0x10 Alt) + high 16 bits VK — read from
+  `SettingsHandlers_nt.dll` / `twinui.dll`, 2026-11-15), `mac` (trackpad prefs + Dock gesture
+  switches → Spaces ^←/^→, Mission Control ^↑, App Exposé ^↓, page swipe ⌘[/⌘], Look up ⌃⌘D;
+  `dock_swipe_fingers` for the macOS client), `linux` (GNOME / KDE defaults from
+  `XDG_CURRENT_DESKTOP`, kwinrc overview + desktop count). A swipe down right after the swipe up
+  that opened an overview sends the same toggle shortcut again (closes it). The Windows
+  injector maps the media keys (113-115, 163-165) and browser back / forward (158 / 159) now.
+  **Untested on hardware** (all three hosts).
   - `input/local_pointer_macos.rs` — macOS host: listen-only `CGEventTap` noticing the
     person at the host using their own mouse (desktop `host::takeover`); skips events tagged
     `INJECTED_TAG` and events from our own pid; `request_listen_access`,
