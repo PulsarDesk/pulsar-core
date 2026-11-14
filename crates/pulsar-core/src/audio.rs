@@ -23,6 +23,10 @@
 //! Pulsar's own tree). That taps the app streams before the endpoint volume and mute, so the
 //! caveats above only apply to the endpoint loopback, which remains the fallback.
 //!
+//! On macOS the whole-desktop audio comes from ScreenCaptureKit ([`run_system_audio_capture`],
+//! macOS 13+): the mix of every app except Pulsar, with no virtual audio device needed. The
+//! ffmpeg AVFoundation input stays the fallback (an older macOS, a user-named device).
+//!
 //! Transport mirrors video: a dedicated ffmpeg captures the OS audio, encodes
 //! **Opus** (multistream for 5.1/7.1 — see [`ChannelLayout`]), and ships **RTP over
 //! UDP** to the client (a second flow alongside the H.264 video). The command
@@ -45,6 +49,9 @@ mod loopback;
 // system mix (doubled/echoed). Win10 20H1+ only; the host falls back to `loopback` otherwise.
 #[cfg(windows)]
 mod process_loopback;
+// macOS system mix via ScreenCaptureKit (macOS 13+): every app but Pulsar, no virtual device.
+#[cfg(target_os = "macos")]
+mod sck_loopback;
 mod mute;
 mod settings;
 mod sink;
@@ -77,6 +84,8 @@ pub use process_loopback::{
 	process_loopback_format, process_loopback_supported, run_process_loopback_capture,
 	run_process_loopback_capture_mode, ProcessLoopbackMode,
 };
+#[cfg(target_os = "macos")]
+pub use sck_loopback::{run_system_audio_capture, system_audio_format, system_audio_supported, SystemAudioFormat};
 pub use mute::{mute_fallback_marker_path, restore_stale_mute_fallback, set_host_muted};
 pub use settings::{
 	AudioInput, AudioPolicy, AudioQuality, AudioSettings, ChannelLayout, CHANNELS, L16_PAYLOAD_TYPE,

@@ -135,7 +135,14 @@ windows-core = "0.62"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 # netwatch.rs: the PF_ROUTE socket that reports address / interface changes.
+# macos_capture: dlopen/dlsym of ScreenCaptureKit (macOS 12.3+, never linked) + sysctl.
 libc = "0.2"
+# macos_capture/sck.rs: ScreenCaptureKit is Objective-C (SCStream, its output delegate class,
+# completion blocks). Only the runtime crates: the objc2-* framework crates link their
+# framework strongly, and a strong ScreenCaptureKit link would keep the app from starting on
+# macOS < 12.3.
+objc2 = "0.6"
+block2 = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }
