@@ -508,7 +508,10 @@ mod tests {
 			let c = Config { audio_input: dev.to_string(), ..Config::default() };
 			assert_eq!(c.audio_input(), crate::audio::AudioInput::default_for_os(), "{dev:?}");
 		}
-		let named = Config { audio_input: "Stereo Mix".to_string(), ..Config::default() };
+		// A named device: a dshow / Pulse name, or on macOS an AVFoundation index (a name is
+		// no index there and falls back to 0, the default — so name device 1 instead).
+		let named = if cfg!(target_os = "macos") { "1" } else { "Stereo Mix" };
+		let named = Config { audio_input: named.to_string(), ..Config::default() };
 		assert_ne!(named.audio_input(), crate::audio::AudioInput::default_for_os());
 	}
 
