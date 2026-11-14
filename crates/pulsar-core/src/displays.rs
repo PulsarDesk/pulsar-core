@@ -94,6 +94,34 @@ pub fn platform_id(idx: usize) -> Option<u32> {
 	}
 }
 
+/// Where the host's own pointer is inside the monitor at `idx` in [`list`], normalized 0..1
+/// (for the client's "host pointer" marker). `None` when it is on another monitor or unknown.
+/// macOS only (`CGEventGetLocation` against `CGDisplayBounds`, both in global points);
+/// `None` elsewhere. Untested on macOS hardware.
+pub fn pointer_in(idx: usize) -> Option<(f32, f32)> {
+	#[cfg(target_os = "macos")]
+	{
+		macos::pointer_in(idx)
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		let _ = idx;
+		None
+	}
+}
+
+/// `(px, py)` normalized into the rectangle `(x, y, w, h)` (same coordinate space), `None`
+/// when outside it or the rectangle is empty.
+#[allow(dead_code)]
+pub(crate) fn normalize_in(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64) -> Option<(f32, f32)> {
+	if w <= 0.0 || h <= 0.0 {
+		return None;
+	}
+	let nx = (px - x) / w;
+	let ny = (py - y) / h;
+	((0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny)).then_some((nx as f32, ny as f32))
+}
+
 /// Start watching for monitor changes (plug / unplug / mode / arrangement / primary). Calls
 /// `on_change` from a background (or, on macOS, the main) thread for every change; several
 /// calls per physical change are normal — callers debounce and re-read [`list`].
@@ -212,6 +240,15 @@ mod tests {
 			id: 0,
 			builtin: false,
 		}
+	}
+
+	#[test]
+	fn pointer_normalizes_inside_its_monitor_only() {
+		assert_eq!(normalize_in(1920.0 + 640.0, 360.0, 1920.0, 0.0, 1280.0, 720.0), Some((0.5, 0.5)));
+		assert_eq!(normalize_in(100.0, 100.0, 1920.0, 0.0, 1280.0, 720.0), None);
+		// A monitor left of the main one (negative origin).
+		assert_eq!(normalize_in(-1280.0, 0.0, -1280.0, 0.0, 1280.0, 1024.0), Some((0.0, 0.0)));
+		assert_eq!(normalize_in(0.0, 0.0, 0.0, 0.0, 0.0, 0.0), None);
 	}
 
 	#[test]

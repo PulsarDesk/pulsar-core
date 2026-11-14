@@ -113,6 +113,18 @@ fn monitor(i: usize, id: CGDirectDisplayID, name: Option<String>, any_main: bool
 	}
 }
 
+pub(super) fn pointer_in(idx: usize) -> Option<(f32, f32)> {
+	use core_graphics::event::CGEvent;
+	use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+	let id = *CGDisplay::active_displays().ok()?.get(idx)?;
+	// An event created without a type carries the current pointer location (global points,
+	// top-left origin — the same space as CGDisplayBounds).
+	let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+	let p = CGEvent::new(src).ok()?.location();
+	let b = CGDisplay::new(id).bounds();
+	super::normalize_in(p.x, p.y, b.origin.x, b.origin.y, b.size.width, b.size.height)
+}
+
 fn on_change_slot() -> &'static Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>> {
 	static S: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>> = OnceLock::new();
 	S.get_or_init(|| Mutex::new(None))
