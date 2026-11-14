@@ -80,7 +80,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   is **dlopen'ed, never linked** (objc2 runtime only, no objc2-* framework crates — they link
   strongly and the app would not start on macOS < 12.3); newer constants via `dlsym`.
   `pcm.rs` (planar → interleaved stereo) is pure and tested everywhere. The encoder that eats
-  the frames is in the desktop app (`pulsar-capture/src/mac/vt.rs`, VideoToolbox).
+  the frames is in the desktop app (`pulsar-capture/src/mac/vt.rs`, VideoToolbox). Frames are
+  stretched to the output size (`preservesAspectRatio = NO`), never letterboxed.
+  `set_streamed_display` / `streamed_display` publish the display being streamed (process-wide)
+  so `input/macos.rs` maps the absolute pointer onto it instead of always the main display;
+  `avfoundation_screen_number` gives the ffmpeg fallback's `"Capture screen N"`.
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks. macOS: `sck_loopback.rs`
