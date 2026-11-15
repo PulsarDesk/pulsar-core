@@ -196,6 +196,13 @@ pub struct DisplayInfo {
 	/// than its own panel refreshes.
 	#[serde(default)]
 	pub refresh_hz: u32,
+	/// The monitor is in HDR mode right now (Windows "Use HDR": its colour space is BT.2020 /
+	/// PQ). A host that advertises [`FEAT_HDR`](crate::service::media::FEAT_HDR) streams real
+	/// 10-bit HDR from such a monitor when the client asks ([`StreamReq::hdr10`]); from an SDR
+	/// monitor the stream stays SDR whatever was asked. `#[serde(default)]` (false) — an old
+	/// host / a host that cannot tell omits it.
+	#[serde(default)]
+	pub hdr: bool,
 }
 
 /// One host top-level WINDOW the client can pick as a per-window capture target
@@ -277,13 +284,36 @@ pub struct StreamReq {
 	/// keeps today's `game_mode`-driven behavior on the host.
 	#[serde(default)]
 	pub quality: QualityPref,
-	/// Request 10-bit **HDR** encode (BT.2020/PQ). `#[serde(default)]` (false) for wire compat
-	/// — only honored when the chosen encoder+codec actually validates for it.
+	/// LEGACY HDR request bit. Old desktop clients and the mobile app set it straight from a
+	/// user setting, with no capability check, so a host must NOT stream real 10-bit HDR on it
+	/// (an old client that cannot decode / show 10-bit would get a black or washed-out
+	/// picture). Real HDR is [`hdr10`](Self::hdr10). The ffmpeg plans read this bit, but they
+	/// stream SDR anyway (`StreamPlan::effective_hdr_yuv444`: every ffmpeg capture is 8-bit).
+	/// New clients send `false`. `#[serde(default)]` (false) for wire compat.
 	#[serde(default)]
 	pub hdr: bool,
-	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop).
+	/// Request real **HDR10** (BT.2020 primaries, SMPTE ST 2084 PQ, HEVC Main10 / AV1 10-bit).
+	/// A client sets it only when the host advertises
+	/// [`FEAT_HDR`](crate::service::media::FEAT_HDR) and the client's renderer really
+	/// decodes and shows the current codec's 10-bit stream (on an HDR display, or tone-mapped
+	/// to SDR); it is recomputed whenever the client changes the codec. The host honours it
+	/// only when the captured monitor is in HDR mode and the codec is HEVC / AV1 on an encoder
+	/// that does 10-bit; otherwise the stream is SDR (never an 8-bit picture tagged as PQ).
+	/// `#[serde(default)]` (false): an old client never gets 10-bit, an old host ignores it.
+	#[serde(default)]
+	pub hdr10: bool,
+	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop). Honored only
+	/// for a codec the client lists in [`decode_yuv444`](Self::decode_yuv444) — see
+	/// [`StreamReq::wants_yuv444`].
 	#[serde(default)]
 	pub yuv444: bool,
+	/// Codecs this CLIENT decodes AND presents in 4:4:4 (its startup probe really decoded a
+	/// 4:4:4 keyframe of each, e.g. `["h265"]` on a Windows GPU whose DXVA has HEVC RExt). The
+	/// host encodes 4:4:4 only for a listed codec, so a client that cannot show 4:4:4 never
+	/// gets it (the Windows NV12-only decode was a black screen). `#[serde(default)]` (empty):
+	/// an old client — and every client that cannot decode 4:4:4 — gets 4:2:0.
+	#[serde(default)]
+	pub decode_yuv444: Vec<String>,
 	/// Codecs this CLIENT can decode (startup-probe result, best-first), already
 	/// PRUNED of any codec whose decoder is incompatible with an encoder family the
 	/// host actually has (e.g. rkmpp-HEVC × native-NVENC). The host clamps its codec
@@ -445,6 +475,24 @@ impl ClientStats {
 	}
 }
 
+impl StreamReq {
+	/// Should the host encode `codec` (`h264` / `h265` / `av1`; `hevc` is taken for `h265`)
+	/// in 4:4:4? Only when the client asked for it AND said it decodes 4:4:4 for that codec —
+	/// the codec the host finally streams, which can differ from the one asked for.
+	pub fn wants_yuv444(&self, codec: &str) -> bool {
+		fn norm(c: &str) -> String {
+			let c = c.trim().to_ascii_lowercase();
+			if c == "hevc" {
+				"h265".into()
+			} else {
+				c
+			}
+		}
+		let codec = norm(codec);
+		self.yuv444 && self.decode_yuv444.iter().any(|c| norm(c) == codec)
+	}
+}
+
 fn default_true() -> bool {
 	true
 }
@@ -587,6 +635,12 @@ enum DataMsgWire {
 		#[serde(default)]
 		reason: String,
 	},
+	HdrMeta {
+		#[serde(default)]
+		sdr_white_nits: u16,
+		#[serde(default)]
+		peak_nits: u16,
+	},
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -634,6 +688,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::Displays(d) => DataMsg::Displays(d),
 			DataMsgWire::StreamedDisplay(i) => DataMsg::StreamedDisplay(i),
 			DataMsgWire::PadUnavailable { slot, reason } => DataMsg::PadUnavailable { slot, reason },
+			DataMsgWire::HdrMeta { sdr_white_nits, peak_nits } => DataMsg::HdrMeta { sdr_white_nits, peak_nits },
 		}
 	}
 }
@@ -888,6 +943,22 @@ pub enum DataMsg {
 		#[serde(default)]
 		reason: String,
 	},
+	/// Host -> client: the HDR10 stream's brightness reference. `sdr_white_nits` is where the
+	/// host's SDR content sits on its HDR monitor (Windows Settings -> HDR -> "SDR content
+	/// brightness", about 80-480 nits): most of a remote desktop is SDR content at that level, so
+	/// a client that tone-maps the PQ picture to an SDR display uses it as its reference white
+	/// (instead of a fixed 203 nits) and the desktop looks as bright as it does on an SDR stream.
+	/// `peak_nits` is the host monitor's peak (the mastering-display maximum): the highlight
+	/// roll-off ends there. 0 = unknown (the client keeps its defaults). Sent while the native
+	/// capture streams HDR10, on start and every few seconds (the session transport is lossy and
+	/// the user can move the slider mid-stream). Appended for additive wire compat (an old
+	/// client ignores the unknown variant).
+	HdrMeta {
+		#[serde(default)]
+		sdr_white_nits: u16,
+		#[serde(default)]
+		peak_nits: u16,
+	},
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -932,6 +1003,19 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn legacy_hdr_bit_is_not_an_hdr10_request() {
+		// Old desktop clients / the mobile app send only the legacy bit: no 10-bit for them.
+		let json = r#"{"port":5000,"codec":"h265","encoder":"auto","width":0,"height":0,"hdr":true}"#;
+		let req: StreamReq = serde_json::from_str(json).unwrap();
+		assert!(req.hdr && !req.hdr10);
+		let json = r#"{"port":5000,"codec":"h265","encoder":"auto","width":0,"height":0,"hdr10":true}"#;
+		assert!(serde_json::from_str::<StreamReq>(json).unwrap().hdr10);
+		// An old client ignores an unknown HdrMeta: it must still be a decodable variant here.
+		let m = DataMsg::HdrMeta { sdr_white_nits: 203, peak_nits: 1000 };
+		let back: DataMsg = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+		assert_eq!(back, m);
+	}
 	#[test]
 	fn streamreq_missing_loss_recovery_defaults_to_normal() {
 		// Phase 0 appended `loss_recovery`; an old client omits it → Normal (long GOP).
@@ -997,6 +1081,7 @@ mod tests {
 			req.decode_codecs.is_empty(),
 			"missing decode_codecs defaults to empty (= unknown → host doesn't clamp)"
 		);
+		assert!(req.decode_yuv444.is_empty(), "missing decode_yuv444 → empty (4:2:0 only)");
 		assert!(
 			!req.media_over_session,
 			"missing media_over_session defaults to false (legacy direct flows)"
@@ -1011,6 +1096,27 @@ mod tests {
 			ChannelLayout::Stereo,
 			"missing audio_layout defaults to Stereo (the universally-decodable layout)"
 		);
+	}
+
+	#[test]
+	fn yuv444_only_for_a_codec_the_client_decodes_in_444() {
+		let mut req: StreamReq = serde_json::from_str(
+			r#"{"port":5000,"codec":"h265","encoder":"auto","width":0,"height":0,"yuv444":true}"#,
+		)
+		.unwrap();
+		// An old client (or one whose probe decoded no 4:4:4) lists nothing: 4:2:0.
+		assert!(!req.wants_yuv444("h265"));
+		req.decode_yuv444 = vec!["h265".into()];
+		assert!(req.wants_yuv444("h265"));
+		assert!(req.wants_yuv444("HEVC"), "hevc is h265");
+		// The host fell back to a codec the client cannot show in 4:4:4: 4:2:0.
+		assert!(!req.wants_yuv444("h264"));
+		assert!(!req.wants_yuv444("av1"));
+		// Not asked for: never, whatever the client can decode.
+		req.yuv444 = false;
+		assert!(!req.wants_yuv444("h265"));
+		let back: StreamReq = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+		assert_eq!(back.decode_yuv444, vec!["h265".to_string()]);
 	}
 
 	#[test]
@@ -1043,11 +1149,15 @@ mod tests {
 				primary: true,
 				modes: vec![(2560, 1440), (1920, 1080)],
 				refresh_hz: 144,
+				hdr: true,
 			}],
 		};
 		let json = serde_json::to_string(&caps).unwrap();
 		let back: StreamCaps = serde_json::from_str(&json).unwrap();
 		assert_eq!(caps, back);
+		// An old host's display entry has no `hdr` flag: SDR.
+		let old_disp = r#"{"idx":0,"name":"D","width":1920,"height":1080}"#;
+		assert!(!serde_json::from_str::<DisplayInfo>(old_disp).unwrap().hdr);
 		// An OLD host's reply has no `features`/`displays` — must deserialize to empty.
 		let old = r#"{"codecs":["h264"],"encoders":["software"]}"#;
 		let caps: StreamCaps = serde_json::from_str(old).unwrap();
@@ -1331,10 +1441,12 @@ mod tests {
 				primary: false,
 				modes: vec![(2560, 1440), (1920, 1080)],
 				refresh_hz: 144,
+				hdr: false,
 			}]),
 			DataMsg::Displays(vec![]),
 			DataMsg::StreamedDisplay(1),
 			DataMsg::PadUnavailable { slot: 1, reason: "mac_entitlement".into() },
+			DataMsg::HdrMeta { sdr_white_nits: 240, peak_nits: 1000 },
 		];
 
 		for msg in cases {

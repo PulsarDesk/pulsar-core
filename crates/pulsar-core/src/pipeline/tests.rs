@@ -15,6 +15,7 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		low_latency: true,
 		gpu_zerocopy: false,
 		output_idx: 0,
+		capture_size: None,
 		hdr: false,
 		yuv444: false,
 		loss_recovery: crate::service::LossRecovery::Normal,
@@ -75,7 +76,7 @@ fn ddagrab_filter_format_matches_command_pixfmt_for_all_encoders() {
 		(HwEncoder::Nvenc, false, true, true),
 		(HwEncoder::Nvenc, true, true, true),
 		(HwEncoder::Nvenc, false, false, true),
-		// NVENC hybrid: no trailing format= in filter (direct D3D11→NVENC), no -pix_fmt.
+		// NVENC hybrid: BGRA readback → scale_cuda format=nv12 (SDR 4:2:0), no -pix_fmt.
 		(HwEncoder::Nvenc, true, false, false),
 		(HwEncoder::Nvenc, false, true, false),
 		(HwEncoder::Nvenc, true, true, false),
@@ -169,11 +170,12 @@ fn ddagrab_nvenc_qsv_degrade_hdr_yuv444_to_sdr_420() {
 	}
 }
 
-/// AMF/Software ddagrab: hdr/yuv444 are NOT degraded — they flow through to both
-/// the filter format and -pix_fmt, and they must agree.
+/// AMF/Software ddagrab: yuv444 is NOT degraded — it flows through to both the filter
+/// format and -pix_fmt, and they must agree. HDR is dropped: ddagrab hands over 8-bit BGRA,
+/// which is SDR (no P010, no PQ tags).
 #[test]
-fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
-	// AMF + HDR: filter must end in format=p010le, command must have -pix_fmt p010le.
+fn ddagrab_cpu_bounce_encoders_honor_yuv444_but_not_fake_hdr() {
+	// AMF + HDR request: the 8-bit BGRA capture stays SDR NV12, untagged.
 	let p = StreamPlan {
 		encoder: HwEncoder::Amf,
 		codec: VCodec::H265,
@@ -182,17 +184,12 @@ fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
 		yuv444: false,
 		..plan(HwEncoder::Amf)
 	};
-	assert_eq!(p.effective_hdr_yuv444(), (true, false));
+	assert_eq!(p.effective_hdr_yuv444(), (false, false));
 	let (_, args) = encode_command(&p);
 	let joined = args.join(" ");
-	assert!(
-		joined.contains("format=p010le"),
-		"AMF ddagrab HDR: filter must end in format=p010le"
-	);
-	assert!(
-		joined.contains("-pix_fmt p010le"),
-		"AMF ddagrab HDR: command must have -pix_fmt p010le"
-	);
+	assert!(joined.contains("format=nv12"), "AMF ddagrab: SDR nv12 filter, got {joined}");
+	assert!(!joined.contains("p010le"), "AMF ddagrab: no 10-bit re-quantisation of SDR");
+	assert!(!joined.contains("smpte2084") && !joined.contains("bt2020"), "AMF ddagrab: no fake PQ");
 
 	// Software + yuv444: filter must end in format=yuv444p, command -pix_fmt yuv444p.
 	let q = StreamPlan {
@@ -360,16 +357,55 @@ fn resolve_codec_honors_then_falls_back() {
 	);
 }
 
+/// Every ffmpeg capture input is 8-bit SDR: an HDR request must never produce PQ / BT.2020
+/// tags or a 10-bit re-quantisation, on any OS's capture or any encoder.
+#[test]
+fn hdr_request_never_tags_an_8bit_capture_as_pq() {
+	let captures = [
+		CaptureMethod::X11grab,
+		CaptureMethod::Kmsgrab,
+		CaptureMethod::Gdigrab,
+		CaptureMethod::Ddagrab,
+		CaptureMethod::AvFoundation,
+	];
+	let encoders = [
+		HwEncoder::Nvenc,
+		HwEncoder::Amf,
+		HwEncoder::Qsv,
+		HwEncoder::Vaapi,
+		HwEncoder::Vulkan,
+		HwEncoder::VideoToolbox,
+		HwEncoder::MediaFoundation,
+		HwEncoder::Software,
+	];
+	for capture in captures {
+		for enc in encoders {
+			for codec in [VCodec::H264, VCodec::H265, VCodec::Av1] {
+				let mut p = plan(enc);
+				p.capture = capture;
+				p.codec = codec;
+				p.hdr = true;
+				assert!(!p.capture_delivers_hdr());
+				assert!(!p.effective_hdr_yuv444().0, "{capture:?} {enc:?} {codec:?}");
+				let j = encode_command(&p).1.join(" ");
+				for bad in ["smpte2084", "bt2020", "p010le", "main10", "high10", "yuv444p10le"] {
+					assert!(!j.contains(bad), "{capture:?} {enc:?} {codec:?} emitted {bad}: {j}");
+				}
+			}
+		}
+	}
+}
+
 #[test]
 fn hdr_and_yuv444_set_pixfmt_profile_colorspace() {
-	// HDR HEVC: p010 + main10 + BT2020/PQ.
+	// An HDR request on an 8-bit capture: plain SDR (no 10-bit, no PQ).
 	let mut p = plan(HwEncoder::Nvenc);
 	p.codec = VCodec::H265;
 	p.hdr = true;
 	let j = encode_command(&p).1.join(" ");
-	assert!(j.contains("-pix_fmt p010le"));
-	assert!(j.contains("-profile:v main10"));
-	assert!(j.contains("smpte2084") && j.contains("bt2020"));
+	assert!(!j.contains("-pix_fmt p010le"));
+	assert!(!j.contains("-profile:v main10"));
+	assert!(!j.contains("smpte2084") && !j.contains("bt2020"));
 	// YUV444 H.264: high444p + yuv444p, no HDR colorspace.
 	let mut q = plan(HwEncoder::Software);
 	q.codec = VCodec::H264;
@@ -518,19 +554,52 @@ fn ddagrab_is_fully_gpu_per_encoder() {
 		"zero-copy must not round-trip to CPU"
 	);
 
-	// NVENC hybrid (display on iGPU, CUDA map unavailable): feed ddagrab's D3D11 frame
-	// STRAIGHT into NVENC — no CPU round-trip at all (the hwdownload/hwupload path capped
-	// ~51 fps on a 3080 laptop). NVENC does the cross-GPU copy itself.
+	// NVENC hybrid (display on iGPU, CUDA map unavailable): NVENC cannot open a session on
+	// the iGPU's D3D11 device ("no encode device", measured 2026-11-15), so the frame is read
+	// back once as BGRA and scaled + converted on the NVIDIA GPU — never a CPU swscale (the
+	// old swscale round trip capped ~51 fps on a 3080 laptop).
 	p.gpu_zerocopy = false;
 	let f = encode_command(&p).1.join(" ");
 	assert!(
-		!f.contains("hwdownload"),
-		"hybrid NVENC must not round-trip to CPU"
+		f.contains("hwdownload,format=bgra,hwupload_cuda,scale_cuda=1920:1080:format=nv12,fps=60"),
+		"hybrid NVENC goes through CUDA: {f}"
 	);
+	assert!(!f.contains(",scale=") && !f.contains("-pix_fmt"), "no CPU scaler / pix_fmt: {f}");
+
+	// Hybrid, capture size EQUAL to the request: the capture's own size (scale_cuda only
+	// converts to NV12).
+	p.capture_size = Some((1920, 1080));
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080:format=nv12"), "{f}");
+
+	// Hybrid asked for a SMALLER size than the capture's: honoured, scaled on the NVIDIA GPU.
+	p.capture_size = Some((2560, 1600));
+	let f = encode_command(&p).1.join(" ");
 	assert!(
-		!f.contains("scale_cuda"),
-		"no on-GPU scaler without the CUDA map; native res"
+		f.contains("hwdownload,format=bgra,hwupload_cuda,scale_cuda=1920:1080:format=nv12,fps=60"),
+		"hybrid must scale to the requested size: {f}"
 	);
+	assert!(!f.contains(",scale=") && !f.contains("-pix_fmt"), "no CPU scaler / pix_fmt: {f}");
+
+	// Hybrid asked for a LARGER size than the capture (a 1440p client, a 1080p panel): never
+	// upscaled — clamped to the capture per axis, as the native DXGI path does.
+	p.capture_size = Some((1920, 1080));
+	p.width = 2560;
+	p.height = 1440;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080:format=nv12") && !f.contains("2560"), "{f}");
+	// One axis larger, one smaller: each axis clamped on its own (and evened).
+	p.capture_size = Some((1366, 768));
+	p.width = 1280;
+	p.height = 1080;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1280:768:format=nv12"), "{f}");
+	p.capture_size = Some((1365, 767));
+	p.width = 1920;
+	p.height = 1080;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1364:766:format=nv12"), "odd capture is evened: {f}");
+	p.capture_size = None;
 
 	// AMD AMF: NV12, no yuv420p swscale.
 	let mut a = plan(HwEncoder::Amf);
@@ -781,4 +850,92 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 		"{win}"
 	);
 	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
+}
+
+#[test]
+fn gst_encode_timer_measures_time_inside_the_encoder() {
+	use std::time::{Duration, Instant};
+	let mut t = gst::EncodeTimer::default();
+	let t0 = Instant::now();
+	// 60 fps frames, each 4 ms inside the encoder: the meter reads ~4 ms (not the 16.7 ms
+	// frame gap), and reports about once a second.
+	let mut reports = Vec::new();
+	for i in 0..130u64 {
+		let at = t0 + Duration::from_micros(i * 16_667);
+		t.frame_in(i * 16_666_667, at);
+		if let Some(ms) = t.frame_out(i * 16_666_667, at + Duration::from_millis(4)) {
+			reports.push(ms);
+		}
+	}
+	assert_eq!(reports.len(), 2, "one report per second: {reports:?}");
+	assert!(reports.iter().all(|ms| (ms - 4.0).abs() < 0.2), "{reports:?}");
+	assert_eq!(t.inflight(), 0);
+}
+
+#[test]
+fn gst_encode_timer_forgets_dropped_frames_and_ignores_unknown_pts() {
+	use std::time::{Duration, Instant};
+	let mut t = gst::EncodeTimer::default();
+	let t0 = Instant::now();
+	t.frame_in(1, t0);
+	t.frame_in(2, t0 + Duration::from_millis(16));
+	t.frame_in(3, t0 + Duration::from_millis(33));
+	// A header buffer / re-stamped output: not a frame we saw going in.
+	assert!(t.frame_out(99, t0 + Duration::from_millis(40)).is_none());
+	assert_eq!(t.inflight(), 3);
+	// Frame 1 was dropped by the encoder; frame 2 comes out → frame 1 is forgotten too.
+	t.frame_out(2, t0 + Duration::from_millis(20));
+	assert_eq!(t.inflight(), 1);
+	assert!((t.ema_ms() - 4.0).abs() < 0.01);
+	// Bounded: a source whose PTS never come back can't grow the queue.
+	for i in 0..1000 {
+		t.frame_in(1000 + i, t0);
+	}
+	assert_eq!(t.inflight(), gst::EncodeTimer::MAX_INFLIGHT);
+}
+
+/// An odd requested size (screen adaptation, a client window of any size) is evened on every
+/// ffmpeg capture path, as the native paths do — an odd 4:2:0 frame kills the encoder.
+#[test]
+fn odd_sizes_are_evened_on_the_ffmpeg_paths() {
+	let odd = |enc: HwEncoder, cap: CaptureMethod| StreamPlan {
+		width: 1921,
+		height: 1081,
+		capture: cap,
+		..plan(enc)
+	};
+	// Windows full screen: ddagrab CPU-bounce / MF / AMF / QSV / NVENC zero-copy, and gdigrab.
+	for enc in [HwEncoder::Software, HwEncoder::Amf, HwEncoder::MediaFoundation] {
+		let f = encode_command(&odd(enc, CaptureMethod::Ddagrab)).1.join(" ");
+		assert!(f.contains("scale=1920:1080,") && !f.contains("1921"), "[{enc:?}] {f}");
+	}
+	let f = encode_command(&odd(HwEncoder::Qsv, CaptureMethod::Ddagrab)).1.join(" ");
+	assert!(f.contains("scale_qsv=w=1920:h=1080") && !f.contains("1921"), "{f}");
+	let mut z = odd(HwEncoder::Nvenc, CaptureMethod::Ddagrab);
+	z.gpu_zerocopy = true;
+	let f = encode_command(&z).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080") && !f.contains("1921"), "{f}");
+	// Hybrid NVENC: the evened request equals the capture → the capture's own size.
+	let mut h = odd(HwEncoder::Nvenc, CaptureMethod::Ddagrab);
+	h.capture_size = Some((1920, 1080));
+	let f = encode_command(&h).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080:") && !f.contains("1921"), "{f}");
+	let f = encode_command(&odd(HwEncoder::Software, CaptureMethod::Gdigrab)).1.join(" ");
+	assert!(f.contains("scale=1920:1080") && !f.contains("1921"), "{f}");
+	// Linux x11grab region.
+	let f = encode_command(&odd(HwEncoder::Software, CaptureMethod::X11grab)).1.join(" ");
+	assert!(f.contains("1920x1080") && !f.contains("1921"), "{f}");
+	// A 1-pixel request floors at 2×2.
+	let tiny = StreamPlan { width: 1, height: 1, ..plan(HwEncoder::Software) };
+	assert!(encode_command(&tiny).1.join(" ").contains("2x2"));
+	// Even sizes pass unchanged.
+	assert!(encode_command(&plan(HwEncoder::Software)).1.join(" ").contains("1920x1080"));
+	// Raw NV12 window frames are produced at exactly the plan size: never resized here.
+	let raw = StreamPlan {
+		width: 1281,
+		height: 721,
+		window: Some(WindowInput::RawNv12 { url: "tcp://127.0.0.1:1".into() }),
+		..plan(HwEncoder::Software)
+	};
+	assert!(encode_command(&raw).1.join(" ").contains("1281x721"));
 }

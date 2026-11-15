@@ -133,8 +133,21 @@ impl CaptureMethod {
 			// the frame stays on the GPU wherever possible — the old "hwdownload → CPU
 			// scale → yuv420p → re-upload" round trip pinned a CPU core + both GPUs.
 			Self::Ddagrab => {
-				let (fps, w, h) = (plan.fps, plan.width, plan.height);
+				let (fps, mut w, mut h) = (plan.fps, plan.width, plan.height);
 				let oi = plan.output_idx;
+				// Hybrid NVENC (no CUDA map): never UPSCALE the capture. On Windows the request
+				// is the client's raw size (not clamped to the screen), and a duplication has
+				// no more detail than its own size — upscaling only costs encoder pixels and
+				// bits per real pixel. Clamp each axis to the capture (evened), as the native
+				// DXGI path does (`pulsar-capture` `target_size`), so a request at or above
+				// the capture streams the capture's own size and only a smaller one is
+				// scaled. Unknown capture size (`None`): the request as is.
+				if plan.encoder == HwEncoder::Nvenc && !plan.gpu_zerocopy {
+					if let Some((cw, ch)) = plan.capture_size {
+						w = (w.min(cw).max(2)) & !1;
+						h = (h.min(ch).max(2)) & !1;
+					}
+				}
 				// CPU-bounce target format honors HDR (10-bit) / YUV444 — the encoder's
 				// `-pix_fmt` (set in encode_command) must match what the filter produces.
 				// NOTE: uses plan.effective_hdr() / plan.effective_yuv444() (not the raw
@@ -158,23 +171,33 @@ impl CaptureMethod {
 					),
 					// NVENC where the zero-copy CUDA map isn't available (hybrid laptop: the
 					// display is on the iGPU, so ffmpeg's `hwmap=derive_device=cuda` fails with
-					// -40). Feed ddagrab's D3D11 frame STRAIGHT into h264_nvenc — NVENC ingests the
-					// D3D11 texture and does the cross-GPU copy itself on the GPU. This is what
-					// Sunshine/Parsec do; it avoids the old hwdownload→CPU-convert→hwupload round
-					// trip (which pinned ~3 CPU cores and capped ~51 fps). No on-GPU scaler is
-					// available without the CUDA map, so we stream the capture's native resolution
-					// and let the client scale (`{w}`/`{h}` intentionally unused here).
+					// -40). ddagrab's frame lives on the iGPU's D3D11 device, and NVENC cannot open
+					// a session on that device: feeding it straight in fails with
+					// "OpenEncodeSessionEx failed: no encode device" (measured 2026-11-15, RTX 3080
+					// Laptop + Vega panel, h264_nvenc and hevc_nvenc, bundled BtbN build) — so the
+					// "direct D3D11 feed" this branch used to have never opened on a hybrid box.
+					// The frame comes down once as raw BGRA (a readback, no CPU colour conversion
+					// or scaling — the swscale step is what made the old round trip pin ~3 cores
+					// and cap ~51 fps), goes up to CUDA, and `scale_cuda` scales + converts to NV12
+					// on the NVIDIA GPU. The size is clamped to the capture above, so this only
+					// ever keeps or DOWNscales. Measured 2026-11-15 on that box with a real
+					// ddagrab of the 1920x1200@120 panel: 960/960 frames in 8 s at 120 fps for
+					// 1920x1200, 1600x1000 and 1280x800, ~0.3-0.4 CPU core. The synthetic per-step
+					// cost at 1920x1200 is ~3 ms readback + ~2-4 ms CUDA upload/scale per frame:
+					// a few ms of latency the zero-copy branch does not pay, which is why the
+					// native capture paths (DXGI/WGC + NVENC SDK) stay first on Windows.
+					// `scale_d3d11` (scale on the capture GPU) is not an option: measured
+					// 2026-11-15 on the bundled BtbN build it fails to create its output texture
+					// (E_INVALIDARG) on both the RTX 3080 Laptop and the AMD iGPU.
+					// `fps={fps}` forces CONSTANT-frame-rate output (even-interval timestamps):
+					// ddagrab/DXGI only delivers a frame when the screen CHANGES, so on a desktop
+					// it emits ~65 fps IRREGULARLY → jittery frame intervals at the client. The fps
+					// filter duplicates the last frame to a steady {fps} (Sunshine does the same);
+					// it goes last so its duplicates are references, not extra readbacks.
 					// HDR/YUV444 degraded to SDR 4:2:0 for the same reason as zero-copy above.
-					HwEncoder::Nvenc => {
-						let _ = (w, h);
-						// `fps={fps}` forces CONSTANT-frame-rate output (even-interval timestamps).
-						// ddagrab/DXGI only delivers a frame when the screen CHANGES, so on a desktop
-						// it emits ~65 fps IRREGULARLY → the client receives jittery frame intervals →
-						// cursor/typing feel hitchy even though input is instant. The fps filter
-						// duplicates the last frame to pace delivery to a steady {fps} (Sunshine does
-						// the same), so the client presents smoothly.
-						format!("ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,fps={fps}")
-					}
+					HwEncoder::Nvenc => format!(
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,hwupload_cuda,scale_cuda={w}:{h}:format=nv12,fps={fps}"
+					),
 					// AMD AMF: on-GPU scale is unreliable on iGPUs; do the minimal CPU work
 					// (download + BGRA→NV12 + scale) — far lighter than the old yuv420p path.
 					// AMF goes through cpu_fmt (eff_hdr/eff_yuv444 honored; AMF supports 10-bit).
@@ -429,8 +452,16 @@ pub struct StreamPlan {
 	/// Passed directly to `ddagrab=output_idx=N` in the ffmpeg filter graph so the
 	/// ffmpeg fallback path captures the same monitor the client selected.
 	pub output_idx: u32,
-	/// Encode 10-bit **HDR** (P010 + BT2020 primaries / SMPTE2084 PQ transfer). Requires an
-	/// HDR-capable encoder+codec (HEVC main10 / AV1 main / H.264 high10); SDR otherwise.
+	/// (Windows/ddagrab) the captured output's own size, when the caller knows it. The
+	/// hybrid NVENC branch (no zero-copy CUDA map) streams that size as-is when it equals the
+	/// plan size, and scales on the NVIDIA GPU when it doesn't; `None` = unknown (stream the
+	/// capture's own size, as before). Ignored everywhere else.
+	pub capture_size: Option<(u32, u32)>,
+	/// The client asked for 10-bit **HDR** (P010 + BT2020 primaries / SMPTE2084 PQ transfer).
+	/// Only honoured when the CAPTURE delivers HDR pixels (see
+	/// [`StreamPlan::effective_hdr_yuv444`]): none of the ffmpeg capture inputs this crate
+	/// builds does, so an ffmpeg plan always streams SDR. Tagging an 8-bit SDR capture as PQ
+	/// made the client decode sRGB pixels as PQ (washed-out / far too bright colours).
 	pub hdr: bool,
 	/// Encode **4:4:4** chroma (no subsampling — sharper text/lines for remote desktop).
 	/// Only a few encoders support it (NVENC, QSV, software); ignored elsewhere.
@@ -465,29 +496,48 @@ pub fn fit_window_size(win_w: u32, win_h: u32, max_w: u32, max_h: u32) -> (u32, 
 
 impl StreamPlan {
 	/// Returns the `(hdr, yuv444)` values that are **actually achievable** for the
-	/// current encoder + capture combination, after clamping paths that cannot produce
-	/// 10-bit or 4:4:4 frames in the GPU filter.
+	/// current encoder + capture combination.
 	///
-	/// NVENC (both zero-copy and hybrid) and QSV with `Ddagrab` use GPU-side filters
+	/// **HDR is never achievable through these ffmpeg plans.** Every capture input here
+	/// delivers 8-bit SDR pixels: `ddagrab` runs with its default `output_fmt=bgra` (an HDR
+	/// desktop is handed over already mapped to SDR), `gdigrab` / `x11grab` / `kmsgrab` /
+	/// `avfoundation` produce 8-bit RGB / YUV. Re-quantising those to P010 and writing
+	/// BT.2020 + PQ into the VUI does not make them HDR: the client then interprets sRGB code
+	/// values as PQ and shows wrong colours. An 8-bit source is SDR, so `hdr` is dropped here
+	/// and the stream is plain BT.709 8-bit. Real HDR is the Windows native NVENC path
+	/// (pulsar-desktop `pulsar-capture`, FP16 Desktop Duplication / WGC → P010 → Main10);
+	/// this is the one place to flip when an ffmpeg capture with a 10-bit HDR output is added.
+	///
+	/// `yuv444`: NVENC (both zero-copy and hybrid) and QSV with `Ddagrab` use GPU-side filters
 	/// (`scale_cuda` / `scale_qsv`) that only reliably output `nv12` (8-bit 4:2:0) on
-	/// current ffmpeg builds.  Allowing `hdr` or `yuv444` for those paths would cause
-	/// the filter to emit `nv12` while `-pix_fmt` requests `p010le`/`yuv444p…` →
-	/// ffmpeg errors or silently encodes SDR while signaling HDR.  We degrade both
-	/// flags to `false` for those paths so the filter format and `-pix_fmt` always
-	/// agree.  All other encoders (AMF, Software, VAAPI, catch-all) use a CPU-bounce
-	/// path whose `format=` step can produce any pixel format, so they respect the
-	/// user's request.
+	/// current ffmpeg builds, and Media Foundation MFTs take NV12 only, so 4:4:4 is dropped
+	/// for those paths (the filter format and `-pix_fmt` must agree). All other encoders
+	/// (AMF, Software, VAAPI, catch-all) use a CPU-bounce path whose `format=` step can
+	/// produce any pixel format, so they respect the request.
 	///
 	/// **Both `CaptureMethod::input_args` (filter) and `encode_command` (-pix_fmt /
 	/// -profile:v) call this method**, so the two can never disagree.
 	pub fn effective_hdr_yuv444(&self) -> (bool, bool) {
-		// NVENC/QSV Ddagrab GPU paths, and Media Foundation (NV12-only MFTs): clamp to SDR 4:2:0.
+		let hdr = self.hdr && self.capture_delivers_hdr();
+		// NVENC/QSV Ddagrab GPU paths, and Media Foundation (NV12-only MFTs): clamp to 4:2:0.
 		let is_gpu_ddagrab = self.capture == CaptureMethod::Ddagrab
 			&& matches!(self.encoder, HwEncoder::Nvenc | HwEncoder::Qsv | HwEncoder::MediaFoundation);
 		if is_gpu_ddagrab {
 			(false, false)
 		} else {
-			(self.hdr, self.yuv444)
+			(hdr, self.yuv444)
+		}
+	}
+
+	/// Does this plan's capture input deliver HDR (10-bit PQ / scRGB) pixels? None of the
+	/// ffmpeg inputs built here does (see [`Self::effective_hdr_yuv444`]).
+	pub fn capture_delivers_hdr(&self) -> bool {
+		match self.capture {
+			CaptureMethod::Ddagrab
+			| CaptureMethod::Gdigrab
+			| CaptureMethod::X11grab
+			| CaptureMethod::Kmsgrab
+			| CaptureMethod::AvFoundation => false,
 		}
 	}
 }

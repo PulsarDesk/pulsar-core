@@ -1,6 +1,6 @@
 //! ffmpeg/ffplay command builders for the host encode + client decode paths.
 
-use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec};
+use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec, WindowInput};
 use crate::service::LossRecovery;
 
 /// Refresh period (frames) of the loss-recovery modes: after a loss the picture is whole
@@ -90,10 +90,34 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 	}
 }
 
+/// The plan's size rounded down to even (at least 2×2), or `None` when it already is even
+/// or the frames come pre-made at exactly that size (`WindowInput::RawNv12`).
+fn evened_size(plan: &StreamPlan) -> Option<(u32, u32)> {
+	if matches!(plan.window, Some(WindowInput::RawNv12 { .. })) {
+		return None;
+	}
+	let even = |v: u32| v.max(2) & !1;
+	let size = (even(plan.width), even(plan.height));
+	(size != (plan.width, plan.height)).then_some(size)
+}
+
 /// Build the host capture+encode command: `(program, args)`. Program is always
 /// `ffmpeg` (the bundled binary is substituted by the caller); the encoder is
 /// selected via ffmpeg's `-c:v` flag, no external wrapper.
 pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
+	// Every encoder wants even 4:2:0 dimensions, and the requested size can be odd (screen
+	// adaptation / a client window of any size): even it here, as the native capture paths
+	// do (`& !1`), so `scale=`/`scale_cuda=`/`-video_size` never ask for an odd frame — the
+	// encoder would refuse it and the stream would die. Raw NV12 window frames are made at
+	// exactly the plan size by their producer (already even, `fit_within`): left alone.
+	let evened;
+	let plan = match evened_size(plan) {
+		Some((width, height)) => {
+			evened = StreamPlan { width, height, ..plan.clone() };
+			&evened
+		}
+		None => plan,
+	};
 	let enc = plan.encoder.ffmpeg_name(plan.codec).unwrap_or("libx264");
 	let s = |x: &str| x.to_string();
 	let mut a: Vec<String> = vec![s("-hide_banner"), s("-loglevel"), s("error")];
@@ -143,9 +167,12 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
-	// format matches the requested depth/chroma (p010 for HDR, yuv444 for 4:4:4).
+	// format matches the effective depth/chroma (p010 for HDR, yuv444 for 4:4:4) — the same
+	// `effective_hdr_yuv444` the `-pix_fmt` below uses, so an SDR capture is never uploaded
+	// as P010 while the encoder is told something else.
 	if plan.encoder == HwEncoder::Vaapi || plan.encoder == HwEncoder::Vulkan {
-		let up = match (plan.yuv444, plan.hdr) {
+		let (eff_hdr, eff_yuv444) = plan.effective_hdr_yuv444();
+		let up = match (eff_yuv444, eff_hdr) {
 			(true, true) => "yuv444p10le",
 			(true, false) => "yuv444p",
 			(false, true) => "p010le",
@@ -294,7 +321,9 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		};
 		a.extend([s("-pix_fmt"), s(pix)]);
 		// HDR10 signaling: BT.2020 primaries + SMPTE-2084 (PQ) transfer + non-constant
-		// luminance matrix. The client carries these through to its display.
+		// luminance matrix. Only for a capture that really delivers HDR pixels
+		// (`effective_hdr_yuv444`; none of the ffmpeg inputs does today) — an 8-bit SDR
+		// source tagged PQ decodes to wrong colours on every client.
 		if eff_hdr {
 			a.extend([
 				s("-color_primaries"),
@@ -471,6 +500,7 @@ mod tests {
 			low_latency,
 			gpu_zerocopy: false,
 			output_idx: 0,
+			capture_size: None,
 			hdr: false,
 			yuv444: false,
 			loss_recovery: LossRecovery::Normal,
