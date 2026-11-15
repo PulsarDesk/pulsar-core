@@ -559,13 +559,14 @@ unsafe fn find_window(content: &AnyObject, id: u32) -> Result<Retained<AnyObject
 pub(crate) unsafe fn request_bt709(cfg: &AnyObject) {
 	if responds(cfg, sel!(setColorSpaceName:)) {
 		if let Some(srgb) = ffi::cf_string_const(c"kCGColorSpaceSRGB") {
-			// A CFStringRef is toll-free bridged to the NSString the setter takes.
-			let _: () = msg_send![cfg, setColorSpaceName: srgb as *const AnyObject];
+			// The property is declared `CFStringRef`: pass it with that encoding (`CfStr`),
+			// not as an object; objc2 checks the argument type in debug builds.
+			let _: () = msg_send![cfg, setColorSpaceName: ffi::CfStr(srgb)];
 		}
 	}
 	if responds(cfg, sel!(setColorMatrix:)) {
 		if let Some(m) = ffi::cf_string_const(c"kCGDisplayStreamYCbCrMatrix_ITU_R_709_2") {
-			let _: () = msg_send![cfg, setColorMatrix: m as *const AnyObject];
+			let _: () = msg_send![cfg, setColorMatrix: ffi::CfStr(m)];
 		}
 	}
 }
