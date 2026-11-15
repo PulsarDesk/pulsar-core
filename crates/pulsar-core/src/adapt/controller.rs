@@ -94,6 +94,31 @@
 //!   probe-down verdict of "followed", the rate goes back to what those windows ran at and the
 //!   loss is FEC's (`random_loss_hold`). A policer / thin link still shows loss falling with
 //!   the rate and keeps the rules above.
+//!
+//! Stall vs congestion (2026-11-15 — a phone USB tether: ~14 Mbit clean, handovers that stall
+//! the link for a few seconds with RTT 50 ms → 0.8–1.8 s; every stall read as congestion —
+//! "rtt bloat severe → halve", repeated fast ×0.85 cuts, each lowering the ceiling — and the
+//! rate went 14 → 0.33 Mbit in a minute):
+//!
+//! * **A stall is not our queue.** A window whose RTT (mean or floor) jumps to
+//!   `STALL_RTT_FACTOR` × the base and `STALL_RTT_MIN_MS` over it, or in which nothing arrives
+//!   (no Pong, a quarter of the last stream's packets), while the rate is one the path proved
+//!   lately (`STALL_SAFE_PCT` of the proven / last good rate) and was not just raised or already
+//!   cut on its own queue, is a STALL: our rate could not have built a queue that deep. It is
+//!   ridden out — no cut, the ceiling untouched (a fast-reflex cut made at its onset stands as
+//!   the one bounded cut; its ceiling punishment is undone), the fast reflex off — and once the
+//!   RTT floor is back the stream continues at the pre-stall rate; the window after it (the
+//!   backlog's drain) is not cut on either.
+//! * **A capacity drop is still followed.** A queue that keeps standing (every sample far up)
+//!   for `STALL_DELIVER_WINDOWS` while the link delivers about our rate, or overflows, and is not
+//!   draining (the RTT falling through the window) is congestion: cut to `GOODPUT_BETA` ×
+//!   delivered, the ceiling follows. After `STALL_MAX_WINDOWS` a backlog that still drains gets a
+//!   ×0.7 to clear it (ceiling kept); one that doesn't is congestion.
+//! * **Mobile link** (`Config::mobile`, the app's route detection): start at most at
+//!   `MOBILE_START_KBPS`, climb ×1.25 (startup / far under the ceiling), probe steps ≤ 40 %.
+//! * **Automatic adjustment off** (`set_adaptive(false)`): no rate / point decisions at all —
+//!   the app streams a fixed rate and point (Moonlight-like); the controller keeps measuring
+//!   (proven / last good, `fixed_rate_kbps`) and still flips the recovery mode.
 
 use super::delay::{DelayState, Trendline};
 use super::fec_policy;
@@ -235,6 +260,33 @@ pub const NEAR_BAD_STEP_PCT: u32 = 8;
 /// A rate step (climb or probe) is the suspect for loss over the noise this many windows
 /// after it: the rate goes straight back to the one before it (measured path).
 pub const RAISE_SUSPECT_WINDOWS: u32 = 2;
+/// Link stall (see "Stall vs congestion" in the module doc): an RTT sample this many times its
+/// baseline…
+pub const STALL_RTT_FACTOR: f32 = 4.0;
+/// …and at least this far (ms) over it reads as a stall, not a queue our rate built.
+pub const STALL_RTT_MIN_MS: f32 = 200.0;
+/// A stall's rate must have run cleanly lately: at most this share (%) over the proven / last
+/// good rate. A rate above it may have built the queue itself — the normal rules judge it.
+pub const STALL_SAFE_PCT: u64 = 115;
+/// Windows a stall may last before a queue that is still standing counts as congestion anyway
+/// (10 s: a handover is over in a few seconds, a capacity drop stays).
+pub const STALL_MAX_WINDOWS: u32 = 5;
+/// From this many stalled windows on, a standing queue that still DELIVERS this share of the
+/// target (goodput at our rate, not a collapse) is a bottleneck at our rate: congestion.
+pub const STALL_DELIVER_SHARE: f32 = 0.6;
+pub const STALL_DELIVER_WINDOWS: u32 = 2;
+/// Fast reflex: no video frame for this long (ms; or 8 typical gaps) reads as a stall — the
+/// burst that follows must not be cut on as a filling queue.
+pub const STALL_GAP_MS: f64 = 300.0;
+/// How long (ms) a stall suspected between windows (a frame gap, a far RTT sample) holds the
+/// fast reflex off.
+pub const STALL_SUSPECT_MS: f64 = 2_500.0;
+/// Mobile link (`Config::mobile`): the start rate is capped here, and the startup / far-climb
+/// steps are gentler (×1.25) — a phone tether reads 20 Mbit in a 1 s probe and holds ~12.
+pub const MOBILE_START_KBPS: u32 = 6_000;
+pub const MOBILE_CLIMB_FACTOR: f64 = 1.25;
+/// Mobile link: the largest probe step past the ceiling (%).
+pub const MOBILE_PROBE_STEP_MAX_PCT: u32 = 40;
 
 /// The fps-aware rate floor for a point running at `fps` (see `KBPS_PER_FPS_FLOOR`).
 pub fn rate_floor_for_fps(fps: u32) -> u32 {
@@ -359,6 +411,14 @@ pub struct Config {
 	/// and 10-15 fps). Picked only when the floored rungs don't fit; the normal climb lifts it
 	/// back. `None` = no such rung (the floors are the bottom).
 	pub last_resort: Option<(u32, u32)>,
+	/// The client's route runs over a phone (USB / Wi-Fi tether, a cellular modem): start at
+	/// most at `MOBILE_START_KBPS` and climb more gently (see the module doc, "Mobile link").
+	pub mobile: bool,
+	/// The loss-recovery mode the stream starts in (`Normal` = flip to `preferred_recovery` on
+	/// the first sustained loss). A client that already knows its path is lossy (a game session
+	/// over a WAN / mobile link with an intra-refresh host) starts in it, so the host doesn't
+	/// rebuild its encoder mid-session for the flip.
+	pub initial_recovery: LossRecovery,
 }
 
 impl Config {
@@ -375,6 +435,8 @@ impl Config {
 			min_fps: 0,
 			min_kbps_scale: 1.0,
 			last_resort: None,
+			mobile: false,
+			initial_recovery: LossRecovery::Normal,
 		}
 	}
 }
@@ -421,6 +483,18 @@ struct LossCut {
 	from: u32,
 	from_ceiling: u32,
 	from_bad: u32,
+}
+
+/// A link stall being ridden out (see "Stall vs congestion" in the module doc).
+#[derive(Clone, Copy, Debug)]
+struct Stall {
+	/// The rate to continue at once the link is back (the pre-stall rate, or the one bounded
+	/// cut when that rate was itself suspect).
+	resume: u32,
+	/// Stalled windows so far.
+	windows: u32,
+	/// Of those, windows whose every RTT sample stood far over the base (a standing queue).
+	standing: u32,
 }
 
 /// The controller state, carried across windows.
@@ -563,6 +637,28 @@ pub struct Controller {
 	raise: Option<(u32, u32)>,
 	/// The ceiling before the current probe past it (held clean for the whole probe wait).
 	probe_from: u32,
+	// Stall vs congestion.
+	stall: Option<Stall>,
+	/// A window's own rules already cut on the queue that is still standing (since the last
+	/// calm window): that queue is ours, not a stall — the normal rules keep judging it.
+	own_queue: bool,
+	/// Windows after a stall in which its drain (the buffered burst, the late Pongs) is not cut on.
+	stall_grace: u32,
+	/// A stall suspected between ticks: the fast reflex holds off until this time (ms, the
+	/// `on_frame` clock).
+	stall_suspect_until_ms: f64,
+	/// Packets of the last window that carried a real stream (≥ 50), for the blackout check.
+	prev_total: u32,
+	/// Video frame arrivals (the frame-gap check): the last one and a typical gap (ms).
+	last_arrival_ms: f64,
+	gap_ema_ms: f64,
+	frames_seen: u32,
+	/// The fast reflex's cut in this window: the target and ceiling before it (a stall gives
+	/// the ceiling back).
+	fast_cut_from: Option<(u32, u32)>,
+	/// The automatic adjustment is off (`set_adaptive(false)`): the app streams a fixed rate and
+	/// point; the controller only measures (and still flips the recovery mode).
+	frozen: bool,
 }
 
 /// `Config::min_fps`: keep the frame rate, give up resolution. Adds `keep`-fps rungs at the
@@ -755,6 +851,9 @@ impl Controller {
 		} else {
 			cfg.start_kbps.clamp(FLOOR_KBPS, cap)
 		};
+		// A phone link: a 1 s probe reads its burst capacity (2026-11-15: 21 Mbit read, ~12-14
+		// held, the start at 16.8 queued at once).
+		let start = if cfg.mobile { start.min(MOBILE_START_KBPS.max(FLOOR_KBPS)) } else { start };
 		let points = build_points(&cfg, None, None);
 		let point_idx = if cfg.ladder { pick_without_last_resort(&cfg, &points, start) } else { 0 };
 		let mut c = Self {
@@ -785,7 +884,7 @@ impl Controller {
 			queued_prev: false,
 			deadband: 0,
 			deadband_acc: 0.0,
-			recovery: LossRecovery::Normal,
+			recovery: cfg.initial_recovery,
 			startup_left: cfg.startup_windows,
 			startup_paused: false,
 			windows: 0,
@@ -836,6 +935,16 @@ impl Controller {
 			bad_rate: 0,
 			raise: None,
 			probe_from: 0,
+			stall: None,
+			own_queue: false,
+			stall_grace: 0,
+			stall_suspect_until_ms: f64::NEG_INFINITY,
+			prev_total: 0,
+			last_arrival_ms: f64::NEG_INFINITY,
+			gap_ema_ms: 0.0,
+			frames_seen: 0,
+			fast_cut_from: None,
+			frozen: false,
 			cfg,
 		};
 		c.retarget();
@@ -957,6 +1066,93 @@ impl Controller {
 	/// its last packet (ms, any monotonic clock) — feeds the delay-gradient estimator.
 	pub fn on_frame(&mut self, send_ts_90k: u32, arrival_ms: f64) {
 		self.delay.on_frame(send_ts_90k, arrival_ms);
+		// The typical gap between frame arrivals (the frame-gap stall check in `poll_fast`).
+		if self.last_arrival_ms.is_finite() {
+			let gap = (arrival_ms - self.last_arrival_ms).clamp(0.0, 1_000.0);
+			self.gap_ema_ms = if self.frames_seen <= 1 { gap } else { self.gap_ema_ms * 0.95 + gap * 0.05 };
+		}
+		self.last_arrival_ms = self.last_arrival_ms.max(arrival_ms);
+		self.frames_seen = self.frames_seen.saturating_add(1);
+	}
+
+	/// One keepalive RTT sample as it arrives (ms; `now_ms` on the `on_frame` clock), between
+	/// windows. The window's samples still come in `Sample::rtt_ms`; this only lets the fast
+	/// reflex see a stall (a sample many times the baseline) before the window closes.
+	pub fn on_rtt(&mut self, rtt_ms: f32, now_ms: f64) {
+		if self.rtt_far(rtt_ms) {
+			self.stall_suspect_until_ms = now_ms + STALL_SUSPECT_MS;
+		}
+	}
+
+	/// An RTT reading far over the baseline (`STALL_RTT_FACTOR`, `STALL_RTT_MIN_MS`).
+	fn rtt_far(&self, rtt_ms: f32) -> bool {
+		self.rtt_base > 0.0 && rtt_ms >= self.rtt_base * STALL_RTT_FACTOR && rtt_ms - self.rtt_base >= STALL_RTT_MIN_MS
+	}
+
+	/// A link stall is being ridden out (no cuts, the ceiling kept; see the module doc).
+	pub fn stalled(&self) -> bool {
+		self.stall.is_some()
+	}
+
+	/// Turn the automatic adjustment off (`false`: the app streams a fixed rate and point —
+	/// Moonlight-like — and the controller only measures, keeps its proven / last good rates
+	/// and still flips the loss-recovery mode) or back on. Back on, it resumes from the rate
+	/// the app streams then: call [`set_target`](Self::set_target) with it (and re-apply the
+	/// pins) right after.
+	pub fn set_adaptive(&mut self, on: bool) {
+		if self.frozen == !on {
+			return;
+		}
+		self.frozen = !on;
+		self.probe_down = None;
+		self.loss_cut = None;
+		self.stall = None;
+		self.stall_grace = 0;
+		self.fast_cut_pending = false;
+		self.fast_cut_from = None;
+		if on {
+			// Nothing learned while frozen describes the new rate: start the climb counters over.
+			self.clean = 0;
+			self.at_ceiling = 0;
+			self.over = 0;
+			self.lossy = 0;
+			self.probe_age = None;
+			self.soft_limit = None;
+			self.raise = None;
+			self.startup_left = 0;
+			self.queue_cuts = 0;
+			self.since_step = 0;
+			self.delay.reset();
+		}
+	}
+
+	/// Whether the automatic adjustment runs (see [`set_adaptive`](Self::set_adaptive)).
+	pub fn adaptive(&self) -> bool {
+		!self.frozen
+	}
+
+	/// The wire rate a fixed (non-adaptive) session runs at when the user left the bitrate on
+	/// automatic: what the path proved it carries lately (`proven`, within its TTL), else the
+	/// last rate that stayed clean for half a minute, else the current target (the start / probe
+	/// estimate at the session's start). Never over the cap.
+	pub fn fixed_rate_kbps(&self) -> u32 {
+		let (pk, pw) = self.proven;
+		let proven = if pk > 0 && self.windows.saturating_sub(pw) <= PROVEN_TTL_WINDOWS { pk } else { 0 };
+		let r = if proven > 0 {
+			proven
+		} else if self.last_good > 0 {
+			self.last_good
+		} else {
+			self.target
+		};
+		r.clamp(FLOOR_KBPS.min(self.cap), self.cap)
+	}
+
+	/// The rate a stall may be ridden out at: what the path proved lately or the last good rate.
+	fn safe_rate(&self) -> u32 {
+		let (pk, pw) = self.proven;
+		let proven = if pk > 0 && self.windows.saturating_sub(pw) <= PROVEN_TTL_WINDOWS { pk } else { 0 };
+		proven.max(self.last_good)
 	}
 
 	/// The parity overhead observed on the wire (Reed-Solomon `m/k`, or `1/n` for the XOR
@@ -1130,6 +1326,14 @@ impl Controller {
 	/// Fast reflex between windows (call every ≤ 200 ms with the same clock as
 	/// `on_frame`): a sustained Overuse hypothesis cuts ×0.85 without waiting for the tick.
 	pub fn poll_fast(&mut self, now_ms: f64) -> Option<Decision> {
+		// No frame for far longer than usual: the link stalled (a handover). What arrives next
+		// is the buffered burst, whose delay ramp is not a queue our rate fills.
+		if self.frames_seen >= 30 && now_ms - self.last_arrival_ms > STALL_GAP_MS.max(self.gap_ema_ms * 8.0) {
+			self.stall_suspect_until_ms = self.stall_suspect_until_ms.max(now_ms + STALL_SUSPECT_MS);
+		}
+		if self.frozen || self.stall.is_some() || self.stall_grace > 0 || now_ms < self.stall_suspect_until_ms {
+			return None;
+		}
 		if self.delay.overuse_ms(now_ms) < FAST_OVERUSE_MS
 			|| now_ms - self.last_fast_cut_ms < FAST_COOLDOWN_MS
 			|| !self.can_cut()
@@ -1142,6 +1346,7 @@ impl Controller {
 		// This is the window's cut: the tick that closes it doesn't cut again.
 		self.fast_cut_pending = true;
 		let before = self.target;
+		self.fast_cut_from = Some((before, self.ceiling));
 		let mut d = Decision { reason: "delay overuse (fast) → ×0.85", ..Default::default() };
 		// Between ticks only the last window's RTT / loss can back the delay signal up.
 		let confirmed = self.last.excess_ms >= RTT_OK_MS || self.last.eff_loss > LOSS_CLEAN;
@@ -1169,6 +1374,12 @@ impl Controller {
 		if total > 0 {
 			self.data_windows += 1;
 		}
+		// The last window that carried a real stream (the blackout check of a stall).
+		let prev_total = self.prev_total;
+		if total >= 50 {
+			self.prev_total = total;
+		}
+		let fast_from = self.fast_cut_from.take();
 		let loss = if total > 0 { s.lost as f32 / total as f32 } else { 0.0 };
 		// The loss the rate logic judges — congestion triggers, the noise floor, the probe-down
 		// and loss-cut verdicts: pre-repair on a measured window (`raw_loss`), the post-repair
@@ -1251,6 +1462,31 @@ impl Controller {
 			self.recovery = self.preferred_recovery();
 			out.recovery = Some(self.recovery);
 			out.reason = "loss → recovery mode";
+		}
+
+		// Automatic adjustment off: measure only (the recovery flip above still runs).
+		if self.frozen {
+			self.fast_cut_pending = false;
+			self.settle_prev_target = self.target;
+			self.win_enc_ref = self.encoder_kbps;
+			return out;
+		}
+
+		// Stall vs congestion: a link that stops carrying for a few seconds is ridden out at the
+		// rate it carried before, not cut in a cascade.
+		if self.stall_step(s, total, raw, prev_total, fast_from, &mut out) {
+			return self.finish(out);
+		}
+		// The window after a stall: its drain (the buffered burst, the late Pongs, the delay ramp
+		// of frames that sat in the buffer) is not a queue this rate builds.
+		if self.stall_grace > 0 {
+			self.stall_grace -= 1;
+			if self.delay.state() == DelayState::Overuse || excess >= RTT_EXCESS_MS || eff > LOSS_DOWN {
+				self.clean = 0;
+				self.at_ceiling = 0;
+				out.reason = "stall drain — hold";
+				return self.finish(out);
+			}
 		}
 
 		// A probe-down is being judged: did the loss follow the rate?
@@ -1384,6 +1620,7 @@ impl Controller {
 			// overuse on a jittery radio link cuts the rate but doesn't lower the ceiling (once).
 			let confirmed = excess >= RTT_OK_MS || eff > LOSS_CLEAN;
 			self.queue_cut_now = true;
+			self.own_queue = true;
 			let punished = self.queue_cut(before, before * 85 / 100, confirmed, &mut out);
 			if out.reason.is_empty() {
 				out.reason = if punished { "delay overuse → ×0.85" } else { "delay overuse (unconfirmed) → ×0.85, ceiling kept" };
@@ -1406,12 +1643,14 @@ impl Controller {
 			let cut = if severe { before / 2 } else { before * 7 / 10 };
 			out.reason = if severe { "rtt bloat severe → halve" } else { "rtt bloat → ×0.7" };
 			self.queue_cut_now = true;
+			self.own_queue = true;
 			let _ = self.queue_cut(before, cut, true, &mut out);
 			return self.finish(out);
 		}
 		// No queue-driven cut this window: the run (if any) is over.
 		if !queued {
 			self.queue_cuts = 0;
+			self.own_queue = false;
 		}
 		// Severe loss (over the learned noise floor — with no noise learned, the raw loss).
 		if total > 100 && eff > LOSS_SEVERE && self.can_cut() {
@@ -1510,7 +1749,8 @@ impl Controller {
 				self.probe_age = None;
 				self.floor_escapes = 0;
 				self.probe_wait = (self.probe_wait / 2).max(PROBE_WAIT_MIN);
-				self.probe_step_pct = (self.probe_step_pct * 2).min(PROBE_STEP_MAX_PCT);
+				let max_step = if self.cfg.mobile { MOBILE_PROBE_STEP_MAX_PCT } else { PROBE_STEP_MAX_PCT };
+				self.probe_step_pct = (self.probe_step_pct * 2).min(max_step);
 				// Past the last loss episode's rate and clean: that limit is gone.
 				if self.target >= self.bad_rate {
 					self.bad_rate = 0;
@@ -1561,10 +1801,12 @@ impl Controller {
 				if !far {
 					self.recovering = false;
 				}
+				// A phone link climbs in smaller steps: its 1 s burst reads far above what it holds.
+				let (startup_f, far_f) = if self.cfg.mobile { (MOBILE_CLIMB_FACTOR, MOBILE_CLIMB_FACTOR) } else { (STARTUP_FACTOR, 1.5) };
 				let (need, factor) = if self.startup_left > 0 {
-					(1, STARTUP_FACTOR)
+					(1, startup_f)
 				} else if far {
-					(if self.recovering { 1 } else { 2 }, 1.5)
+					(if self.recovering { 1 } else { 2 }, far_f)
 				} else if gentle {
 					(2, 1.0 + NEAR_BAD_STEP_PCT as f64 / 100.0)
 				} else {
@@ -1679,6 +1921,141 @@ impl Controller {
 			self.deadband_acc = 0.0;
 		}
 		self.finish(out)
+	}
+
+	/// Stall vs congestion (see the module doc). `true` = this window was a stall window (entered,
+	/// held, ended or judged congestion) and `out` holds its decision; the caller finishes it.
+	///
+	/// A stall: the window's RTT (its mean, or its floor) many times the baseline
+	/// (`rtt_far`), or nothing arriving at all — no Pong and a fraction of the last stream's
+	/// packets — while the rate is one the path carried cleanly lately (`safe_rate`) and was not
+	/// just raised. Our own rate could not have built that queue: the link stopped carrying.
+	/// It is ridden out at the rate, the ceiling untouched (a fast-reflex cut made in the window
+	/// stands as the one bounded cut, its ceiling punishment is undone), and the rate before it
+	/// comes back once the RTT floor is back. A queue that keeps standing while the link
+	/// delivers (goodput near our rate), overflows, or outlasts `STALL_MAX_WINDOWS` is a real
+	/// capacity drop: cut to `GOODPUT_BETA` × delivered and the ceiling follows.
+	fn stall_step(
+		&mut self,
+		s: &Sample,
+		total: u32,
+		raw: f32,
+		prev_total: u32,
+		fast_from: Option<(u32, u32)>,
+		out: &mut Decision,
+	) -> bool {
+		let samples = s.rtt_ms.iter().filter(|&&x| x > 0.0).count();
+		let mean = if samples > 0 {
+			s.rtt_ms.iter().filter(|&&x| x > 0.0).sum::<f32>() / samples as f32
+		} else {
+			0.0
+		};
+		// A standing stall lifts every sample (the window's floor); a short one only the mean.
+		let standing = samples > 0 && self.rtt_far(self.rtt_floor);
+		let spike = samples > 0 && self.rtt_far(mean);
+		let blackout = samples == 0 && prev_total >= 50 && (total as u64) * 4 < prev_total as u64;
+		if let Some(mut st) = self.stall {
+			if !(standing || blackout) {
+				// The link is back: continue where it was, and let the drain pass (`stall_grace`).
+				self.stall = None;
+				self.stall_grace = 1;
+				self.delay.reset();
+				self.queued_prev = false;
+				self.loss_cut = None;
+				self.clean = 0;
+				self.at_ceiling = 0;
+				if self.target < st.resume {
+					let r = st.resume;
+					self.apply_rate(r, out);
+				}
+				out.reason = "link stall over → back to the pre-stall rate";
+				return true;
+			}
+			st.windows += 1;
+			if standing {
+				st.standing += 1;
+			}
+			let delivered = self.goodput.map(|g| g * (1.0 + self.fec_overhead));
+			// Unmeasured: a queue standing for two windows is congestion, as it always was.
+			let delivering = delivered.is_none_or(|d| d >= self.target as f32 * STALL_DELIVER_SHARE);
+			// The backlog the stall left is draining (the RTT falls through the window): that is
+			// the stall ending, not a queue our rate keeps up — and the loss of a phone buffer that
+			// overflowed while stalled isn't either.
+			let first = s.rtt_ms.iter().copied().find(|&x| x > 0.0).unwrap_or(0.0);
+			let last = s.rtt_ms.iter().copied().rfind(|&x| x > 0.0).unwrap_or(0.0);
+			let draining = samples >= 2 && last <= first * 0.85;
+			let congestion = st.windows >= STALL_MAX_WINDOWS
+				|| (standing && !draining && st.standing >= STALL_DELIVER_WINDOWS && delivering)
+				|| (standing && !draining && st.standing > STALL_DELIVER_WINDOWS && raw > self.noise_loss + LOSS_DOWN);
+			if congestion {
+				self.stall = None;
+				let before = st.resume.max(self.target);
+				if draining {
+					// Still draining after `STALL_MAX_WINDOWS`: our rate sits so close to the link's
+					// that the backlog barely shrinks. Cut to clear it, but this rate carried the
+					// path before the stall — the ceiling stays and the climb comes back to it.
+					let to = (before * 7 / 10).max(self.rate_min());
+					self.own_queue = true;
+					self.soft_reset();
+					self.apply_rate(to, out);
+					out.reason = "stall backlog drains too slowly → ×0.7 to clear it, ceiling kept";
+					return true;
+				}
+				self.punish(before);
+				let to = match delivered {
+					Some(d) if d > 0.0 => {
+						let d = d / (1.0 - self.noise_loss).max(0.3);
+						((d * GOODPUT_BETA) as u32).clamp(before / 2, before * 85 / 100)
+					}
+					_ => before / 2,
+				};
+				self.queue_cut_now = true;
+				self.own_queue = true;
+				self.startup_left = 0;
+				self.apply_rate(to, out);
+				out.reason = "stall persists with a standing queue → congestion, 0.85 × delivered";
+				return true;
+			}
+			self.stall = Some(st);
+			self.clean = 0;
+			self.at_ceiling = 0;
+			self.over = 0;
+			if out.reason.is_empty() {
+				out.reason = "link stall continues — hold";
+			}
+			return true;
+		}
+		if !(spike || standing || blackout) {
+			return false;
+		}
+		// The rate before the window's fast cut, if there was one.
+		let pre = fast_from.map_or(self.target, |(t, _)| t.max(self.target));
+		let safe = self.safe_rate();
+		let raised = self.in_probe()
+			|| self.raise.is_some_and(|(_, at)| self.windows.saturating_sub(at) <= RAISE_SUSPECT_WINDOWS)
+			|| self.startup_left > 0
+			|| self.own_queue;
+		if safe == 0 || pre as u64 * 100 > safe as u64 * STALL_SAFE_PCT || raised {
+			// Our rate is a suspect (above what the path proved, or just raised): the normal rules.
+			return false;
+		}
+		if let Some((_, c)) = fast_from {
+			// The fast reflex's cut stands (one bounded cut), its ceiling punishment doesn't.
+			self.ceiling = self.ceiling.max(c).min(self.cap);
+			self.soft_limit = None;
+			self.soft_cut_at = None;
+		}
+		self.queue_cuts = 0;
+		self.clean = 0;
+		self.at_ceiling = 0;
+		self.over = 0;
+		self.stall = Some(Stall { resume: pre, windows: 1, standing: u32::from(standing) });
+		out.reason = if blackout {
+			"link stall (nothing arrives) — hold, ceiling kept"
+		} else {
+			"link stall (rtt far over its base) — hold, ceiling kept"
+		};
+		true
 	}
 
 	/// Severe loss with a measured goodput (see the module doc, "Loss is measured").
@@ -1932,6 +2309,7 @@ impl Controller {
 		}
 		self.drain_left = self.drain_left.saturating_sub(1);
 		self.fast_cut_pending = false;
+		self.fast_cut_from = None;
 		let cur = self.points[self.point_idx];
 		self.point_short = if self.ladder_active() && self.want < cur.min_kbps { self.point_short + 1 } else { 0 };
 		self.apply_ladder(&mut out, false);
@@ -3125,6 +3503,194 @@ mod tests {
 			c.tick(&mwin(pkts(&c).max(1), 0, 40.0));
 		}
 		assert!(c.ceiling() < 6_500, "recovered twice: ceiling {}", c.ceiling());
+	}
+
+	/// A window of a stalled link: almost nothing arrives and the Pongs that do come back are
+	/// 0.9–1.8 s late (2026-11-15 phone tether, a handover).
+	fn stall_win() -> Sample {
+		Sample { recv: 30, lost: 0, rtt_ms: vec![900.0, 1400.0, 1800.0], recv_bytes: 30 * 1100, window_ms: 2000, ..Default::default() }
+	}
+
+	/// A controller that ran 10 Mbit cleanly at a 45 ms RTT for a few windows (proven ≈ 10 Mbit).
+	fn running_at_10mbit() -> Controller {
+		let mut c = Controller::new(cfg(20_000, false));
+		c.startup_left = 0;
+		c.want = 10_000;
+		c.target = 10_000;
+		c.ceiling = 10_000;
+		c.encoder_kbps = 10_000;
+		for _ in 0..6 {
+			c.tick(&mwin(pkts(&c), 0, 45.0));
+		}
+		assert!(c.proven.0 >= 9_500, "proven {:?}", c.proven);
+		assert_eq!(c.target_kbps(), 10_000);
+		c
+	}
+
+	/// Stall vs congestion (2026-11-15): a few seconds of a stalled link (RTT 40 ms → 1.8 s,
+	/// goodput ~0) at a rate the path carried cleanly is ridden out — no halving, no cut cascade,
+	/// the ceiling untouched — and the stream continues at the pre-stall rate.
+	#[test]
+	fn a_link_stall_holds_the_rate_and_keeps_the_ceiling() {
+		let mut c = running_at_10mbit();
+		let ceiling = c.ceiling();
+		for i in 0..3 {
+			let d = c.tick(&stall_win());
+			assert_eq!(d.bitrate, None, "stall window {i}: {d:?}");
+			assert!(c.stalled(), "window {i}: {d:?}");
+			assert_eq!(c.target_kbps(), 10_000, "window {i}: {d:?}");
+			assert_eq!(c.ceiling(), ceiling, "window {i}: {d:?}");
+		}
+		// The fast reflex stays off while stalled.
+		assert!(c.poll_fast(1.0e9).is_none());
+		// Back: the buffered burst arrives with late Pongs first, then the base RTT.
+		let d = c.tick(&Sample {
+			recv: 3_000,
+			lost: 0,
+			rtt_ms: vec![700.0, 45.0, 44.0],
+			recv_bytes: 3_000 * 1100,
+			window_ms: 2000,
+			..Default::default()
+		});
+		assert!(!c.stalled(), "{d:?}");
+		assert!(d.reason.contains("stall over"), "{d:?}");
+		// The drain window right after is not cut on either (a delay ramp, a little loss).
+		let d = c.tick(&Sample { recv: 2_200, lost: 90, rtt_ms: vec![120.0, 60.0, 45.0], recv_bytes: 2_200 * 1100, window_ms: 2000, ..Default::default() });
+		assert_eq!(c.target_kbps(), 10_000, "{d:?}");
+		for _ in 0..4 {
+			c.tick(&mwin(pkts(&c), 0, 45.0));
+		}
+		assert!(c.target_kbps() >= 10_000, "{}", c.target_kbps());
+		assert_eq!(c.ceiling(), ceiling);
+	}
+
+	/// The fast reflex may cut once at the stall's onset (between windows the RTT isn't known
+	/// yet); that is the one bounded cut — its ceiling punishment is undone and the pre-stall
+	/// rate comes back with the link.
+	#[test]
+	fn a_fast_cut_at_the_stall_onset_gives_its_ceiling_back() {
+		let mut c = running_at_10mbit();
+		let ceiling = c.ceiling();
+		// What `poll_fast` leaves behind after its ×0.85 cut that punished the ceiling.
+		c.fast_cut_from = Some((10_000, ceiling));
+		c.fast_cut_pending = true;
+		c.want = 8_500;
+		c.target = 8_500;
+		c.ceiling = 8_500;
+		let d = c.tick(&stall_win());
+		assert!(c.stalled(), "{d:?}");
+		assert_eq!(c.ceiling(), ceiling, "{d:?}");
+		assert_eq!(c.target_kbps(), 8_500, "no second cut: {d:?}");
+		c.tick(&stall_win());
+		let d = c.tick(&mwin(3_000, 0, 45.0));
+		assert_eq!(c.target_kbps(), 10_000, "back to the pre-stall rate: {d:?}");
+	}
+
+	/// A rate that was never proven (a startup / probe overshoot) is not excused as a stall: the
+	/// queue it built is cut as before.
+	#[test]
+	fn a_queue_over_an_unproven_rate_is_still_cut() {
+		let mut c = running_at_10mbit();
+		c.want = 16_000;
+		c.target = 16_000;
+		c.ceiling = 16_000;
+		c.encoder_kbps = 16_000;
+		let s = Sample { recv: 3_000, lost: 0, rtt_ms: vec![600.0, 650.0, 700.0], recv_bytes: 3_000 * 1100, window_ms: 2000, ..Default::default() };
+		c.tick(&s);
+		let d = c.tick(&s);
+		assert!(!c.stalled(), "{d:?}");
+		assert!(c.target_kbps() < 16_000, "{d:?}");
+	}
+
+	/// A real capacity drop under a proven rate still gets followed: a queue that keeps standing
+	/// while the link overflows (or delivers about our rate) is congestion — the rate is cut to
+	/// what the path delivers and the ceiling comes down with it.
+	#[test]
+	fn a_real_bottleneck_under_the_proven_rate_still_cuts() {
+		// (a) Capacity fell to 4 Mbit: the queue stands at ~0.8 s and overflows (8 % loss).
+		let mut c = running_at_10mbit();
+		let ceiling = c.ceiling();
+		let mut cut_at = None;
+		for w in 0..STALL_MAX_WINDOWS + 1 {
+			let d = c.tick(&Sample {
+				recv: 840,
+				lost: 70,
+				rtt_ms: vec![780.0, 820.0, 860.0],
+				recv_bytes: 840 * 1100,
+				window_ms: 2000,
+				..Default::default()
+			});
+			if c.target_kbps() < 10_000 {
+				cut_at = Some((w, d));
+				break;
+			}
+		}
+		let (w, d) = cut_at.expect("a standing, overflowing queue must be cut");
+		assert!(w <= 3, "cut only at window {w}: {d:?}");
+		assert!(c.ceiling() < ceiling, "{d:?}");
+		assert!(c.target_kbps() <= 5_000, "{d:?}");
+		// (b) A standing queue while the link still delivers ~our rate: a bottleneck AT our rate.
+		let mut c = running_at_10mbit();
+		let s = Sample { recv: 2_100, lost: 0, rtt_ms: vec![600.0, 640.0, 700.0], recv_bytes: 2_100 * 1100, window_ms: 2000, ..Default::default() };
+		c.tick(&s);
+		let d = c.tick(&s);
+		assert!(c.target_kbps() < 10_000, "{d:?}");
+		assert!(c.ceiling() < 10_000, "{d:?}");
+	}
+
+	/// The automatic adjustment off ("Otomatik ayar", Moonlight-like): the controller keeps
+	/// measuring but never moves the rate or the point; the recovery mode still flips; the fixed
+	/// rate for an automatic bitrate is what the path proved. Back on, it adapts again.
+	#[test]
+	fn adaptive_off_holds_rate_and_point_and_on_resumes() {
+		let mut c = running_at_10mbit();
+		c.set_adaptive(false);
+		assert!(!c.adaptive());
+		let mut flipped = false;
+		for _ in 0..8 {
+			let d = c.tick(&Sample { recv: 1_800, lost: 400, rtt_ms: vec![300.0, 320.0], recv_bytes: 1_800 * 1100, window_ms: 2000, ..Default::default() });
+			assert_eq!(d.bitrate, None, "{d:?}");
+			assert_eq!(d.point, None, "{d:?}");
+			flipped |= d.recovery.is_some();
+		}
+		assert!(c.poll_fast(1.0e9).is_none());
+		assert!(flipped, "the recovery mode still flips on loss");
+		assert!((9_500..=10_500).contains(&c.fixed_rate_kbps()), "{}", c.fixed_rate_kbps());
+		c.set_adaptive(true);
+		c.set_target(10_000);
+		let mut cut = false;
+		for _ in 0..4 {
+			let d = c.tick(&Sample { recv: 1_800, lost: 400, rtt_ms: vec![300.0, 320.0], recv_bytes: 1_800 * 1100, window_ms: 2000, ..Default::default() });
+			cut |= d.bitrate.is_some();
+		}
+		assert!(cut && c.target_kbps() < 10_000, "{}", c.target_kbps());
+	}
+
+	#[test]
+	fn a_mobile_link_starts_capped_and_climbs_gently() {
+		let mut cfg = Config::new(VCodec::H264, 20_000);
+		cfg.start_kbps = 16_800;
+		cfg.mobile = true;
+		let mut c = Controller::new(cfg);
+		assert_eq!(c.target_kbps(), MOBILE_START_KBPS);
+		let d = c.tick(&mwin(pkts(&c), 0, 45.0));
+		assert_eq!(c.target_kbps(), (MOBILE_START_KBPS as f64 * MOBILE_CLIMB_FACTOR) as u32, "{d:?}");
+		// Not mobile: the same start is kept.
+		let mut cfg = Config::new(VCodec::H264, 20_000);
+		cfg.start_kbps = 16_800;
+		assert_eq!(Controller::new(cfg).target_kbps(), 16_800);
+	}
+
+	#[test]
+	fn a_session_can_start_in_intra_refresh() {
+		let mut cfg = cfg(20_000, true);
+		cfg.initial_recovery = LossRecovery::IntraRefresh;
+		let mut c = Controller::new(cfg);
+		assert_eq!(c.recovery(), LossRecovery::IntraRefresh);
+		for _ in 0..3 {
+			let d = c.tick(&win(900, 100, 40.0));
+			assert_eq!(d.recovery, None, "{d:?}");
+		}
 	}
 
 	#[test]

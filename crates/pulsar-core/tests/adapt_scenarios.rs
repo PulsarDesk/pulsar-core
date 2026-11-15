@@ -1046,3 +1046,130 @@ fn a_session_does_not_start_on_the_last_resort_rung() {
 		assert_ne!(ctl.point().label(), "720p30", "game={game}");
 	}
 }
+
+/// The 2026-11-15 phone-tether session, replayed frame by frame: ~14 Mbit when clean, a 45 ms
+/// base RTT with ±20 ms jitter, handover stalls of 1.5–5 s (nothing gets through, the phone
+/// buffers it, the Pongs come back 1–5 s late, then the backlog arrives as one burst), and a
+/// 5 % loss burst every ~75 s. The field run read each stall as congestion — "rtt bloat severe
+/// → halve", repeated fast ×0.85 cuts, each lowering the ceiling — 14 → 0.33 Mbit in a minute.
+/// Ridden out as stalls, the rate must stay near what the path proved and the climb must not
+/// stall behind punished ceilings. (Reordering, ~20 % on that link, is the hold loop's business
+/// — the reorder wait — and never reaches the controller as loss.)
+#[test]
+fn a_tethered_link_with_handover_stalls_keeps_its_rate() {
+	const CAP_KBPS: f64 = 14_000.0;
+	const OWD_MS: f64 = 22.0;
+	const FRAME_MS: f64 = 1000.0 / 60.0;
+	// (start ms, length ms) of each stall.
+	const STALLS: [(f64, f64); 6] =
+		[(41_000.0, 3_000.0), (91_300.0, 1_500.0), (141_700.0, 4_000.0), (191_100.0, 2_500.0), (241_500.0, 5_000.0), (301_900.0, 2_000.0)];
+	let mut cfg = Config::new(VCodec::H265, 16_817);
+	cfg.native = (1920, 1080, 120);
+	cfg.ladder = true;
+	cfg.min_fps = 60;
+	cfg.min_height = 720;
+	// The session-start probe read 21 Mbit (the phone's burst): start at 80 % of it, capped.
+	cfg.start_kbps = 16_816;
+	cfg.startup_windows = 0;
+	let mut ctl = Controller::new(cfg);
+	let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+	let mut queue_bits = 0.0f64;
+	let queue_max_bits = CAP_KBPS * 1000.0 * 2.0; // a phone buffers seconds
+	// In flight: (arrival ms, packets, lost packets, rtp ts) per frame, and Pong arrivals.
+	let mut frames: std::collections::VecDeque<(f64, u32, u32, u32)> = std::collections::VecDeque::new();
+	let mut pongs: Vec<(f64, f32)> = Vec::new();
+	let (mut recv, mut lost, mut bytes) = (0u32, 0u32, 0u64);
+	let mut rtts: Vec<f32> = Vec::new();
+	let mut trace: Vec<String> = Vec::new();
+	let mut min_late = u32::MAX;
+	let mut cuts_in_stalls = 0;
+	let windows = 180u32;
+	for w in 0..windows {
+		let w0 = w as f64 * 2000.0;
+		for i in 0..120u32 {
+			let t = w0 + i as f64 * FRAME_MS;
+			let stall_end = STALLS.iter().find(|(s, l)| t >= *s && t < s + l).map(|(s, l)| s + l);
+			let jitter = Path::uniform(&mut rng) * 20.0;
+			// Send this frame at the controller's encoder rate.
+			let bits = ctl.encoder_kbps() as f64 * FRAME_MS;
+			let pkts = ((bits / 8.0 / 1100.0).ceil() as u32).max(1);
+			let ahead = queue_bits;
+			queue_bits += bits;
+			let mut drop = 0;
+			if queue_bits > queue_max_bits {
+				drop = (((queue_bits - queue_max_bits) / bits) * pkts as f64).ceil().min(pkts as f64) as u32;
+				queue_bits = queue_max_bits;
+			}
+			// A 5 % loss burst every ~75 s (radio), a little random loss otherwise.
+			let burst = w % 37 == 36;
+			let p_loss = if burst { 0.05 } else { 0.002 };
+			for _ in 0..pkts.saturating_sub(drop) {
+				if Path::uniform(&mut rng) < p_loss {
+					drop += 1;
+				}
+			}
+			let wait = stall_end.map_or(0.0, |e| e - t) + ahead / (CAP_KBPS * 1000.0) * 1000.0;
+			frames.push_back((t + OWD_MS + wait + jitter, pkts, drop.min(pkts), (t * 90.0) as u32));
+			// The link drains at its capacity, not at all while stalled.
+			if stall_end.is_none() {
+				queue_bits = (queue_bits - CAP_KBPS * FRAME_MS).max(0.0);
+			}
+			// A Ping every ~500 ms: its Pong rides the same downlink queue.
+			if i % 30 == 15 {
+				let rtt = 2.0 * OWD_MS + stall_end.map_or(0.0, |e| e - t) + queue_bits / (CAP_KBPS * 1000.0) * 1000.0 + jitter;
+				pongs.push((t + rtt, rtt as f32));
+			}
+			// Everything that has arrived by now: frames to the delay estimator, Pongs to on_rtt.
+			while frames.front().is_some_and(|f| f.0 <= t) {
+				let (arr, n, l, ts) = frames.pop_front().unwrap();
+				ctl.on_frame(ts, arr);
+				recv += n - l;
+				lost += l;
+				bytes += (n - l) as u64 * 1100;
+			}
+			pongs.retain(|&(arr, rtt)| {
+				if arr <= t {
+					ctl.on_rtt(rtt, t);
+					rtts.push(rtt);
+					false
+				} else {
+					true
+				}
+			});
+			if i % 6 == 0 {
+				if let Some(d) = ctl.poll_fast(t) {
+					if STALLS.iter().any(|(s, l)| t >= *s && t < s + l + 2000.0) {
+						cuts_in_stalls += 1;
+					}
+					trace.push(format!("w{w} fast {} {}", ctl.target_kbps(), d.reason));
+				}
+			}
+		}
+		let s = Sample { recv, lost, rtt_ms: std::mem::take(&mut rtts), recv_bytes: bytes, window_ms: 2000, ..Default::default() };
+		(recv, lost, bytes) = (0, 0, 0);
+		let d = ctl.tick(&s);
+		trace.push(format!(
+			"w{w} recv={} lost={} rtt={:?} target={} ceiling={} {}",
+			s.recv,
+			s.lost,
+			s.rtt_ms.iter().map(|x| *x as u32).collect::<Vec<_>>(),
+			ctl.target_kbps(),
+			ctl.ceiling(),
+			d.reason
+		));
+		if w >= 20 {
+			min_late = min_late.min(ctl.target_kbps());
+		}
+	}
+	let dump = || trace.join("\n");
+	if std::env::var_os("ADAPT_TRACE").is_some() {
+		println!("{}", dump());
+	}
+	// The path carries ~14 Mbit: after the first settle the rate never collapses under a third
+	// of it (the field run went to 0.33 Mbit), and ends close to it.
+	assert!(min_late as f64 >= CAP_KBPS * 0.35, "collapsed to {min_late}\n{}", dump());
+	assert!(ctl.target_kbps() as f64 >= CAP_KBPS * 0.6, "ended at {}\n{}", ctl.target_kbps(), dump());
+	assert!(ctl.ceiling() as f64 >= CAP_KBPS * 0.6, "ceiling {}\n{}", ctl.ceiling(), dump());
+	assert!(ctl.point().height >= 1080, "point {}\n{}", ctl.point().label(), dump());
+	let _ = cuts_in_stalls;
+}

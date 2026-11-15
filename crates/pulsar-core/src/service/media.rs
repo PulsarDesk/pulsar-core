@@ -433,6 +433,12 @@ pub const FEAT_GESTURE: &str = "gesture";
 /// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
 /// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.
 pub const FEAT_RFI: &str = "rfi";
+/// Feature id: the host's default encoder really streams periodic intra refresh when asked
+/// ([`LossRecovery::IntraRefresh`](crate::service::LossRecovery::IntraRefresh)) — a loss heals
+/// within the refresh wave, no keyframe. A host without it falls back to a short GOP, which a
+/// client that asked for intra refresh can only conceal until the next keyframe, so clients
+/// ask for it only from hosts that say so (and from Linux libav paths that always could).
+pub const FEAT_IR: &str = "ir";
 /// Tag byte: a bandwidth-probe packet follows (`adapt::probe::Hdr` + padding). Only sent in
 /// answer to a client's [`DataMsg::ProbeReq`](crate::service::DataMsg::ProbeReq), so a client
 /// that never asks never sees one.
