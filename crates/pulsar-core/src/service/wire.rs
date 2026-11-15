@@ -59,7 +59,9 @@ pub enum InputEvent {
 	/// Relative pointer movement (raw mouse deltas) — used by the native renderer,
 	/// where there's no canvas to read absolute positions from (and what games want).
 	PointerRelative { dx: f64, dy: f64 },
-	/// Mouse button (0=left, 1=right, 2=middle) pressed/released.
+	/// Mouse button pressed/released: 0=left, 1=right, 2=middle, 3=back (X1), 4=forward (X2)
+	/// ([`crate::input::mouse_button`]). 3 / 4 go only to hosts that advertise
+	/// [`crate::service::media::FEAT_MOUSE_X`]; hosts ignore ids they do not know.
 	PointerButton { button: u8, down: bool },
 	/// Smooth scroll delta.
 	Scroll { dx: f64, dy: f64 },

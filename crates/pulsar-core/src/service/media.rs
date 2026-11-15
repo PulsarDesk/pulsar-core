@@ -429,6 +429,10 @@ pub const FEAT_TOUCH: &str = "touch";
 /// Feature id: the host performs 3 / 4-finger touchpad gestures (`InputEvent::Gesture`) as
 /// its own OS defines them (`input::gesture::HostGestures`).
 pub const FEAT_GESTURE: &str = "gesture";
+/// Host injects the mouse side buttons (`PointerButton` 3 = back / X1, 4 = forward / X2, see
+/// [`crate::input::mouse_button`]). Older hosts turned unknown button ids into a LEFT click,
+/// so clients send the side buttons only to hosts that advertise this.
+pub const FEAT_MOUSE_X: &str = "mouse_x";
 /// Feature id: the host recovers a lost frame by reference-frame invalidation
 /// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
 /// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.
