@@ -112,7 +112,7 @@ pub enum Transport {
 /// Returns `None` (so the caller fails the connection gracefully) if the blob is
 /// too short — never index-slices an untrusted, attacker-influenced buffer.
 /// `< 64` (not `!= 64`): the blob may carry the optional LAN-candidate tail
-/// (see [`parse_lan_candidate`]) — anything after the fixed part is tolerated.
+/// (see [`parse_lan_candidates`]) — anything after the fixed part is tolerated.
 fn split_handshake(blob: &[u8]) -> Option<([u8; 32], PeerHs, u8)> {
 	if blob.len() < 64 {
 		return None;
@@ -140,37 +140,80 @@ const HS_BLOB_LEN: usize = 104;
 /// Capabilities this build advertises in its handshakes.
 pub(crate) const OUR_CAPS: u8 = CAP_PAKE | CAP_TOTP;
 
+/// Handshake-blob extension carrying the EXTRA LAN candidates (after the v1 extension):
+/// `ver(1) || n(1) || n × (v4 ip(4) || port(2))`. Old peers stop reading at the v1
+/// extension, so this needs no protocol bump; the relay forwards the blob as opaque bytes.
+const HS_EXT_LANS: u8 = 0x02;
+/// At most this many LAN candidates in one blob (the primary in the LAN slot + extras).
+const MAX_LAN_CANDIDATES: usize = 6;
+
 /// Relay-path handshake blob. The LAN slot is ALWAYS written (zeros = none, which
-/// `parse_lan_candidate` reads as absent) so old peers, which read bytes 64..70 as the
+/// `parse_lan_candidates` reads as absent) so old peers, which read bytes 64..70 as the
 /// LAN candidate and ignore anything after, keep working; new peers read the extension.
-fn handshake_blob(pubkey: [u8; 32], hs: &LocalHs, lan: Option<SocketAddr>) -> Vec<u8> {
-	let mut blob = Vec::with_capacity(HS_BLOB_LEN);
+/// `lans[0]` (the default-route address) goes in the LAN slot; the other v4 candidates (a
+/// second NIC, the LAN address behind a full-tunnel VPN) ride the [`HS_EXT_LANS`] tail.
+fn handshake_blob(pubkey: [u8; 32], hs: &LocalHs, lans: &[SocketAddr]) -> Vec<u8> {
+	let v4: Vec<std::net::SocketAddrV4> = lans
+		.iter()
+		.filter_map(|a| match a {
+			SocketAddr::V4(a) => Some(*a),
+			_ => None,
+		})
+		.take(MAX_LAN_CANDIDATES)
+		.collect();
+	let mut blob = Vec::with_capacity(HS_BLOB_LEN + 2 + 6 * v4.len().saturating_sub(1));
 	blob.extend_from_slice(&pubkey);
 	blob.extend_from_slice(&hs.salt);
-	match lan {
-		Some(SocketAddr::V4(a)) => {
+	match v4.first() {
+		Some(a) => {
 			blob.extend_from_slice(&a.ip().octets());
 			blob.extend_from_slice(&a.port().to_be_bytes());
 		}
-		_ => blob.extend_from_slice(&[0u8; 6]),
+		None => blob.extend_from_slice(&[0u8; 6]),
 	}
 	blob.push(HS_EXT_V1);
 	blob.push(OUR_CAPS);
 	blob.extend_from_slice(&hs.eph_public());
+	if v4.len() > 1 {
+		blob.push(HS_EXT_LANS);
+		blob.push((v4.len() - 1) as u8);
+		for a in &v4[1..] {
+			blob.extend_from_slice(&a.ip().octets());
+			blob.extend_from_slice(&a.port().to_be_bytes());
+		}
+	}
 	blob
 }
 
-/// Optional same-LAN punch candidate appended to the 64-byte handshake blobs:
-/// `v4 ip(4) || port(2)`, big-endian. Two peers behind the SAME NAT only ever
-/// learn each other's PUBLIC address from the relay, so their "direct" path is a
-/// router hairpin — which measurably drops a double-digit share of a 15 Mbit
-/// stream on consumer gear. Punching the private candidate too lets same-LAN
-/// peers go truly direct. Absent tail (old peer) → `None`, unchanged fallback.
-fn parse_lan_candidate(blob: &[u8]) -> Option<SocketAddr> {
-	let t = blob.get(64..70)?;
-	let ip = std::net::Ipv4Addr::new(t[0], t[1], t[2], t[3]);
-	let port = u16::from_be_bytes([t[4], t[5]]);
-	(!ip.is_unspecified() && port != 0).then(|| SocketAddr::new(ip.into(), port))
+/// Optional same-LAN punch candidates appended to the 64-byte handshake blobs:
+/// `v4 ip(4) || port(2)`, big-endian, in the LAN slot, plus the [`HS_EXT_LANS`] tail.
+/// Two peers behind the SAME NAT only ever learn each other's PUBLIC address from the
+/// relay, so their "direct" path is a router hairpin — which measurably drops a
+/// double-digit share of a 15 Mbit stream on consumer gear. Punching the private
+/// candidates too lets same-LAN peers go truly direct. Absent tail (old peer) → empty,
+/// unchanged fallback. The primary (LAN-slot) candidate comes first.
+fn parse_lan_candidates(blob: &[u8]) -> Vec<SocketAddr> {
+	let entry = |t: &[u8]| {
+		let ip = std::net::Ipv4Addr::new(t[0], t[1], t[2], t[3]);
+		let port = u16::from_be_bytes([t[4], t[5]]);
+		(!ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() && port != 0)
+			.then(|| SocketAddr::new(ip.into(), port))
+	};
+	let mut out: Vec<SocketAddr> = Vec::new();
+	if let Some(a) = blob.get(64..70).and_then(entry) {
+		out.push(a);
+	}
+	if blob.get(70) == Some(&HS_EXT_V1) && blob.get(HS_BLOB_LEN) == Some(&HS_EXT_LANS) {
+		let n = (*blob.get(HS_BLOB_LEN + 1).unwrap_or(&0) as usize).min(MAX_LAN_CANDIDATES - 1);
+		for i in 0..n {
+			let at = HS_BLOB_LEN + 2 + i * 6;
+			let Some(a) = blob.get(at..at + 6).and_then(entry) else { break };
+			if !out.contains(&a) {
+				out.push(a);
+			}
+		}
+	}
+	out
 }
 
 /// RFC1918/link-local/loopback v4 — the "prefer the LAN path" test for punches.

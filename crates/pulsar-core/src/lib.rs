@@ -21,6 +21,7 @@ pub mod displays;
 pub mod input;
 pub mod macos_capture;
 pub mod media;
+pub mod netpath;
 pub mod netwatch;
 #[cfg(target_os = "macos")]
 pub mod overlay_macos;

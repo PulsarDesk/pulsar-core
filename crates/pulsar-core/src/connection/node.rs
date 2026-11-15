@@ -145,11 +145,14 @@ impl Node {
 		identity: Identity,
 		creds: RelayCreds,
 	) -> std::io::Result<Arc<Self>> {
-		// Media-over-session rides THIS one socket: a 15 Mbit stream's IDR bursts
-		// overflow the kernel-default ~208 KiB rcvbuf (UdpRcvbufErrors → silent
-		// packet loss → broken reference chains / mosaic under motion). Ask for
-		// 4 MiB each way before binding; the kernel clamps to rmem_max/wmem_max,
-		// so this is best-effort (Pi has 16 MiB, stock desktops 4 MiB+).
+		// Media-over-session rides THIS one socket: a 15-150 Mbit stream's IDR / FEC bursts
+		// overflow a small rcvbuf (UdpRcvbufErrors → silent packet loss that reads as network
+		// loss → NACKs, ABR cuts, broken reference chains). Ask for 4 MiB each way before
+		// binding. Stock Linux clamps that SILENTLY to net.core.rmem_max = 208 KiB (only a
+		// tuned box — the Pi image, a gaming distro — has more); Android clamps hard too.
+		// `tune_udp_buffers` tries SO_RCVBUFFORCE when the clamp hit (works with CAP_NET_ADMIN
+		// only); the deb/rpm ship /usr/lib/sysctl.d/60-pulsar.conf. A buffer still under
+		// 1 MiB is a WARNING with the fix, not an info line nobody reads.
 		let sock = {
 			use socket2::{Domain, Protocol, Socket, Type};
 			let domain = if local.is_ipv4() {
@@ -158,16 +161,17 @@ impl Node {
 				Domain::IPV6
 			};
 			let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-			let want: usize = 4 << 20;
-			let _ = s.set_recv_buffer_size(want);
-			let _ = s.set_send_buffer_size(want);
-			// A16: read the rcvbuf back — the kernel silently CLAMPS the request to
-			// rmem_max (Android clamps it hard), and a too-small rcvbuf is exactly what
-			// drops packets during an IDR burst. Log the achieved size so a clamp is
-			// visible in the logs instead of being invisible. (Linux reports ~2x the
-			// requested value by convention — that's expected, not the request itself.)
-			if let Ok(got) = s.recv_buffer_size() {
-				tracing::info!(requested = want, achieved = got, "UDP recv buffer");
+			let r = crate::netpath::tune_udp_buffers(&s, crate::netpath::UDP_BUF_WANT);
+			if r.ok() {
+				tracing::info!(requested = r.requested, recv = r.recv, send = r.send, forced = r.forced, "UDP socket buffers");
+			} else {
+				tracing::warn!(
+					requested = r.requested,
+					recv = r.recv,
+					send = r.send,
+					"UDP receive buffer is under 1 MiB: stream bursts will be dropped by the kernel — {}",
+					crate::netpath::udp_buf_hint()
+				);
 			}
 			s.set_nonblocking(true)?;
 			s.bind(&local.into())?;
@@ -277,11 +281,40 @@ impl Node {
 		}
 	}
 
-	/// Append our LAN candidate (`v4 ip(4) || port(2)`, big-endian) to a handshake
-	/// blob — the counterpart of `parse_lan_candidate`. No-op without a candidate.
-	/// Our relay-path handshake blob for `hs` (see `handshake_blob`).
+	/// Every same-LAN punch candidate we offer: the default-route address first (what
+	/// [`Self::lan_candidate`] returns), then the private v4 address of every other up NIC
+	/// (Ethernet + Wi-Fi at once; the real LAN address while a full-tunnel VPN owns the
+	/// default route). Overlay VPN and virtual / container interfaces are left out: a
+	/// ZeroTier or WireGuard address is not a LAN path (and would win the private-path
+	/// preference over the native one), a Docker / Hyper-V bridge never leads to another
+	/// machine.
+	pub(super) fn lan_candidates(&self) -> Vec<SocketAddr> {
+		let Ok(port) = self.sock.local_addr().map(|a| a.port()) else {
+			return Vec::new();
+		};
+		let mut out: Vec<SocketAddr> = self.lan_candidate().into_iter().collect();
+		if let Ok(ifs) = if_addrs::get_if_addrs() {
+			for i in ifs {
+				let std::net::IpAddr::V4(v4) = i.ip() else { continue };
+				if !v4.is_private()
+					|| crate::netpath::is_overlay_iface_name(&i.name)
+					|| crate::netpath::is_virtual_iface_name(&i.name)
+				{
+					continue;
+				}
+				let a = SocketAddr::new(v4.into(), port);
+				if !out.contains(&a) {
+					out.push(a);
+				}
+			}
+		}
+		out
+	}
+
+	/// Our relay-path handshake blob for `hs` (see `handshake_blob`), carrying our LAN
+	/// candidates (`parse_lan_candidates` is the counterpart).
 	pub(super) fn handshake_blob(&self, hs: &LocalHs) -> Vec<u8> {
-		handshake_blob(self.identity.public_bytes(), hs, self.lan_candidate())
+		handshake_blob(self.identity.public_bytes(), hs, &self.lan_candidates())
 	}
 
 	pub fn public_key(&self) -> [u8; 32] {
@@ -498,7 +531,7 @@ impl Node {
 		}
 		// Handshake blob: static pubkey(32) || fresh session salt(32) || optional
 		// LAN candidate (same-NAT peers punch our PRIVATE addr too — see
-		// `parse_lan_candidate`).
+		// `parse_lan_candidates`).
 		let hello = self.handshake_blob(&our_hs);
 		self.sock
 			.send_to(
@@ -836,4 +869,48 @@ pub(super) async fn heartbeat_loop(weak: Weak<Node>) {
 				.await;
 		}
 	}
+}
+
+/// The peer's LAN candidates worth punching: its primary (LAN-slot) candidate as before, plus
+/// each EXTRA one that lies on a subnet of one of our own LAN interfaces (`local`: address +
+/// netmask) — a private address off our subnets is not reachable directly, and punching it
+/// could only hit an unrelated machine. Never one of our own addresses (a same-machine
+/// bridge address both ends share).
+pub(super) fn usable_peer_lans(cands: Vec<SocketAddr>, local: &[(std::net::Ipv4Addr, std::net::Ipv4Addr)]) -> Vec<SocketAddr> {
+	let mut it = cands.into_iter();
+	let mut out: Vec<SocketAddr> = it.next().into_iter().collect();
+	for c in it {
+		let SocketAddr::V4(c4) = c else { continue };
+		let ip = u32::from(*c4.ip());
+		let own = local.iter().any(|(a, _)| a == c4.ip());
+		let on_subnet = local.iter().any(|(a, m)| {
+			let m = u32::from(*m);
+			m != 0 && (u32::from(*a) & m) == (ip & m)
+		});
+		if on_subnet && !own && !out.contains(&c) {
+			out.push(c);
+		}
+	}
+	out
+}
+
+/// Our own LAN interfaces (address, netmask) for [`usable_peer_lans`]: private v4, not an
+/// overlay VPN or virtual bridge.
+pub(super) fn local_lan_ifaces() -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+	if_addrs::get_if_addrs()
+		.map(|ifs| {
+			ifs.into_iter()
+				.filter_map(|i| match i.addr {
+					if_addrs::IfAddr::V4(a)
+						if a.ip.is_private()
+							&& !crate::netpath::is_overlay_iface_name(&i.name)
+							&& !crate::netpath::is_virtual_iface_name(&i.name) =>
+					{
+						Some((a.ip, a.netmask))
+					}
+					_ => None,
+				})
+				.collect()
+		})
+		.unwrap_or_default()
 }
