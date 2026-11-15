@@ -3693,6 +3693,41 @@ mod tests {
 		}
 	}
 
+	/// 2026-11-15, host on home Wi-Fi → a friend: every 5th 2 s window (10 s) lost ~6 % of
+	/// its packets before repair, FEC / NACK got nearly all back (post-repair 0-2 %), RTT flat
+	/// at ~20 ms, the rate far under the path. The controller still walked 11.5 → 3.5 Mbit in
+	/// three minutes. A periodic, repaired, unqueued burst at a steady rate must not ratchet
+	/// the rate down.
+	#[test]
+	fn periodic_repaired_bursts_do_not_ratchet_the_rate_down() {
+		let mut c = Controller::new(cfg(30_000, false));
+		c.startup_left = 0;
+		c.ceiling = 30_000;
+		c.target = 11_000;
+		c.want = 11_000;
+		let start = c.target_kbps();
+		let mut reasons = Vec::new();
+		for w in 0..90u32 {
+			let n = pkts(&c).max(10);
+			let mut s = mwin(n, 0, 20.0);
+			if w % 5 == 4 {
+				// ~6 % dropped on the path, all but ~0.5 % repaired.
+				let dropped = n * 6 / 100;
+				let left = n / 200;
+				s.lost = left;
+				s.recv = n - left;
+				s.nack_ok = (dropped - left) * 2 / 3;
+				s.fec_ok = dropped - left - s.nack_ok;
+				s.nack_sent = dropped;
+			}
+			let d = c.tick(&s);
+			if !d.reason.is_empty() {
+				reasons.push(format!("w{w} {} {}", c.target_kbps(), d.reason));
+			}
+		}
+		assert!(c.target_kbps() * 10 >= start * 8, "{start} → {}: {reasons:#?}", c.target_kbps());
+	}
+
 	#[test]
 	fn no_memory_starts_cautiously_under_the_cap() {
 		assert_eq!(Controller::new(Config::new(VCodec::H264, 15_000)).target_kbps(), START_KBPS_NO_MEMORY);
