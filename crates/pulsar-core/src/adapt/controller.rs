@@ -188,6 +188,13 @@ pub const POINT_RETRY_WINDOWS: u32 = 150;
 pub const POINT_RETRY_MAX: u32 = 1200;
 /// Under this share of the ceiling the climb runs at the startup pace.
 pub const FAST_CLIMB_SHARE: f32 = 0.5;
+/// How long a rate the path DELIVERED cleanly stays proven (windows, ~5 min).
+pub const PROVEN_TTL_WINDOWS: u32 = 150;
+/// Collapse recovery: when the rate sits at a quarter or less of the proven rate and the link
+/// has been clean for this many windows at it, the ceiling comes back to
+/// RECOVER_SHARE_PCT % of the proven rate and the climb is the fast one.
+pub const RECOVER_CLEAN_WINDOWS: u32 = 3;
+pub const RECOVER_SHARE_PCT: u64 = 50;
 /// Starting rate (kbit/s) without a per-peer memory (`Config::start_kbps` 0), capped by the
 /// cap. Was the cap itself: a 15 Mbit pick opened a 10 Mbit mobile link at 15 Mbit and the
 /// first seconds were 35–40 % loss.
@@ -496,6 +503,13 @@ pub struct Controller {
 	// Memory.
 	clean_at_target: u32,
 	last_good: u32,
+	/// The highest rate the path delivered in a clean window (no loss over noise, no RTT
+	/// excess) and the window it was last confirmed in — see PROVEN_TTL_WINDOWS.
+	proven: (u32, u32),
+	/// The proven rate a collapse recovery already used (one recovery per proven value).
+	recovered_for: u32,
+	/// A collapse recovery is climbing: the fast climb steps every clean window, not every second.
+	recovering: bool,
 	/// Startup-settle bookkeeping (see `startup_settled`): the target at the previous window's
 	/// end, and the window of the last rate cut / operating-point change.
 	settle_prev_target: u32,
@@ -795,6 +809,9 @@ impl Controller {
 			last_fast_cut_ms: -1.0e9,
 			clean_at_target: 0,
 			last_good: 0,
+			proven: (0, 0),
+			recovered_for: 0,
+			recovering: false,
 			settle_prev_target: start,
 			last_cut_window: 0,
 			last_point_window: 0,
@@ -1205,6 +1222,20 @@ impl Controller {
 			goodput_kbps: self.goodput.unwrap_or(0.0),
 			send_kbps: self.send_est.unwrap_or(0.0),
 		};
+		// What the path has PROVEN it carries: the wire rate of a clean window (no loss over the
+		// noise floor, no RTT excess). Kept for PROVEN_TTL_WINDOWS while windows near it keep
+		// confirming it. Collapse recovery climbs back toward it (see the clean branch).
+		if let Some(g) = self.goodput {
+			if total > 0 && eff <= LOSS_CLEAN && excess < RTT_EXCESS_MS {
+				let wire = (g * (1.0 + self.fec_overhead)) as u32;
+				let (pk, pw) = self.proven;
+				if wire >= pk || self.windows.saturating_sub(pw) > PROVEN_TTL_WINDOWS {
+					self.proven = (wire, self.windows);
+				} else if wire as u64 * 10 >= pk as u64 * 8 {
+					self.proven.1 = self.windows;
+				}
+			}
+		}
 		let mut out = Decision::default();
 
 		// Loss-recovery mode: flip once, on the first sustained loss.
@@ -1498,6 +1529,27 @@ impl Controller {
 					self.point_cap -= 1;
 				}
 			}
+			// Collapse recovery: a stall (a mobile handover: RTT 50 ms → 1.8 s for a few seconds)
+			// cut the rate to the floor and each cut lowered the ceiling under it — 14 Mbit to
+			// 0.33 Mbit in a minute on a phone tether (2026-11-15), then a 60 s probe wait and +8 %
+			// steps: minutes back. When the link is clean again at a quarter or less of what it
+			// proved minutes ago, give the ceiling back half of that and climb fast; if the link
+			// really got worse, the climb meets the queue and is cut as usual (once per proven rate).
+			let (pk, pw) = self.proven;
+			if pk > 0
+				&& self.windows.saturating_sub(pw) <= PROVEN_TTL_WINDOWS
+				&& self.recovered_for != pk
+				&& self.target as u64 * 4 <= pk as u64
+				&& self.clean_at_target >= RECOVER_CLEAN_WINDOWS
+			{
+				self.recovered_for = pk;
+				self.ceiling = self.ceiling.max((pk as u64 * RECOVER_SHARE_PCT / 100) as u32).min(self.cap);
+				self.bad_rate = 0;
+				self.probe_wait = PROBE_WAIT_MIN;
+				self.clean = self.clean.max(1);
+				self.recovering = true;
+				out.reason = "clean again after a collapse → ceiling back to half the proven rate";
+			}
 			if self.target < self.ceiling {
 				self.clean += 1;
 				self.at_ceiling = 0;
@@ -1506,10 +1558,13 @@ impl Controller {
 				// to it in small steps, never one ×1.25 jump that lands on the old failure (the
 				// pol10 run went 8.2 → 10.2 Mbit, the rate that had just failed, in one window).
 				let gentle = self.bad_rate > 0;
+				if !far {
+					self.recovering = false;
+				}
 				let (need, factor) = if self.startup_left > 0 {
 					(1, STARTUP_FACTOR)
 				} else if far {
-					(2, 1.5)
+					(if self.recovering { 1 } else { 2 }, 1.5)
 				} else if gentle {
 					(2, 1.0 + NEAR_BAD_STEP_PCT as f64 / 100.0)
 				} else {
@@ -2186,6 +2241,7 @@ impl Controller {
 	/// A rate produced loss/bloat: remember it as a punished ceiling and, if it was a probe,
 	/// double the wait before the next one.
 	fn punish(&mut self, bad_rate: u32) {
+		self.recovering = false;
 		self.ceiling = (bad_rate as u64 * 85 / 100).clamp(FLOOR_KBPS as u64, self.cap as u64) as u32;
 		if self.probe_age.is_some_and(|a| a <= PROBE_PUNISH_WINDOWS) {
 			// The fast 20 s cadence is for a link that keeps proving it has more; the first
@@ -3030,6 +3086,45 @@ mod tests {
 	/// Packets the encoder rate puts on the wire in a 2 s window (1100-byte packets).
 	fn pkts(c: &Controller) -> u32 {
 		c.encoder_kbps() * 2000 / 8 / 1100
+	}
+
+	/// 2026-11-15, phone tether: the link carried ~14 Mbit, a handover stall (RTT 1.8 s) cut
+	/// the rate to the floor and the ceiling under it (0.33 Mbit, 60 s probe wait, +8 % steps).
+	/// Clean again, it must climb back toward the proven rate within seconds, not minutes —
+	/// and only once for that proven rate.
+	#[test]
+	fn a_stall_collapse_climbs_back_toward_the_proven_rate() {
+		let mut c = Controller::new(cfg(20_000, false));
+		c.startup_left = 0;
+		for _ in 0..3 {
+			c.tick(&mwin(14_000 * 2000 / 8 / 1100, 0, 40.0));
+		}
+		assert!(c.proven.0 >= 13_000, "proven {:?}", c.proven);
+		// The collapse left it here.
+		c.target = 330;
+		c.want = 330;
+		c.ceiling = 330;
+		c.bad_rate = 420;
+		c.probe_wait = 60;
+		c.clean_at_target = 0;
+		let mut reasons = Vec::new();
+		for _ in 0..14 {
+			let d = c.tick(&mwin(pkts(&c).max(1), 0, 40.0));
+			if !d.reason.is_empty() {
+				reasons.push(d.reason);
+			}
+		}
+		assert!(c.target_kbps() >= 5_000, "still at {} after 28 s: {reasons:?}", c.target_kbps());
+		assert!(c.ceiling() >= 6_500, "ceiling {}", c.ceiling());
+		// Used once: a second collapse at the same proven rate does not get it again.
+		c.target = 330;
+		c.want = 330;
+		c.ceiling = 330;
+		c.clean_at_target = 0;
+		for _ in 0..6 {
+			c.tick(&mwin(pkts(&c).max(1), 0, 40.0));
+		}
+		assert!(c.ceiling() < 6_500, "recovered twice: ceiling {}", c.ceiling());
 	}
 
 	#[test]
