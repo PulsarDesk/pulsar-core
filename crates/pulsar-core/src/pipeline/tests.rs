@@ -463,7 +463,12 @@ fn vaapi_command_sets_device_and_upload() {
 	assert_eq!(program, "ffmpeg");
 	assert!(args.iter().any(|a| a == "-vaapi_device"));
 	assert!(args.iter().any(|a| a == "/dev/dri/renderD128"));
-	assert!(args.iter().any(|a| a == "format=nv12,hwupload"));
+	// The upload's NV12 comes from an explicit BT.709 limited conversion, then the SDR tag.
+	assert!(
+		args.iter().any(|a| a
+			== "scale=out_color_matrix=bt709:out_range=tv,format=nv12,hwupload,setparams=color_primaries=bt709:color_trc=bt709"),
+		"{args:?}"
+	);
 	assert!(args.iter().any(|a| a == "h264_vaapi"));
 }
 
@@ -696,12 +701,19 @@ fn x11_window_capture_args() {
 	assert_eq!(at("-window_id").as_deref(), Some("60817415"));
 	assert_eq!(at("-i").as_deref(), Some(":0.0"));
 	assert!(!args.iter().any(|a| a == "-video_size"), "{args:?}");
-	assert_eq!(at("-vf").as_deref(), Some("scale=1280:720"));
+	assert_eq!(
+		at("-vf").as_deref(),
+		Some("scale=1280:720:out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709")
+	);
 
 	let v = StreamPlan { encoder: HwEncoder::Vaapi, ..p.clone() };
 	let args = encode_command(&v).1;
 	assert_eq!(args.iter().filter(|a| *a == "-vf").count(), 1, "{args:?}");
-	assert!(args.iter().any(|a| a == "scale=1280:720,format=nv12,hwupload"), "{args:?}");
+	assert!(
+		args.iter().any(|a| a
+			== "scale=1280:720:out_color_matrix=bt709:out_range=tv,format=nv12,hwupload,setparams=color_primaries=bt709:color_trc=bt709"),
+		"{args:?}"
+	);
 }
 
 /// The screen path is untouched by the window field: no `-window_id`, `-video_size` kept,
@@ -711,7 +723,13 @@ fn window_none_keeps_screen_args() {
 	let args = encode_command(&plan(HwEncoder::Software)).1;
 	assert!(!args.iter().any(|a| a == "-window_id"));
 	assert!(args.iter().any(|a| a == "1920x1080"));
-	assert!(!args.iter().any(|a| a == "-vf"), "{args:?}");
+	// The only filters of a plain x11grab screen are the SDR conversion + colour tag (no resize).
+	let vf = args.iter().position(|a| a == "-vf").map(|i| args[i + 1].as_str());
+	assert_eq!(
+		vf,
+		Some("scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709"),
+		"{args:?}"
+	);
 	let k = StreamPlan {
 		capture: CaptureMethod::Kmsgrab,
 		window: Some(WindowInput::X11 { id: 5 }),
@@ -778,7 +796,7 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 	assert_eq!(screen, gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, None));
 	let win = gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, Some((1281, 719)));
 	assert!(
-		win.contains("format=NV12 ! videoscale n-threads=0 add-borders=true ! video/x-raw,width=1280,height=718,pixel-aspect-ratio=1/1 ! x264enc name=venc"),
+		win.contains("format=NV12,colorimetry=bt709 ! videoscale n-threads=0 add-borders=true ! video/x-raw,width=1280,height=718,pixel-aspect-ratio=1/1 ! x264enc name=venc"),
 		"{win}"
 	);
 	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
@@ -788,7 +806,7 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 fn gst_wayland_convert_uses_every_core_or_the_gpu() {
 	// CPU path (every encoder by default): the convert is sliced over all cores.
 	let cpu = gst::wayland_pipeline(7, 42, "x264enc name=venc", "10.0.0.5", 9000);
-	assert!(cpu.contains("! videoconvert n-threads=0 ! video/x-raw,format=NV12 ! x264enc name=venc"), "{cpu}");
+	assert!(cpu.contains("! videoconvert n-threads=0 ! video/x-raw,format=NV12,colorimetry=bt709 ! x264enc name=venc"), "{cpu}");
 	// Only the `va` plugin's encoders get the GPU conversion.
 	let va = gst::encoder_fragment(gst::GstEncoder::Va, VCodec::H264, 8000, 60).unwrap();
 	assert_eq!(gst::wayland_convert_for(&va), gst::WaylandConvert::Va);
@@ -797,14 +815,14 @@ fn gst_wayland_convert_uses_every_core_or_the_gpu() {
 		assert_eq!(gst::wayland_convert_for(&f), gst::WaylandConvert::Cpu, "{f}");
 	}
 	let gpu = gst::wayland_pipeline_conv(7, 42, &va, "10.0.0.5", 9000, None, gst::WaylandConvert::Va);
-	assert!(gpu.contains("! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! vah264enc name=venc"), "{gpu}");
+	assert!(gpu.contains("! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709 ! vah264enc name=venc"), "{gpu}");
 	assert!(!gpu.contains("videoconvert"), "{gpu}");
 	// The caps in front of vapostproc stay open: DMA-BUF or SHM, whatever PipeWire offers.
 	assert!(!gpu.contains("memory:DMABuf"), "{gpu}");
 	// A window cast scales on the GPU too, into the same fixed even box.
 	let win = gst::wayland_pipeline_conv(7, 42, &va, "10.0.0.5", 9000, Some((1281, 719)), gst::WaylandConvert::Va);
 	assert!(
-		win.contains("vapostproc add-borders=true ! video/x-raw(memory:VAMemory),format=NV12,width=1280,height=718,pixel-aspect-ratio=1/1 ! vah264enc"),
+		win.contains("vapostproc add-borders=true ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709,width=1280,height=718,pixel-aspect-ratio=1/1 ! vah264enc"),
 		"{win}"
 	);
 	// The X11 converts are threaded too.
@@ -812,4 +830,156 @@ fn gst_wayland_convert_uses_every_core_or_the_gpu() {
 	assert!(x.contains("videoconvert n-threads=0"), "{x}");
 	let xw = gst::x11_window_pipeline(":0", 5, 60, (1280, 720), "x264enc name=venc", "10.0.0.2", 9000);
 	assert!(xw.contains("videoconvert n-threads=0 ! videoscale n-threads=0"), "{xw}");
+}
+
+/// SDR = BT.709 limited range on every ffmpeg path: the encoder options (negotiated RGB → YUV
+/// conversion + VUI) and the frame tag, at the end of a `-filter_complex` (ddagrab) or of the
+/// `-vf` chain, or first for a capture that is YUV already (labelled, not converted).
+#[test]
+fn sdr_streams_signal_bt709_limited() {
+	let tag_rgb = "setparams=color_primaries=bt709:color_trc=bt709";
+	let tag_yuv = "setparams=colorspace=bt709:range=tv:color_primaries=bt709:color_trc=bt709";
+	let opts = "-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
+	for enc in [
+		HwEncoder::Software,
+		HwEncoder::Nvenc,
+		HwEncoder::Amf,
+		HwEncoder::Qsv,
+		HwEncoder::Vaapi,
+		HwEncoder::MediaFoundation,
+		HwEncoder::VideoToolbox,
+	] {
+		for capture in [CaptureMethod::X11grab, CaptureMethod::Gdigrab, CaptureMethod::Ddagrab] {
+			let p = StreamPlan { capture, ..plan(enc) };
+			let args = encode_command(&p).1;
+			let j = args.join(" ");
+			assert!(j.contains(opts), "[{enc:?} {capture:?}] {j}");
+			assert_eq!(args.iter().filter(|a| a.contains("setparams")).count(), 1, "[{enc:?} {capture:?}] {j}");
+			let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+			let chain = at("-filter_complex").or_else(|| at("-vf")).unwrap();
+			assert!(chain.ends_with(tag_rgb), "[{enc:?} {capture:?}] {chain}");
+			// (VA-API never runs on Windows: its upload `-vf` beside ddagrab is not a real plan.)
+			if capture == CaptureMethod::Ddagrab && enc != HwEncoder::Vaapi {
+				assert!(at("-vf").is_none(), "[{enc:?}] no -vf beside a complex graph: {j}");
+			}
+			// Every RGB → YUV conversion names BT.709 limited, ahead of the format constraint
+			// (an ffmpeg older than 7.1 would otherwise convert BT.601 under the BT.709 tag).
+			// The one exception: ddagrab → NVENC without the CUDA map hands NVENC the BGRA.
+			let hands_rgb = capture == CaptureMethod::Ddagrab && enc == HwEncoder::Nvenc;
+			let conv = chain.find("out_color_matrix=bt709:out_range=tv");
+			assert_eq!(conv.is_some(), !hands_rgb, "[{enc:?} {capture:?}] {chain}");
+			if let (Some(c), Some(f)) = (conv, chain.rfind("format=")) {
+				let scaler = chain[..c].rfind("scale").or_else(|| chain[..c].rfind("vpp_qsv")).unwrap();
+				assert!(scaler < c, "[{enc:?} {capture:?}] {chain}");
+				// The format the conversion feeds comes after (or is the scaler's own option).
+				assert!(f > scaler, "[{enc:?} {capture:?}] {chain}");
+			}
+		}
+	}
+	// The ddagrab GPU scalers convert too: CUDA (zero-copy NVENC) and QSV name the matrix.
+	for enc in [HwEncoder::Nvenc, HwEncoder::Qsv] {
+		let p = StreamPlan { capture: CaptureMethod::Ddagrab, gpu_zerocopy: true, ..plan(enc) };
+		let args = encode_command(&p).1;
+		let fc = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+		assert!(fc.contains("format=nv12:out_color_matrix=bt709:out_range=tv"), "[{enc:?}] {fc}");
+	}
+	// An x11grab with no scale of its own gets an explicit one in front of the encoder's format.
+	let p = StreamPlan { capture: CaptureMethod::X11grab, ..plan(HwEncoder::Software) };
+	let args = encode_command(&p).1;
+	let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+	assert_eq!(at("-vf").as_deref(), Some("scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709"));
+	assert!(args.iter().position(|a| a == "-vf") < args.iter().position(|a| a == "-pix_fmt"));
+	// Kmsgrab frames are DRM-PRIME (no swscale): no CPU scale for an encoder that takes them.
+	let p = StreamPlan { capture: CaptureMethod::Kmsgrab, ..plan(HwEncoder::Nvenc) };
+	assert!(!encode_command(&p).1.join(" ").contains("scale="), "{:?}", encode_command(&p).1);
+	// macOS frames are NV12 / UYVY already: the tag labels them before anything converts.
+	let p = StreamPlan {
+		capture: CaptureMethod::AvFoundation,
+		window: Some(WindowInput::RawNv12 { url: "tcp://127.0.0.1:5000".into() }),
+		..plan(HwEncoder::VideoToolbox)
+	};
+	let args = encode_command(&p).1;
+	let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+	assert_eq!(at("-vf").as_deref(), Some(tag_yuv), "{args:?}");
+	assert!(args.join(" ").contains(opts));
+	let p = StreamPlan { capture: CaptureMethod::AvFoundation, ..plan(HwEncoder::VideoToolbox) };
+	let args = encode_command(&p).1;
+	assert!(args.iter().any(|a| a.starts_with(tag_yuv)), "{args:?}");
+	// HDR keeps its own colour description (whenever the plan really streams HDR).
+	let mut h = plan(HwEncoder::Software);
+	h.codec = VCodec::H265;
+	h.hdr = true;
+	let j = encode_command(&h).1.join(" ");
+	assert_eq!(!j.contains("bt709"), h.effective_hdr_yuv444().0, "{j}");
+}
+
+/// Colour-bar harness: run the real ffmpeg args of an SDR software plan (gdigrab chain with
+/// the capture swapped for solid RGB frames, RTP swapped for a raw H.264 file), decode the
+/// result and compare the YUV to the BT.709 limited-range values, plus the VUI tag. BT.601
+/// would put red at Y = 81 instead of 63. Runs only with `PULSAR_TEST_FFMPEG=<ffmpeg>`
+/// (FFmpeg 7.1+, e.g. the desktop's bundled `src-tauri/resources/ffmpeg`), else it skips.
+#[test]
+fn sdr_colour_bars_through_ffmpeg() {
+	let Ok(ffmpeg) = std::env::var("PULSAR_TEST_FFMPEG") else {
+		eprintln!("PULSAR_TEST_FFMPEG not set: colour-bar harness skipped");
+		return;
+	};
+	let dir = std::env::temp_dir().join(format!("pulsar-colour-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	// (R, G, B) → BT.709 limited (Y, Cb, Cr).
+	let bars = [
+		("red", (63u8, 102u8, 240u8)),
+		("lime", (173, 42, 26)),
+		("blue", (32, 240, 118)),
+		("white", (235, 128, 128)),
+		("black", (16, 128, 128)),
+	];
+	// gdigrab (its own resize carries the matrix) and x11grab (the explicit conversion scale).
+	for ((name, (y, cb, cr)), (capture, from, to)) in bars
+		.into_iter()
+		.flat_map(|b| [(b, (CaptureMethod::Gdigrab, "gdigrab", "desktop")), (b, (CaptureMethod::X11grab, "x11grab", ":0.0"))])
+	{
+		let p = StreamPlan { capture, width: 64, height: 64, ..plan(HwEncoder::Software) };
+		let mut args = encode_command(&p).1;
+		let i = args.iter().position(|a| a == from).unwrap() - 1;
+		let j = args.iter().position(|a| a == to).unwrap();
+		args.splice(i..=j, ["-f", "lavfi", "-i", &format!("color=c={name}:s=64x64:r=60,format=bgr0")].map(String::from));
+		let k = args.iter().position(|a| a == "-bsf:v").unwrap();
+		let out = dir.join(format!("{name}-{from}.h264"));
+		args.truncate(k);
+		args.extend(["-frames:v", "1", "-f", "h264", "-y"].map(String::from));
+		args.push(out.to_string_lossy().into_owned());
+		let st = std::process::Command::new(&ffmpeg).args(&args).status().unwrap();
+		assert!(st.success(), "encode {name}: {args:?}");
+		let dec = std::process::Command::new(&ffmpeg)
+			.args(["-hide_banner", "-loglevel", "error", "-i"])
+			.arg(&out)
+			.args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+			.output()
+			.unwrap();
+		assert!(dec.status.success(), "decode {name}");
+		let px = &dec.stdout;
+		assert_eq!(px.len(), 64 * 64 * 3 / 2, "{name}");
+		let got = (px[64 * 32 + 32], px[64 * 64 + 16 * 32 + 16], px[64 * 64 + 32 * 32 + 16 * 32 + 16]);
+		let near = |a: u8, b: u8| a.abs_diff(b) <= 3;
+		assert!(near(got.0, y) && near(got.1, cb) && near(got.2, cr), "{name} {from}: got {got:?}, BT.709 limited {:?}", (y, cb, cr));
+		let info = std::process::Command::new(&ffmpeg).args(["-hide_banner", "-i"]).arg(&out).output().unwrap();
+		let info = String::from_utf8_lossy(&info.stderr);
+		assert!(info.contains("yuv420p(tv, bt709"), "{name}: VUI not BT.709 limited: {info}");
+	}
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every gst `videoconvert` into the encoder names BT.709 (limited range): GStreamer's default
+/// for a YUV caps without colorimetry is BT.601 below 720 lines, which the client would then
+/// decode as BT.709 (Pulsar's SDR rule).
+#[test]
+fn gst_conversions_pin_bt709() {
+	let frag = "x264enc name=venc";
+	for desc in [
+		gst::wayland_pipeline(3, 42, frag, "10.0.0.5", 9000),
+		gst::probe_pipeline(frag),
+	] {
+		assert!(desc.contains("video/x-raw,format=NV12,colorimetry=bt709"), "{desc}");
+	}
 }

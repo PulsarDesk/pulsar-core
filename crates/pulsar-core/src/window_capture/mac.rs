@@ -566,6 +566,8 @@ impl WindowStream {
 				config.setWidth(w);
 				config.setHeight(h);
 				config.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+				// BT.709 matrix from sRGB pixels (Pulsar's SDR rule, see `set_sdr_colour`).
+				crate::macos_capture::sck::set_sdr_colour(&config);
 				config.setMinimumFrameInterval(CMTime::new(1, fps as i32));
 				config.setShowsCursor(true);
 				config.setQueueDepth(3);

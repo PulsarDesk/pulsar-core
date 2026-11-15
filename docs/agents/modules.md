@@ -178,6 +178,17 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   x11grab (`-window_id`, scaled to the plan size; `fit_window_size` / `fit_within` pick it)
   — used by both the per-window "Pencere" pick and the Linux per-window co-op capture
   source — or `WindowInput::RawNv12` (macOS ScreenCaptureKit frames).
+  SDR colour rule (2026-11-15): every encode command signals **BT.709 limited range**
+  (`command.rs` `SDR_ENCODER_OPTS` + a `setparams` tag; gst `videoconvert` caps carry
+  `colorimetry=bt709`); macOS ScreenCaptureKit is set to the BT.709 matrix from sRGB
+  (`macos_capture::sck::set_sdr_colour`). Clients decode the stream's tag, BT.709 limited
+  when absent (pulsar-desktop `pulsar-render/src/colour.rs`). Every RGB → YUV conversion
+  the ffmpeg CLI runs names the matrix (`SDR_SCALE_OPTS`: x11grab / gdigrab `scale`, the
+  ddagrab CPU bounces, `scale_cuda` and `vpp_qsv` options), so an FFmpeg older than 7.1
+  (Rockchip PPA, system ffmpeg) cannot convert BT.601 under the BT.709 tag; only ddagrab →
+  NVENC without the CUDA map hands NVENC the BGRA. SCK's CF strings go through `msg_send!` as
+  `ffi::CFStringObj` pointers: objc2 checks argument encodings in debug builds and panics on
+  `*const c_void` (`^v`) where a method takes `^{__CFString=}`.
 - `x11win.rs` — X11 top-level window list (`_NET_CLIENT_LIST`) and launched-game →
   window lookup (`_NET_WM_PID` over the `/proc` process tree) for the co-op path; the Linux
   counterpart of `pulsar-capture`'s `window.rs`. Overlaps `window_capture/x11.rs` (the
