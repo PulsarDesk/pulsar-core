@@ -46,6 +46,10 @@ const ANNOUNCE_VERSION: u16 = 1;
 /// A human label for this machine's current OS user (e.g. "Jane Doe"),
 /// used as the device's identity — especially relay-less, where there's no id to
 /// show. Falls back to the login name, then a generic label.
+///
+/// PRIVACY: only for peers the user actually connects with (the authenticated session's
+/// `PeerName`, the relay registration). NEVER put it in the LAN beacon ([`Discovery`]
+/// `name`): that is broadcast every 2 s to everyone on the network (a café, a hotel).
 pub fn os_display_name() -> String {
 	// whoami 2 returns `Result`s (1.x silently substituted "Unknown" on error); an error
 	// now falls through to the next candidate like an empty name does.
@@ -60,8 +64,12 @@ pub fn os_display_name() -> String {
 struct Announce {
 	magic: u32,
 	version: u16,
-	/// Relay-assigned id, if registered; `None` when running relay-less.
+	/// Relay-assigned id, if registered; `None` when running relay-less. (An unattended host
+	/// does not announce at all: the beacon's address + port alone let anyone on the network
+	/// connect to a host that asks for no password — the apps pause it, see `set_paused`.)
 	id: Option<u32>,
+	/// A label the user chose for the device, else the hostname; empty only without one
+	/// (receivers show a generic label). Never the OS user's real name (see [`os_display_name`]).
 	name: String,
 	/// The node's main UDP port (where a future relay-less direct LAN link goes).
 	node_port: u16,
@@ -192,8 +200,16 @@ impl Discovery {
 		self.inner.lock().await.announce.id = id.map(|d| d.0);
 	}
 
+	/// Change the announced name (the user renamed the device). Empty = no name: receivers
+	/// show a generic label.
+	pub async fn set_name(&self, name: String) {
+		self.inner.lock().await.announce.name = name;
+	}
+
 	/// Pause/resume ANNOUNCING (broadcasting) this device on the LAN. Paused while in gaming
-	/// mode (a pure client must not advertise itself as connectable). Receiving is unaffected.
+	/// mode (a pure client must not advertise itself as connectable) and while unattended
+	/// access is on (no password, no approval: the beacon must not invite strangers on a
+	/// shared network). Receiving is unaffected.
 	pub fn set_paused(&self, paused: bool) {
 		self.paused
 			.store(paused, std::sync::atomic::Ordering::Relaxed);
@@ -340,46 +356,14 @@ impl Drop for Discovery {
 	}
 }
 
-/// True when `ip` sits on the subnet of a local VPN / overlay adapter (ZeroTier, Tailscale,
-/// WireGuard, Hamachi, ...) or in Tailscale's CGNAT range. LAN discovery works across such
+/// True when `ip` is reached over a local VPN / overlay adapter (ZeroTier, Tailscale,
+/// WireGuard, Hamachi, ...) or sits in Tailscale's CGNAT range. LAN discovery works across such
 /// overlays (ZeroTier even carries the multicast beacon), so a peer found that way LOOKS
 /// same-LAN — but connecting over the overlay adds its encapsulation (and, when it can't go
 /// peer-to-peer, its relays) to every packet. Callers skip the same-LAN shortcut for these
-/// and take the regular internet P2P path instead.
+/// and take the regular internet P2P path instead. See [`crate::netpath::is_overlay_addr`].
 pub fn is_overlay_vpn_addr(ip: IpAddr) -> bool {
-	let IpAddr::V4(peer) = ip else {
-		return false;
-	};
-	let o = peer.octets();
-	if o[0] == 100 && (64..128).contains(&o[1]) {
-		return true; // 100.64.0.0/10 — Tailscale / carrier-grade NAT, never a real LAN
-	}
-	if_addrs::get_if_addrs()
-		.map(|ifs| {
-			ifs.iter().any(|i| match &i.addr {
-				if_addrs::IfAddr::V4(a) => {
-					let mask = u32::from(a.netmask);
-					mask != 0
-						&& (u32::from(a.ip) & mask) == (u32::from(peer) & mask)
-						&& is_overlay_iface_name(&i.name)
-				}
-				_ => false,
-			})
-		})
-		.unwrap_or(false)
-}
-
-/// Interface names of VPN / overlay adapters: Windows friendly names ("ZeroTier One [..]",
-/// "Tailscale", "WireGuard Tunnel", "Hamachi") and Unix names (`zt*`, `tailscale0`, `wg*`,
-/// `tun*`, `utun*`, `ham*`).
-fn is_overlay_iface_name(name: &str) -> bool {
-	let n = name.to_ascii_lowercase();
-	const WORDS: &[&str] = &[
-		"zerotier", "tailscale", "wireguard", "hamachi", "radmin", "openvpn", "tap-windows", "wintun",
-		"nordlynx", "mullvad", "protonvpn", "netbird", "nebula",
-	];
-	const PREFIXES: &[&str] = &["zt", "wg", "tun", "utun", "ham"];
-	WORDS.iter().any(|w| n.contains(w)) || PREFIXES.iter().any(|p| n.starts_with(p))
+	crate::netpath::is_overlay_addr(ip)
 }
 
 /// Every usable local IPv4 NIC address (excludes loopback + link-local APIPA `169.254/16`).
@@ -602,6 +586,7 @@ mod tests {
 #[cfg(test)]
 mod overlay_tests {
 	use super::*;
+	use crate::netpath::is_overlay_iface_name;
 
 	#[test]
 	fn overlay_adapters_are_recognised_and_real_nics_are_not() {
@@ -612,6 +597,9 @@ mod overlay_tests {
 			assert!(!is_overlay_iface_name(n), "{n}");
 		}
 		assert!(is_overlay_vpn_addr("100.101.102.103".parse().unwrap()), "Tailscale CGNAT range");
-		assert!(!is_overlay_vpn_addr("192.0.2.10".parse().unwrap()), "not on any local overlay");
+		// Only the machine-independent part: any other address also asks the OS route, and a
+		// dev / CI box whose default route is a tunnel (full-tunnel WireGuard, a Tailscale exit
+		// node, a corporate VPN) rightly reports an outside address as overlay-routed.
+		assert!(!is_overlay_vpn_addr("127.0.0.1".parse().unwrap()), "loopback is never an overlay");
 	}
 }

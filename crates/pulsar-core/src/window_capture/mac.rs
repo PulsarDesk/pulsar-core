@@ -566,6 +566,8 @@ impl WindowStream {
 				config.setWidth(w);
 				config.setHeight(h);
 				config.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+				// BT.709 matrix from sRGB pixels (Pulsar's SDR rule, see `set_sdr_colour`).
+				crate::macos_capture::sck::set_sdr_colour(&config);
 				config.setMinimumFrameInterval(CMTime::new(1, fps as i32));
 				config.setShowsCursor(true);
 				config.setQueueDepth(3);
@@ -579,8 +581,6 @@ impl WindowStream {
 			if config.respondsToSelector(sel!(setPreservesAspectRatio:)) {
 				let _: () = unsafe { msg_send![&config, setPreservesAspectRatio: true] };
 			}
-			// sRGB + BT.709 matrix, as the screen capture (not the display's own P3 space).
-			unsafe { crate::macos_capture::sck::request_bt709(&config) };
 
 			let mut black = vec![16u8; w * h * 3 / 2];
 			black[w * h..].fill(128);

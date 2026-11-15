@@ -6,7 +6,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 	KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
 	MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
 	MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-	MOUSEINPUT,
+	MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
 };
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
@@ -28,7 +28,24 @@ pub struct MonitorRect {
 	pub virt_height: i32,
 }
 
-const WHEEL_DELTA: i32 = 120;
+const WHEEL_DELTA: i32 = super::wheel::HI_RES_PER_NOTCH;
+
+/// `SendInput` mouse data + flag of a button edge ([`super::mouse_button`] ids); `None` for an
+/// id this host does not know.
+fn button_input(button: u8, down: bool) -> Option<(i32, u32)> {
+	Some(match (button, down) {
+		(0, true) => (0, MOUSEEVENTF_LEFTDOWN),
+		(0, false) => (0, MOUSEEVENTF_LEFTUP),
+		(1, true) => (0, MOUSEEVENTF_RIGHTDOWN),
+		(1, false) => (0, MOUSEEVENTF_RIGHTUP),
+		(2, true) => (0, MOUSEEVENTF_MIDDLEDOWN),
+		(2, false) => (0, MOUSEEVENTF_MIDDLEUP),
+		(b, down) => {
+			let x = super::mouse_button::to_win_xbutton(b)? as i32;
+			(x, if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP })
+		}
+	})
+}
 
 fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
 	let input = INPUT {
@@ -55,15 +72,14 @@ fn send_key(vk: u16, flags: u32) {
 	// arrows, Ins/Del/Home/End/PgUp/PgDn, ...), like RustDesk's enigo does. A VK-only event
 	// (wScan = 0) is not a complete keystroke: shell shortcuts such as Alt+Tab and many
 	// games look at the scan code and ignored our injected keys.
-	let ext = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
-	let scan = (ext & 0xFF) as u16;
+	let (scan, extended) = vk_scan(vk, unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) });
 	let mut flags = flags;
 	// The E0 prefix from MAPVK_VK_TO_VSC_EX is not reliable: on a real host (2026-11-10) it
 	// came back as a bare 0x4D for VK_RIGHT, so the arrows went out WITHOUT the extended flag,
 	// i.e. as the numpad 4/6/8/2 keys — Steam Big Picture scrolled instead of moving the
 	// selection. The extended keys are fixed by the keyboard hardware, so list them (the same
 	// set Sunshine uses) and keep the map's prefix as a second source.
-	if matches!(ext >> 8, 0xE0 | 0xE1) || is_extended_vk(vk) {
+	if extended {
 		flags |= KEYEVENTF_EXTENDEDKEY;
 	}
 	let input = INPUT {
@@ -87,9 +103,29 @@ fn send_key(vk: u16, flags: u32) {
 pub fn evdev_to_raw_key(code: u32) -> Option<(u16, u16, bool)> {
 	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
 	let vk = evdev_to_vk(code)?;
-	let ext = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
-	let extended = matches!(ext >> 8, 0xE0 | 0xE1) || is_extended_vk(vk);
-	Some((vk, (ext & 0xFF) as u16, extended))
+	let (scan, extended) = vk_scan(vk, unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) });
+	Some((vk, scan, extended))
+}
+
+/// Scancode + extended flag of `vk` from `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)` (`ext`).
+/// Pause is the exception: Windows answers `E1 1D` (the first half of its E1 sequence, which
+/// is Right Ctrl's scancode), so a scancode reader would see Ctrl; its make code is a plain
+/// `0x45`.
+fn vk_scan(vk: u16, ext: u32) -> (u16, bool) {
+	if vk == 0x13 {
+		return (0x45, false); // VK_PAUSE
+	}
+	((ext & 0xFF) as u16, matches!(ext >> 8, 0xE0 | 0xE1) || is_extended_vk(vk))
+}
+
+/// VK of a key whose virtual key depends on the host layout (the JIS / ABNT / ISO extras): the
+/// one the host's layout gives its fixed set-1 scancode, else the common default.
+fn layout_vk(scan: u32, fallback: u16) -> u16 {
+	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK_EX};
+	match unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } as u16 {
+		0 => fallback,
+		vk => vk,
+	}
 }
 
 /// Virtual keys whose scan code carries the E0 prefix on a PC keyboard: right Ctrl/Alt, Win,
@@ -214,6 +250,23 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 		165 => 0xB1, // Prev track  (VK_MEDIA_PREV_TRACK)
 		158 => 0xA6, // Back        (VK_BROWSER_BACK)
 		159 => 0xA7, // Forward     (VK_BROWSER_FORWARD)
+		// ISO / JIS / Korean / ABNT extras and the rest of the PC keyboard (every key
+		// `keytables::CLIENT_KEYS` lists). Keys whose VK differs per layout take the VK the
+		// host layout gives their set-1 scancode.
+		86 => layout_vk(0x56, 0xE2),  // KEY_102ND, ISO <>| (VK_OEM_102)
+		89 => layout_vk(0x73, 0xC1),  // KEY_RO, JIS \_ (VK_ABNT_C1; JIS layouts: VK_OEM_102)
+		92 => layout_vk(0x79, 0x1C),  // KEY_HENKAN (VK_CONVERT)
+		93 => layout_vk(0x70, 0x15),  // KEY_KATAKANAHIRAGANA (VK_KANA)
+		94 => layout_vk(0x7B, 0x1D),  // KEY_MUHENKAN (VK_NONCONVERT)
+		95 => 0x6C,                   // KEY_KPJPCOMMA (VK_SEPARATOR)
+		99 => 0x2C,                   // KEY_SYSRQ = Print Screen (VK_SNAPSHOT)
+		117 => layout_vk(0x59, 0x92), // KEY_KPEQUAL (VK_OEM_NEC_EQUAL)
+		119 => 0x13,                  // KEY_PAUSE (VK_PAUSE)
+		121 => layout_vk(0x7E, 0xC2), // KEY_KPCOMMA (VK_ABNT_C2)
+		122 => 0x15,                  // KEY_HANGEUL (VK_HANGUL)
+		123 => 0x19,                  // KEY_HANJA (VK_HANJA)
+		124 => layout_vk(0x7D, 0xDC), // KEY_YEN, JIS ¥| (VK_OEM_5 on JIS layouts)
+		183..=194 => 0x7C + (code - 183) as u16, // F13..F24 (VK_F13..VK_F24)
 		_ => return None,
 	})
 }
@@ -226,11 +279,11 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 pub struct DesktopInput {
 	held_buttons: std::collections::HashSet<u8>,
 	held_keys: std::collections::HashSet<u16>,
-	/// Carried-over fractional scroll (in wheel notches). Fine/precision wheel deltas
-	/// (< one notch) used to `round()` to 0 and do nothing; we accumulate the remainder
-	/// so successive small scrolls eventually move (and big deltas behave as before).
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Hi-res wheel conversion with the sub-unit carry (see [`super::wheel`]).
+	scroll: super::wheel::HiResScroll,
+	/// Inject whole `WHEEL_DELTA` notches instead of hi-res units (see
+	/// [`set_whole_notch_wheel`](Self::set_whole_notch_wheel)).
+	whole_notches: bool,
 	/// Geometry of the streamed monitor within the virtual desktop. `None` ⇒ the primary
 	/// display (single-monitor host / unknown geometry) — keeps the legacy primary-only
 	/// absolute mapping. `Some` ⇒ map the normalized coords onto that monitor's rect across
@@ -357,8 +410,8 @@ impl DesktopInput {
 		Ok(Self {
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
+			whole_notches: false,
 			monitor: None,
 			pinch_tx: None,
 			pen_touch: None,
@@ -475,40 +528,46 @@ impl DesktopInput {
 		}
 	}
 
-	/// Press/release a mouse button (0=left, 1=right, 2=middle).
+	/// Press/release a mouse button (0=left, 1=right, 2=middle, 3=back / X1, 4=forward / X2).
+	/// Unknown ids are ignored (they used to become a left click).
 	pub fn button(&mut self, button: u8, down: bool) {
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
-		}
-		let flag = match (button, down) {
-			(1, true) => MOUSEEVENTF_RIGHTDOWN,
-			(1, false) => MOUSEEVENTF_RIGHTUP,
-			(2, true) => MOUSEEVENTF_MIDDLEDOWN,
-			(2, false) => MOUSEEVENTF_MIDDLEUP,
-			(_, true) => MOUSEEVENTF_LEFTDOWN,
-			(_, false) => MOUSEEVENTF_LEFTUP,
+		let Some((data, flag)) = button_input(button, down) else {
+			return;
 		};
-		send_mouse(0, 0, 0, flag);
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
+		}
+		send_mouse(0, 0, data, flag);
 	}
 
-	/// Scroll by a delta (browser wheel pixels → wheel notches).
+	/// Whole-notch wheel output (`true`) for a game session or while the client's pointer is
+	/// relative / locked: many games read the wheel from Raw Input or `WM_MOUSEWHEEL` and do
+	/// `delta / WHEEL_DELTA` as an integer (a 15-unit hi-res step = 0, a dead wheel) or step
+	/// once per event (8 weapon switches per notch) — the reason Windows mouse drivers keep
+	/// hi-res scrolling off by default. `false` (default) = hi-res units for desktop use.
+	pub fn set_whole_notch_wheel(&mut self, on: bool) {
+		self.whole_notches = on;
+	}
+
+	/// Scroll by a delta (browser wheel pixels → hi-res wheel units, 1/120 notch). Windows
+	/// takes sub-`WHEEL_DELTA` `mouseData` (precision touchpads send it all the time), so a
+	/// smooth client scroll stays smooth instead of being rounded to whole notches; the
+	/// sub-unit remainder carries to the next call (see [`super::wheel`]). In whole-notch
+	/// mode ([`set_whole_notch_wheel`](Self::set_whole_notch_wheel)) only the completed
+	/// notches go out, × `WHEEL_DELTA`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Accumulate fractional notches so fine/precision scroll (< 100px) isn't lost to
-		// rounding; carry the sub-notch remainder to the next call (trunc toward zero
-		// preserves direction). browser down(+) → wheel down (negative), so negate dy.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
+		let o = self.scroll.push(dx, dy);
+		let (v, h) = if self.whole_notches {
+			(o.v_notches.saturating_mul(WHEEL_DELTA), o.h_notches.saturating_mul(WHEEL_DELTA))
+		} else {
+			(o.v, o.h)
+		};
 		if v != 0 {
-			send_mouse(0, 0, v * WHEEL_DELTA, MOUSEEVENTF_WHEEL);
+			send_mouse(0, 0, v, MOUSEEVENTF_WHEEL);
 		}
 		if h != 0 {
-			send_mouse(0, 0, h * WHEEL_DELTA, MOUSEEVENTF_HWHEEL);
+			send_mouse(0, 0, h, MOUSEEVENTF_HWHEEL);
 		}
 	}
 
@@ -563,12 +622,9 @@ impl DesktopInput {
 			w.release(); // lift the pen / every injected finger
 		}
 		for b in self.held_buttons.drain() {
-			let flag = match b {
-				1 => MOUSEEVENTF_RIGHTUP,
-				2 => MOUSEEVENTF_MIDDLEUP,
-				_ => MOUSEEVENTF_LEFTUP,
-			};
-			send_mouse(0, 0, 0, flag);
+			if let Some((data, flag)) = button_input(b, false) {
+				send_mouse(0, 0, data, flag);
+			}
 		}
 		for vk in self.held_keys.drain() {
 			send_key(vk, KEYEVENTF_KEYUP);
@@ -587,7 +643,38 @@ impl Drop for DesktopInput {
 
 #[cfg(test)]
 mod tests {
-	use super::{evdev_to_vk, is_extended_vk};
+	use super::{button_input, evdev_to_vk, is_extended_vk, vk_scan};
+	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+		MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+	};
+
+	#[test]
+	fn every_client_key_has_a_vk() {
+		for &k in crate::input::keytables::CLIENT_KEYS {
+			assert!(evdev_to_vk(k as u32).is_some(), "evdev {k} has no VK on the Windows host");
+		}
+		assert_eq!(evdev_to_vk(99), Some(0x2C)); // Print Screen
+		assert_eq!(evdev_to_vk(119), Some(0x13)); // Pause
+		assert_eq!(evdev_to_vk(183), Some(0x7C)); // F13
+		assert_eq!(evdev_to_vk(194), Some(0x87)); // F24
+		assert_eq!(evdev_to_vk(122), Some(0x15)); // Hangul
+	}
+
+	#[test]
+	fn pause_goes_out_as_its_make_code_not_right_ctrl() {
+		assert_eq!(vk_scan(0x13, 0xE11D), (0x45, false));
+		assert_eq!(vk_scan(0x41, 0x1E), (0x1E, false));
+		assert_eq!(vk_scan(0x26, 0xE048), (0x48, true));
+	}
+
+	#[test]
+	fn side_buttons_are_xbuttons_and_unknown_ids_are_ignored() {
+		assert_eq!(button_input(0, true), Some((0, MOUSEEVENTF_LEFTDOWN)));
+		assert_eq!(button_input(3, true), Some((1, MOUSEEVENTF_XDOWN)));
+		assert_eq!(button_input(4, false), Some((2, MOUSEEVENTF_XUP)));
+		assert_eq!(button_input(5, true), None);
+		assert_eq!(button_input(200, false), None);
+	}
 
 	#[test]
 	fn arrows_and_nav_block_are_extended_but_numpad_is_not() {

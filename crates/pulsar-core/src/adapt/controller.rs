@@ -562,6 +562,9 @@ pub struct Controller {
 	/// Clean windows spent at `point_cap`, and the wait before retrying the next heavier one.
 	at_point_cap: u32,
 	point_retry: u32,
+	/// A decoder-forced fps step on a ladder-off session (`client_decoder_sheds`): the rung to
+	/// go back to and the windows left before it is retried.
+	decode_retry: Option<(usize, u32)>,
 	/// The last ladder step UP: (window, the lighter point it left). A queue cut right after
 	/// it means the host can't encode the heavier point — see `queue_cut`.
 	point_up: Option<(u32, usize)>,
@@ -900,6 +903,7 @@ impl Controller {
 			point_cap: 0,
 			at_point_cap: 0,
 			point_retry: 0,
+			decode_retry: None,
 			point_up: None,
 			drain_left: 0,
 			encoder_kbps: 0,
@@ -1297,6 +1301,7 @@ impl Controller {
 		// Indices changed: a host-bound cap learned on the old ladder no longer maps.
 		self.point_cap = 0;
 		self.at_point_cap = 0;
+		self.decode_retry = None;
 		self.point_up = None;
 		self.point_idx = if self.cfg.ladder { pick_without_last_resort(&self.cfg, &self.points, self.want) } else { 0 };
 		self.point_age = 0;
@@ -1463,6 +1468,9 @@ impl Controller {
 			out.recovery = Some(self.recovery);
 			out.reason = "loss → recovery mode";
 		}
+		// A decoder-forced fps step's retry (ladder-off sessions): counted every window, clean
+		// or not, and with automatic adjustment off too — a decoder limit is not the link's.
+		self.decode_retry_step(&mut out);
 
 		// Automatic adjustment off: measure only (the recovery flip above still runs).
 		if self.frozen {
@@ -2616,6 +2624,77 @@ impl Controller {
 		out
 	}
 
+	/// A ladder-off session (`Config::ladder = false`: the mobile client, whose size and fps
+	/// are otherwise fixed) whose decoder has been shedding what it is fed. Its decoders report
+	/// no decode time (Android MediaCodec), so `client_decode_bound`'s estimate has nothing to
+	/// run on: this steps exactly ONE fps rung down at the same size (60 → 30) and schedules a
+	/// retry of the rung it left after `POINT_RETRY_WINDOWS` windows (doubling on each repeat,
+	/// up to `POINT_RETRY_MAX`) — a false verdict, or a decoder that was busy only for a while,
+	/// does not cost the user's fps for the whole session. An empty decision with the ladder on
+	/// (the desktop runs `client_decode_bound` on real decode times) or with no lower fps rung.
+	pub fn client_decoder_sheds(&mut self) -> Decision {
+		let mut out = Decision::default();
+		if self.cfg.ladder || self.points.len() < 2 {
+			return out;
+		}
+		let cur = self.points[self.point_idx];
+		let Some(next) = (self.point_idx + 1..self.points.len())
+			.find(|&i| self.points[i].fps < cur.fps && (self.points[i].width, self.points[i].height) == (cur.width, cur.height))
+		else {
+			return out;
+		};
+		self.point_retry = if self.point_retry == 0 {
+			POINT_RETRY_WINDOWS
+		} else {
+			(self.point_retry * 2).min(POINT_RETRY_MAX)
+		};
+		// Back to where the session started (index 0, the only rung a ladder-off session runs
+		// on otherwise) when the retry is due.
+		self.decode_retry = Some((self.decode_retry.map_or(self.point_idx, |(back, _)| back), self.point_retry));
+		self.point_idx = next;
+		self.point_age = 0;
+		self.clean_at_point = 0;
+		self.point_short = 0;
+		self.retarget();
+		self.last_point_window = self.windows;
+		self.last_change_window = self.windows;
+		out.point = Some(self.points[next]);
+		out.reason = "client decoder sheds frames → one fps rung down";
+		out
+	}
+
+	/// Whether a decoder-forced fps step (`client_decoder_sheds`) is in force: the point the
+	/// stream runs at is under the session's own.
+	pub fn decoder_limited(&self) -> bool {
+		self.decode_retry.is_some()
+	}
+
+	/// One window of the decoder-forced step's retry wait (`client_decoder_sheds`): when it ran
+	/// out, the point goes back to the rung it left (the decoder gets another chance).
+	fn decode_retry_step(&mut self, out: &mut Decision) {
+		let Some((back, left)) = self.decode_retry else {
+			return;
+		};
+		if left > 1 {
+			self.decode_retry = Some((back, left - 1));
+			return;
+		}
+		self.decode_retry = None;
+		if back < self.point_idx && back < self.points.len() {
+			self.point_idx = back;
+			self.point_age = 0;
+			self.clean_at_point = 0;
+			self.point_short = 0;
+			self.retarget();
+			self.last_point_window = self.windows;
+			self.last_change_window = self.windows;
+			out.point = Some(self.points[back]);
+			if out.reason.is_empty() {
+				out.reason = "decoder-forced fps step retried → back up";
+			}
+		}
+	}
+
 	/// A rate produced loss/bloat: remember it as a punished ceiling and, if it was a probe,
 	/// double the wait before the next one.
 	fn punish(&mut self, bad_rate: u32) {
@@ -2865,6 +2944,57 @@ mod tests {
 			ctl.tick(&win(2000, 0, 20.0));
 		}
 		assert!(ctl.point().fps <= p.fps, "{:?}", ctl.point());
+	}
+
+	/// The mobile client runs the ladder off (bitrate only): a decoder that sheds frames steps
+	/// the fps down ONE rung at the same size, the point otherwise stays put while the rate
+	/// adapts, and the rung it left is retried after `POINT_RETRY_WINDOWS` (doubling).
+	#[test]
+	fn a_ladder_off_session_steps_one_fps_rung_for_the_decoder_and_retries() {
+		let mut c = at_cap(VCodec::H265, 20_000);
+		c.native = (2400, 1080, 60);
+		let mut ctl = Controller::new(c);
+		let top = ctl.point();
+		assert_eq!((top.width, top.height, top.fps), (2400, 1080, 60));
+		// Bandwidth alone never moves the point with the ladder off.
+		for _ in 0..6 {
+			ctl.tick(&win(600, 400, 20.0));
+		}
+		assert_eq!(ctl.point(), top, "a lossy link cuts the rate, not the point");
+		// Decode time is not used: the ladder-off path never reads it.
+		assert!(ctl.client_decode_bound(25.0).point.is_none(), "a ladder-off point is not the ladder's");
+		let p = ctl.client_decoder_sheds().point.expect("stepped down for the decoder");
+		assert_eq!((p.width, p.height, p.fps), (2400, 1080, 30), "one fps rung, same size");
+		assert!(ctl.decoder_limited());
+		// The point holds (clean or lossy) until the retry is due, then goes back up.
+		let mut back = None;
+		for i in 1..=POINT_RETRY_WINDOWS + 1 {
+			let d = ctl.tick(&if i % 2 == 0 { win(2000, 0, 20.0) } else { win(600, 400, 20.0) });
+			if let Some(q) = d.point {
+				back = Some((i, q));
+				break;
+			}
+			assert_eq!(ctl.point(), p);
+		}
+		assert_eq!(back, Some((POINT_RETRY_WINDOWS, top)), "retried after the wait");
+		assert!(!ctl.decoder_limited());
+		// Shedding again: the next wait is twice as long.
+		assert!(ctl.client_decoder_sheds().point.is_some());
+		for _ in 0..POINT_RETRY_WINDOWS {
+			assert!(ctl.tick(&win(2000, 0, 20.0)).point.is_none());
+		}
+		assert!(ctl.decoder_limited());
+		// The bottom fps rung has nothing under it at this size.
+		let mut b = at_cap(VCodec::H265, 20_000);
+		b.native = (1280, 720, 30);
+		assert!(Controller::new(b).client_decoder_sheds().point.is_none());
+		// With the ladder on, the desktop's decode-time rule runs instead.
+		let mut l = cfg(15_000, false);
+		l.native = (1920, 1080, 60);
+		let mut laddered = Controller::new(l);
+		assert!(laddered.client_decoder_sheds().point.is_none());
+		laddered.set_manual_point(true);
+		assert!(laddered.client_decode_bound(25.0).point.is_none(), "a pinned point is left alone");
 	}
 
 	/// A real standing queue lifts EVERY sample — the floor-based check must still cut.

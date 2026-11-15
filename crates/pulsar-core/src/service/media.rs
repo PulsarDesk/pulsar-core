@@ -16,12 +16,35 @@
 pub const TAG_VIDEO: u8 = 0x01;
 /// Tag byte: an audio (Opus) RTP datagram follows.
 pub const TAG_AUDIO: u8 = 0x02;
-// (`TAG_FEC` = 0x03, the XOR parity datagram, is defined with the FEC code below.)
+// (`TAG_FEC` = 0x03, the XOR parity datagram, is defined with the FEC code below; the audio
+// parity `TAG_AUDIO_FEC` = 0x07 next to `AudioFecEncoder`.)
 
 /// Feature ids a host advertises in `StreamCaps::features`:
 /// `mos` = media-over-session supported; `nack` = it honors `MediaNack` retransmits.
 pub const FEAT_MOS: &str = "mos";
 pub const FEAT_NACK: &str = "nack";
+
+/// Media-over-session is the ONLY encrypted media path: without it the host would send the
+/// RTP as plain UDP to the client's ports. A client must refuse to stream (and a host must
+/// refuse to send) instead of falling back to that — an on-path attacker who drops the caps
+/// exchange for two seconds must not get a plaintext stream. Every Pulsar host since the
+/// single-socket transport advertises [`FEAT_MOS`]; the pure-RTP legacy flows remain only as
+/// the encoders' loopback intake.
+pub fn encrypted_media(features: &[String]) -> bool {
+	features.iter().any(|f| f == FEAT_MOS)
+}
+
+/// Largest video RTP packet (RTP header + payload) any host packetizer may emit.
+///
+/// Sized so the WORST datagram it becomes — a Reed-Solomon parity packet for it (1 tag +
+/// 7 header + 2 length + packet), sealed (+16 Poly1305), framed as `PeerMsg::Data` (+28) and
+/// wrapped in the sender-side `ClientMsg::RelayData` (+40), in UDP over IPv6 (+48) — still
+/// fits a 1280-byte MTU: the IPv6 minimum, Tailscale's tunnel MTU, a WireGuard/ZeroTier
+/// overlay at its tightest. 1200 (the old value) produced 1282-byte direct and ~1320-byte
+/// relayed packets, which such tunnels fragment (one lost fragment loses the packet, and the
+/// FEC loses a whole shard). The cost on a 1500-byte LAN is ~5 % more packets. Pinned by the
+/// `rtp_packets_fit_a_1280_mtu` test against the real encoders.
+pub const RTP_MAX_PACKET: usize = 1136;
 
 /// Build one media session-payload: `[tag][rtp…]`.
 pub fn frame(tag: u8, rtp: &[u8]) -> Vec<u8> {
@@ -39,7 +62,7 @@ pub use crate::input::ds5::wire::TAG_DS5;
 /// control messages, junk). Empty RTP is rejected.
 pub fn parse(payload: &[u8]) -> Option<(u8, &[u8])> {
 	match payload.split_first() {
-		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS | TAG_PROBE | TAG_DS5), rest)) if !rest.is_empty() => Some((tag, rest)),
+		Some((&tag @ (TAG_VIDEO | TAG_AUDIO | TAG_FEC | TAG_FEC_RS | TAG_PROBE | TAG_DS5 | TAG_AUDIO_FEC), rest)) if !rest.is_empty() => Some((tag, rest)),
 		_ => None,
 	}
 }
@@ -64,6 +87,30 @@ pub fn seq_forward(a: u16, b: u16) -> u16 {
 mod tests {
 	use super::*;
 
+	/// The largest datagram a [`RTP_MAX_PACKET`] video packet turns into on the wire — its
+	/// RS or XOR parity, sealed, as `PeerMsg::Data`, wrapped in the client-side relay frame
+	/// (the bigger of the two relay frames), in UDP over IPv6 — fits a 1280-byte MTU.
+	#[test]
+	fn rtp_packets_fit_a_1280_mtu() {
+		use pulsar_proto::{encode, ClientMsg, DeviceId, PeerMsg, Token};
+		let pkt = vec![0x80u8; RTP_MAX_PACKET];
+		let video = frame(TAG_VIDEO, &pkt);
+		let rs = rs_parity_frames_m(0, &[&pkt[..], &pkt[..]], 1).remove(0);
+		let xor = parity_frame(0, &[&pkt[..], &pkt[..]]).unwrap();
+		let biggest = [video.len(), rs.len(), xor.len()].into_iter().max().unwrap();
+		let sealed = vec![0u8; biggest + 16]; // ChaCha20-Poly1305 tag
+		let data = encode(&PeerMsg::Data { session: u64::MAX, seq: u64::MAX, payload: sealed });
+		let relayed = encode(&ClientMsg::RelayData {
+			id: DeviceId(999_999_999),
+			token: Token([0; 16]),
+			session: u64::MAX,
+			payload: data.clone(),
+		});
+		const UDP_IPV6: usize = 8 + 40;
+		assert!(relayed.len() + UDP_IPV6 <= 1280, "relayed {} B + {UDP_IPV6}", relayed.len());
+		assert!(data.len() + UDP_IPV6 <= 1280, "direct {} B + {UDP_IPV6}", data.len());
+	}
+
 	#[test]
 	fn frame_parse_roundtrip() {
 		let rtp = [0x80u8, 96, 0x12, 0x34, 0, 0, 0, 0];
@@ -78,7 +125,7 @@ mod tests {
 		assert!(parse(b"{\"Ping\":null}").is_none(), "JSON is not media");
 		assert!(parse(&[]).is_none());
 		assert!(parse(&[TAG_VIDEO]).is_none(), "empty RTP rejected");
-		assert!(parse(&[0x07, 1, 2, 3]).is_none(), "unknown tag rejected");
+		assert!(parse(&[0x08, 1, 2, 3]).is_none(), "unknown tag rejected");
 	}
 
 	#[test]
@@ -429,6 +476,10 @@ pub const FEAT_TOUCH: &str = "touch";
 /// Feature id: the host performs 3 / 4-finger touchpad gestures (`InputEvent::Gesture`) as
 /// its own OS defines them (`input::gesture::HostGestures`).
 pub const FEAT_GESTURE: &str = "gesture";
+/// Host injects the mouse side buttons (`PointerButton` 3 = back / X1, 4 = forward / X2, see
+/// [`crate::input::mouse_button`]). Older hosts turned unknown button ids into a LEFT click,
+/// so clients send the side buttons only to hosts that advertise this.
+pub const FEAT_MOUSE_X: &str = "mouse_x";
 /// Feature id: the host recovers a lost frame by reference-frame invalidation
 /// ([`DataMsg::MediaRfi`](crate::service::DataMsg::MediaRfi)) instead of a keyframe, and tags
 /// the recovery frame with [`RFI_RECOVERY_UUID`] in a user-data-unregistered SEI.
@@ -888,6 +939,157 @@ impl RsFecDecoder {
 	pub fn reset(&mut self) {
 		self.ring.clear();
 		self.blocks.clear();
+	}
+}
+
+// ── Audio FEC: Reed-Solomon parity over short runs of audio datagrams ──────────────────
+//
+// The audio stream had no repair at all (hidden-gaps 1.11a): one lost datagram on Wi-Fi was
+// a PLC'd (Opus) or hard (L16) gap, and the audio NACK path does not exist (a retransmit is
+// too late for a 15 ms queue anyway). Moonlight sends RS(4+2) over 5 ms Opus packets, i.e.
+// one block per 20 ms. Here the block also spans ~20 ms whatever the packet length:
+// RS(4+2) over the 5 ms L16 packets, RS(2+1) over the 10 ms Opus packets — 50 % parity
+// either way (+64 kbit/s on Standard Opus), any one loss per 10 ms repairable with zero
+// round trips. Same body as the video's `TAG_FEC_RS` (so `RsFecDecoder` rebuilds it) on its
+// own tag: an old client (which would hand a TAG_FEC_RS shard to the VIDEO decoder) never
+// sees one, because a host sends audio parity only to a client that asked
+// (`StreamReq::audio_fec`).
+
+/// Tag byte: a Reed-Solomon parity shard over a block of audio datagrams follows (body as
+/// [`TAG_FEC_RS`], parsed with [`parse_rs_parity`] / [`RsFecDecoder`]).
+pub const TAG_AUDIO_FEC: u8 = 0x07;
+/// Feature id: the host sends audio parity to a client that asks (`StreamReq::audio_fec`).
+pub const FEAT_AUDIO_FEC: &str = "audio_fec";
+
+/// Data + parity shards of one audio block for a payload type: ~20 ms of audio per block.
+pub fn audio_fec_shape(payload_type: u8) -> (usize, usize) {
+	if payload_type == crate::audio::L16_PAYLOAD_TYPE {
+		(4, 2)
+	} else {
+		(2, 1)
+	}
+}
+
+/// Host side: groups consecutive audio datagrams (by RTP sequence number, per SSRC and payload
+/// type) into blocks of [`audio_fec_shape`] and returns the block's parity datagrams
+/// (`[TAG_AUDIO_FEC][…]`, ready to send) when its last packet passes. A sequence gap, a new
+/// SSRC or payload type (encoder restart, quality change) drops the open block.
+#[derive(Debug, Default)]
+pub struct AudioFecEncoder {
+	group: Vec<Vec<u8>>,
+	base: u16,
+	next: Option<u16>,
+	stream: Option<(u32, u8)>,
+}
+
+impl AudioFecEncoder {
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// One outgoing audio RTP datagram (after it was sent).
+	pub fn push(&mut self, rtp: &[u8]) -> Vec<Vec<u8>> {
+		if rtp.len() < 12 || rtp.len() > FEC_MAX_PACKET {
+			self.group.clear();
+			self.next = None;
+			return Vec::new();
+		}
+		let seq = u16::from_be_bytes([rtp[2], rtp[3]]);
+		let pt = rtp[1] & 0x7f;
+		let ssrc = u32::from_be_bytes([rtp[8], rtp[9], rtp[10], rtp[11]]);
+		if self.next != Some(seq) || self.stream != Some((ssrc, pt)) {
+			self.group.clear();
+		}
+		self.stream = Some((ssrc, pt));
+		self.next = Some(seq.wrapping_add(1));
+		if self.group.is_empty() {
+			self.base = seq;
+		}
+		self.group.push(rtp.to_vec());
+		let (k, m) = audio_fec_shape(pt);
+		if self.group.len() < k {
+			return Vec::new();
+		}
+		let group = std::mem::take(&mut self.group);
+		let refs: Vec<&[u8]> = group.iter().map(|v| v.as_slice()).collect();
+		let mut out = rs_parity_frames_m(self.base, &refs, m);
+		for f in &mut out {
+			f[0] = TAG_AUDIO_FEC;
+		}
+		out
+	}
+}
+
+#[cfg(test)]
+mod audio_fec_tests {
+	use super::*;
+
+	fn rtp(seq: u16, pt: u8, ssrc: u32, len: usize) -> Vec<u8> {
+		let mut v = vec![0u8; len];
+		v[0] = 0x80;
+		v[1] = pt;
+		v[2..4].copy_from_slice(&seq.to_be_bytes());
+		v[8..12].copy_from_slice(&ssrc.to_be_bytes());
+		for (i, b) in v[12..].iter_mut().enumerate() {
+			*b = (seq as usize * 7 + i) as u8;
+		}
+		v
+	}
+
+	#[test]
+	fn opus_blocks_are_two_plus_one_and_rebuild_a_loss() {
+		let mut enc = AudioFecEncoder::new();
+		let mut dec = RsFecDecoder::new(64);
+		let a = rtp(65535, crate::audio::OPUS_PAYLOAD_TYPE, 9, 160);
+		let b = rtp(0, crate::audio::OPUS_PAYLOAD_TYPE, 9, 143); // VBR: sizes differ, seq wraps
+		assert!(enc.push(&a).is_empty());
+		let par = enc.push(&b);
+		assert_eq!(par.len(), 1);
+		assert_eq!(par[0][0], TAG_AUDIO_FEC);
+		let p = parse_rs_parity(&par[0][1..]).unwrap();
+		assert_eq!((p.base_seq, p.k, p.m), (65535, 2, 1));
+		// `a` lost: rebuilt from `b` + the parity.
+		dec.on_packet(0, &b);
+		let got = dec.on_parity(&par[0][1..]);
+		assert_eq!(got, vec![(65535, a)]);
+	}
+
+	#[test]
+	fn l16_blocks_are_four_plus_two_and_rebuild_two_losses() {
+		let mut enc = AudioFecEncoder::new();
+		let pkts: Vec<Vec<u8>> = (10..14).map(|s| rtp(s, crate::audio::L16_PAYLOAD_TYPE, 1, 972)).collect();
+		let mut par = Vec::new();
+		for p in &pkts {
+			par.extend(enc.push(p));
+		}
+		assert_eq!(par.len(), 2);
+		let mut dec = RsFecDecoder::new(64);
+		dec.on_packet(11, &pkts[1]);
+		dec.on_packet(13, &pkts[3]);
+		assert!(dec.on_parity(&par[0][1..]).is_empty(), "two losses need both shards");
+		let got = dec.on_parity(&par[1][1..]);
+		assert_eq!(got, vec![(10, pkts[0].clone()), (12, pkts[2].clone())]);
+	}
+
+	#[test]
+	fn a_gap_or_new_stream_drops_the_open_block() {
+		let mut enc = AudioFecEncoder::new();
+		let pt = crate::audio::OPUS_PAYLOAD_TYPE;
+		assert!(enc.push(&rtp(1, pt, 5, 100)).is_empty());
+		// Sequence gap: 1 is dropped, 3 opens a new block.
+		assert!(enc.push(&rtp(3, pt, 5, 100)).is_empty());
+		let par = enc.push(&rtp(4, pt, 5, 100));
+		assert_eq!(parse_rs_parity(&par[0][1..]).unwrap().base_seq, 3);
+		// New SSRC (encoder restart) with the next number: no block across the two streams.
+		assert!(enc.push(&rtp(5, pt, 6, 100)).is_empty());
+		assert!(enc.push(&rtp(6, pt, 7, 100)).is_empty());
+		assert_eq!(enc.push(&rtp(7, pt, 7, 100)).len(), 1);
+	}
+
+	#[test]
+	fn the_tag_parses_as_media() {
+		let f = frame(TAG_AUDIO_FEC, &[1, 2, 3]);
+		assert_eq!(parse(&f), Some((TAG_AUDIO_FEC, &[1u8, 2, 3][..])));
 	}
 }
 

@@ -8,7 +8,7 @@
 //! and packetizes the stream itself. Pipeline:
 //!
 //! ```text
-//! pipewiresrc ! queue leaky ! videoconvert ! video/x-raw,format=NV12 ! fakesink (handoff)
+//! pipewiresrc ! queue leaky ! videoconvert n-threads=0 ! video/x-raw,format=NV12,colorimetry=bt709 ! fakesink (handoff)
 //! ```
 //!
 //! The encoder is built on the first frame (its size is the cast's, known only then) by the
@@ -62,7 +62,7 @@ pub(crate) fn pipeline_desc(fd: i32, node_id: u32) -> String {
 	format!(
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! video/x-raw,format=NV12 \
+		 ! videoconvert n-threads=0 ! video/x-raw,format=NV12,colorimetry=bt709 \
 		 ! fakesink name={SINK_NAME} sync=false signal-handoffs=true"
 	)
 }

@@ -138,11 +138,9 @@ pub struct DesktopInput {
 	/// across both devices, so abs-position-then-click still lands correctly.
 	mouse: VirtualDevice,
 	keyboard: VirtualDevice,
-	/// Carried-over fractional scroll (in wheel notches). A single small/precision
-	/// wheel delta (< one notch) used to `round()` to 0 and silently do nothing; we
-	/// instead accumulate the remainder so successive fine scrolls eventually move.
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Hi-res wheel conversion with the sub-unit carry + legacy-notch counter (see
+	/// [`super::wheel`]).
+	scroll: super::wheel::HiResScroll,
 	/// The streamed monitor within the output layout (see `set_region`); `None` = the
 	/// whole layout.
 	region: Option<crate::capture::PointerRegion>,
@@ -155,6 +153,15 @@ pub struct DesktopInput {
 	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
 	/// Lazily started pen / touch worker (uinput tablet + touchscreen, see `pen_touch`).
 	pen_touch: Option<super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>>>,
+	/// X11 only: the scratch-keycode remap for characters the layout lacks. `None` = not
+	/// tried yet, `Some(None)` = unavailable (Wayland / no X display).
+	x11_scratch: Option<Option<super::host_keymap_linux::X11Scratch>>,
+	/// Caps Lock as toggled by the keys this injector pressed (the host's own keyboard can
+	/// toggle it too, unseen), counted only where KEY_CAPSLOCK locks Caps on the host layout:
+	/// `type_char` then types from the layout's Caps table.
+	caps_on: bool,
+	/// A character neither the layout nor a fallback could type was already logged.
+	untypable_logged: bool,
 }
 
 /// Commands for the touchpad-pinch worker thread.
@@ -389,6 +396,9 @@ impl DesktopInput {
 		btns.insert(KeyCode::BTN_LEFT);
 		btns.insert(KeyCode::BTN_RIGHT);
 		btns.insert(KeyCode::BTN_MIDDLE);
+		// Side buttons: back / forward (`mouse_button::BACK` / `FORWARD`).
+		btns.insert(KeyCode::BTN_SIDE);
+		btns.insert(KeyCode::BTN_EXTRA);
 		// ABSOLUTE pointer: INPUT_PROP_DIRECT + ABS_X/Y. Buttons stay here too so an
 		// absolute-path tap (set position, then click on THIS device) still works.
 		let mut props = AttributeSet::<PropType>::new();
@@ -411,6 +421,11 @@ impl DesktopInput {
 		rels.insert(RelativeAxisCode::REL_Y);
 		rels.insert(RelativeAxisCode::REL_WHEEL);
 		rels.insert(RelativeAxisCode::REL_HWHEEL);
+		// High-resolution wheel (120 per notch, kernel 5.0+): libinput / Wayland
+		// compositors read these for smooth scrolling and ignore the legacy axes on a
+		// device that has them; X11 / older stacks still read REL_WHEEL / REL_HWHEEL.
+		rels.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+		rels.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
 		let mouse = VirtualDevice::builder()?
 			.name("Pulsar Virtual Mouse")
 			.with_keys(&btns)?
@@ -425,17 +440,21 @@ impl DesktopInput {
 			.name("Pulsar Virtual Keyboard")
 			.with_keys(&keys)?
 			.build()?;
+		// Read the host layout off the input path, ready by the first typed character.
+		super::host_keymap_linux::start();
 		Ok(Self {
 			pointer,
 			mouse,
 			keyboard,
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 			region: None,
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
 			pinch_tx: None,
 			pen_touch: None,
+			x11_scratch: None,
+			caps_on: false,
+			untypable_logged: false,
 		})
 	}
 
@@ -511,49 +530,44 @@ impl DesktopInput {
 		}
 	}
 
-	/// Press/release a mouse button (0=left, 1=right, 2=middle).
+	/// Press/release a mouse button (0=left, 1=right, 2=middle, 3=back = BTN_SIDE,
+	/// 4=forward = BTN_EXTRA). Unknown ids are ignored (they used to become a left click).
 	pub fn button(&mut self, button: u8, down: bool) {
-		let key = match button {
-			1 => KeyCode::BTN_RIGHT,
-			2 => KeyCode::BTN_MIDDLE,
-			_ => KeyCode::BTN_LEFT,
+		let Some(code) = super::mouse_button::to_evdev(button) else {
+			return;
 		};
 		if down {
-			self.held_buttons.insert(key.code());
+			self.held_buttons.insert(code);
 		} else {
-			self.held_buttons.remove(&key.code());
+			self.held_buttons.remove(&code);
 		}
 		let _ = self
 			.mouse
-			.emit(&[InputEvent::new(EventType::KEY.0, key.code(), down as i32)]);
+			.emit(&[InputEvent::new(EventType::KEY.0, code, down as i32)]);
 	}
 
-	/// Scroll by a delta (browser wheel pixels → wheel clicks).
+	/// Scroll by a delta (browser wheel pixels → hi-res wheel units + legacy notches).
+	///
+	/// Emits `REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES` (1/120 notch) for every delta, so a
+	/// smooth client scroll stays smooth, plus the legacy `REL_WHEEL` / `REL_HWHEEL` notch
+	/// each time 120 hi-res units built up in one direction — in the same frame, exactly
+	/// like the kernel's hid driver for a real hi-res mouse. Signs: evdev wheel up is +,
+	/// browser down is + (handled in [`super::wheel::HiResScroll`]).
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Accumulate fractional notches so fine/precision scroll (< 100px) isn't lost to
-		// rounding. We keep the leftover sub-notch remainder for the next call; the sign
-		// of the truncation matters, so use trunc() (toward zero) and carry the rest.
-		// evdev wheel up is +, browser down is +, so negate the vertical delta.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
-		let mut ev = Vec::new();
-		if v != 0 {
-			ev.push(InputEvent::new(
-				EventType::RELATIVE.0,
-				RelativeAxisCode::REL_WHEEL.0,
-				v,
-			));
+		let o = self.scroll.push(dx, dy);
+		let rel = |code: RelativeAxisCode, v: i32| InputEvent::new(EventType::RELATIVE.0, code.0, v);
+		let mut ev = Vec::with_capacity(4);
+		if o.v != 0 {
+			ev.push(rel(RelativeAxisCode::REL_WHEEL_HI_RES, o.v));
 		}
-		if h != 0 {
-			ev.push(InputEvent::new(
-				EventType::RELATIVE.0,
-				RelativeAxisCode::REL_HWHEEL.0,
-				h,
-			));
+		if o.v_notches != 0 {
+			ev.push(rel(RelativeAxisCode::REL_WHEEL, o.v_notches));
+		}
+		if o.h != 0 {
+			ev.push(rel(RelativeAxisCode::REL_HWHEEL_HI_RES, o.h));
+		}
+		if o.h_notches != 0 {
+			ev.push(rel(RelativeAxisCode::REL_HWHEEL, o.h_notches));
 		}
 		if !ev.is_empty() {
 			let _ = self.mouse.emit(&ev);
@@ -567,6 +581,12 @@ impl DesktopInput {
 		}
 		let code = code as u16;
 		if down {
+			if code == KeyCode::KEY_CAPSLOCK.code()
+				&& !self.held_keys.contains(&code)
+				&& super::host_keymap_linux::current().caps_locks
+			{
+				self.caps_on = !self.caps_on;
+			}
 			self.held_keys.insert(code);
 		} else {
 			self.held_keys.remove(&code);
@@ -576,45 +596,72 @@ impl DesktopInput {
 			.emit(&[InputEvent::new(EventType::KEY.0, code, down as i32)]);
 	}
 
-	/// Type a resolved Unicode character (layout-independent). uinput is keycode-based with no
-	/// direct Unicode-insert path, so a Linux HOST can't natively insert an arbitrary codepoint.
-	/// A Linux CLIENT resolves printable keys through xkb and forwards ONLY `Char(c)` (suppressing
-	/// the raw `Key` press/release), so without this the character is silently dropped on a Linux
-	/// host (Windows hosts use KEYEVENTF_UNICODE). We synthesize ASCII codepoints by tapping the
-	/// matching US-layout evdev keycode (+ Shift when needed) on the existing keyboard device —
-	/// reliable for URLs, passwords, chat and filenames. Non-ASCII codepoints have no fixed
-	/// keycode without a temporary keymap remap and remain unhandled.
+	/// Type a resolved Unicode character (the client mapped a key through ITS layout to this
+	/// codepoint; Windows hosts insert it with KEYEVENTF_UNICODE, macOS with a CGEvent string).
+	/// uinput has only keycodes and the compositor / X server applies the HOST's layout to
+	/// them, so the character is typed with the key and level the host layout uses for it
+	/// (`host_keymap_linux`: TR-Q `ş` = KEY_SEMICOLON, `@` = AltGr+Q). The client's held
+	/// Shift / AltGr are lifted or reused as the level needs (`keytables::chord_edges`).
+	/// A character the layout has only as a dead key (de `^`, fr `¨`) is the dead key + Space
+	/// (or the dead key twice). One the layout lacks: X11 maps it onto a borrowed keycode (as
+	/// `xdotool type` does); under GNOME / IBus it goes in as the Unicode entry Ctrl+Shift+U,
+	/// hex, Space; elsewhere (KDE without IBus, wlroots) it is dropped and logged once.
+	/// Never blocks on reading the layout (a worker thread does that).
 	pub fn type_char(&mut self, c: char) {
-		let Some((key, shift)) = us_char_to_key(c) else {
+		use super::keytables::{chord_edges, control_char_key, unicode_entry_edges, KeyChord};
+		if let Some(code) = control_char_key(c) {
+			let edges = chord_edges(KeyChord { code, shift: false, altgr: false }, |k| self.held_keys.contains(&k));
+			self.emit_edges(&edges);
 			return;
+		}
+		let km = super::host_keymap_linux::current();
+		let table = if self.caps_on && km.caps_locks { &km.table_caps } else { &km.table };
+		let edges = if let Some(&chord) = table.get(&c) {
+			Some(chord_edges(chord, |k| self.held_keys.contains(&k)))
+		} else {
+			// Missing: the user may have switched layouts — let the worker re-read it.
+			super::host_keymap_linux::nudge();
+			if let Some(chords) = km.dead.get(&c) {
+				Some(chords.iter().flat_map(|&ch| chord_edges(ch, |k| self.held_keys.contains(&k))).collect())
+			} else if let Some(code) = self.x11_scratch_code(c) {
+				Some(chord_edges(KeyChord { code, shift: false, altgr: false }, |k| self.held_keys.contains(&k)))
+			} else if super::keytables::unicode_entry_supported(|k| std::env::var(k).ok()) {
+				unicode_entry_edges(c, table, |k| self.held_keys.contains(&k))
+			} else {
+				None
+			}
 		};
-		let code = key.code();
-		// If Shift is already physically held by the client (tracked in held_keys), do NOT
-		// emit a synthetic LEFTSHIFT down/up around the keytap. The kernel already sees Shift
-		// held and will produce the shifted character on its own. Adding a trailing
-		// LEFTSHIFT(0) would release the host's held Shift at the kernel/X layer even though
-		// the client's Shift key is still down — the held_keys set and the actual kernel
-		// modifier state would diverge, breaking subsequent Shift+Arrow / Shift+Home / etc.
-		let shift_already_held = self.held_keys.contains(&KeyCode::KEY_LEFTSHIFT.code())
-			|| self.held_keys.contains(&KeyCode::KEY_RIGHTSHIFT.code());
-		let mut ev = Vec::with_capacity(4);
-		if shift && !shift_already_held {
-			ev.push(InputEvent::new(
-				EventType::KEY.0,
-				KeyCode::KEY_LEFTSHIFT.code(),
-				1,
-			));
+		match edges {
+			Some(edges) => self.emit_edges(&edges),
+			None if !self.untypable_logged => {
+				self.untypable_logged = true;
+				// Never the character itself: remote typing can be a password, and users attach
+				// this log to bug reports.
+				tracing::warn!(
+					source = km.source,
+					utf8_len = c.len_utf8(),
+					alphabetic = c.is_alphabetic(),
+					"host layout cannot type a received character (no X11 remap, no GTK/IBus Unicode entry)"
+				);
+			}
+			None => {}
 		}
-		ev.push(InputEvent::new(EventType::KEY.0, code, 1));
-		ev.push(InputEvent::new(EventType::KEY.0, code, 0));
-		if shift && !shift_already_held {
-			ev.push(InputEvent::new(
-				EventType::KEY.0,
-				KeyCode::KEY_LEFTSHIFT.code(),
-				0,
-			));
+	}
+
+	/// X11 fallback: the evdev code of a borrowed keycode now mapped to `c`.
+	fn x11_scratch_code(&mut self, c: char) -> Option<u16> {
+		self.x11_scratch
+			.get_or_insert_with(super::host_keymap_linux::X11Scratch::new)
+			.as_mut()?
+			.evdev_for(c)
+	}
+
+	/// Emit key edges one per frame (SYN_REPORT after each), so the compositor's xkb state
+	/// takes every modifier change before the next key.
+	fn emit_edges(&mut self, edges: &[(u16, i32)]) {
+		for &(code, value) in edges {
+			let _ = self.keyboard.emit(&[InputEvent::new(EventType::KEY.0, code, value)]);
 		}
-		let _ = self.keyboard.emit(&ev);
 	}
 
 	/// Release every currently-held mouse button and key. Called when control is
@@ -655,108 +702,6 @@ impl Drop for DesktopInput {
 	fn drop(&mut self) {
 		self.flush_held();
 	}
-}
-
-/// Maps an ASCII character to the US-layout evdev key that produces it and whether Shift is held.
-/// The host keyboard device exposes the full evdev keycode range, so emitting these raw codes (the
-/// same codes a Linux client's `Key` path sends) lands the character regardless of the host's own
-/// X/Wayland layout. Returns `None` for non-ASCII (no fixed keycode without a keymap remap).
-fn us_char_to_key(c: char) -> Option<(KeyCode, bool)> {
-	let unshifted = |k: KeyCode| Some((k, false));
-	let shifted = |k: KeyCode| Some((k, true));
-	match c {
-		'a'..='z' => unshifted(KeyCode::new(letter_key_code(c, false))),
-		'A'..='Z' => shifted(KeyCode::new(letter_key_code(c, true))),
-		'0' => unshifted(KeyCode::KEY_0),
-		'1' => unshifted(KeyCode::KEY_1),
-		'2' => unshifted(KeyCode::KEY_2),
-		'3' => unshifted(KeyCode::KEY_3),
-		'4' => unshifted(KeyCode::KEY_4),
-		'5' => unshifted(KeyCode::KEY_5),
-		'6' => unshifted(KeyCode::KEY_6),
-		'7' => unshifted(KeyCode::KEY_7),
-		'8' => unshifted(KeyCode::KEY_8),
-		'9' => unshifted(KeyCode::KEY_9),
-		' ' => unshifted(KeyCode::KEY_SPACE),
-		'\t' => unshifted(KeyCode::KEY_TAB),
-		'\n' | '\r' => unshifted(KeyCode::KEY_ENTER),
-		'-' => unshifted(KeyCode::KEY_MINUS),
-		'=' => unshifted(KeyCode::KEY_EQUAL),
-		'[' => unshifted(KeyCode::KEY_LEFTBRACE),
-		']' => unshifted(KeyCode::KEY_RIGHTBRACE),
-		'\\' => unshifted(KeyCode::KEY_BACKSLASH),
-		';' => unshifted(KeyCode::KEY_SEMICOLON),
-		'\'' => unshifted(KeyCode::KEY_APOSTROPHE),
-		'`' => unshifted(KeyCode::KEY_GRAVE),
-		',' => unshifted(KeyCode::KEY_COMMA),
-		'.' => unshifted(KeyCode::KEY_DOT),
-		'/' => unshifted(KeyCode::KEY_SLASH),
-		'!' => shifted(KeyCode::KEY_1),
-		'@' => shifted(KeyCode::KEY_2),
-		'#' => shifted(KeyCode::KEY_3),
-		'$' => shifted(KeyCode::KEY_4),
-		'%' => shifted(KeyCode::KEY_5),
-		'^' => shifted(KeyCode::KEY_6),
-		'&' => shifted(KeyCode::KEY_7),
-		'*' => shifted(KeyCode::KEY_8),
-		'(' => shifted(KeyCode::KEY_9),
-		')' => shifted(KeyCode::KEY_0),
-		'_' => shifted(KeyCode::KEY_MINUS),
-		'+' => shifted(KeyCode::KEY_EQUAL),
-		'{' => shifted(KeyCode::KEY_LEFTBRACE),
-		'}' => shifted(KeyCode::KEY_RIGHTBRACE),
-		'|' => shifted(KeyCode::KEY_BACKSLASH),
-		':' => shifted(KeyCode::KEY_SEMICOLON),
-		'"' => shifted(KeyCode::KEY_APOSTROPHE),
-		'~' => shifted(KeyCode::KEY_GRAVE),
-		'<' => shifted(KeyCode::KEY_COMMA),
-		'>' => shifted(KeyCode::KEY_DOT),
-		'?' => shifted(KeyCode::KEY_SLASH),
-		_ => None,
-	}
-}
-
-/// evdev keycode for an ASCII letter. The alphabet is NOT contiguous in evdev order, so look it up
-/// in a row-ordered table (q-row, a-row, z-row) keyed by the lowercase letter.
-fn letter_key_code(c: char, upper: bool) -> u16 {
-	let lower = if upper {
-		c.to_ascii_lowercase()
-	} else {
-		c
-	};
-	// evdev key order by physical row: top (Q..P), home (A..L), bottom (Z..M).
-	const ROWS: &[(char, u16)] = &[
-		('q', 16),
-		('w', 17),
-		('e', 18),
-		('r', 19),
-		('t', 20),
-		('y', 21),
-		('u', 22),
-		('i', 23),
-		('o', 24),
-		('p', 25),
-		('a', 30),
-		('s', 31),
-		('d', 32),
-		('f', 33),
-		('g', 34),
-		('h', 35),
-		('j', 36),
-		('k', 37),
-		('l', 38),
-		('z', 44),
-		('x', 45),
-		('c', 46),
-		('v', 47),
-		('b', 48),
-		('n', 49),
-		('m', 50),
-	];
-	ROWS.iter()
-		.find(|(ch, _)| *ch == lower)
-		.map(|(_, code)| *code)
-		.unwrap_or(0)
 }
 
 #[cfg(test)]

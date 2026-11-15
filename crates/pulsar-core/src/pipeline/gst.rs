@@ -159,8 +159,11 @@ pub fn encoder_fragment_with(
 		VCodec::H265 => ("h265parse", "rtph265pay"),
 		VCodec::Av1 => return None,
 	};
+	// `mtu` = whole RTP packet, sized to fit a 1280-byte overlay / relay MTU after the
+	// session framing (see `service::media::RTP_MAX_PACKET`).
 	Some(format!(
-		"{enc_props} ! {parse} ! {pay} config-interval=1 pt=96 mtu=1200"
+		"{enc_props} ! {parse} ! {pay} config-interval=1 pt=96 mtu={}",
+		crate::service::media::RTP_MAX_PACKET
 	))
 }
 
@@ -175,6 +178,36 @@ pub fn wayland_pipeline(fd: i32, node_id: u32, fragment: &str, ip: &str, port: u
 	wayland_pipeline_sized(fd, node_id, fragment, ip, port, None)
 }
 
+/// Where the Wayland pipeline turns the cast's RGB frames into the encoder's NV12
+/// (hidden-gaps 1.10: one single-threaded CPU `videoconvert` did all of it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaylandConvert {
+	/// `videoconvert` (and `videoscale` for a window cast) on the CPU, sliced over every core
+	/// (`n-threads=0` = one slice per core; the element default is ONE thread, an fps ceiling
+	/// at 1440p/4K 120 and worse on ARM64 hosts).
+	Cpu,
+	/// `vapostproc` (the `va` plugin) on the GPU, straight into the VA surfaces `vah26Xenc`
+	/// encodes without a copy. Whether the frames also arrive as DMA-BUF is up to the stack:
+	/// a `pipewiresrc` / PipeWire pair that negotiates DMA-BUF caps (GStreamer 1.24+ with
+	/// `DMA_DRM`) hands the compositor's buffer to `vapostproc` with no CPU touch at all; an
+	/// older one sends SHM frames that `vapostproc` uploads (4 B/px, no CPU colour conversion
+	/// either). Nothing is forced: the caps stay open so both negotiate. The caller checks
+	/// that a frame really reaches the encoder and falls back to [`Self::Cpu`] otherwise
+	/// (`capture::start_full`).
+	Va,
+}
+
+/// The GPU conversion a gst encoder fragment can take (see [`WaylandConvert`]). Only the
+/// `va` plugin's encoders get one. NVENC on Wayland normally runs the app's raw-frame
+/// encoder (`capture/frames.rs`, CPU convert); gstreamer-vaapi (`vaapih26Xenc`, dropped
+/// upstream), `nvh26Xenc` and software x264 keep the CPU path.
+pub fn wayland_convert_for(fragment: &str) -> WaylandConvert {
+	match fragment.split_whitespace().next() {
+		Some(e) if e.starts_with("vah26") => WaylandConvert::Va,
+		_ => WaylandConvert::Cpu,
+	}
+}
+
 /// [`wayland_pipeline`] with an optional FIXED output size. A window cast (portal source
 /// type WINDOW) changes size whenever the window is resized, and the encoder must never
 /// see a size change mid-stream: `Some((w, h))` scales every frame into an even `w`×`h`
@@ -187,13 +220,31 @@ pub fn wayland_pipeline_sized(
 	port: u16,
 	size: Option<(u32, u32)>,
 ) -> String {
-	let scale = match size {
-		Some((w, h)) => format!(
-			"! videoscale add-borders=true ! video/x-raw,width={},height={},pixel-aspect-ratio=1/1 ",
-			w.max(2) & !1,
-			h.max(2) & !1
+	wayland_pipeline_conv(fd, node_id, fragment, ip, port, size, WaylandConvert::Cpu)
+}
+
+/// [`wayland_pipeline_sized`] with the colour conversion `convert`.
+pub fn wayland_pipeline_conv(
+	fd: i32,
+	node_id: u32,
+	fragment: &str,
+	ip: &str,
+	port: u16,
+	size: Option<(u32, u32)>,
+	convert: WaylandConvert,
+) -> String {
+	let size = size.map(|(w, h)| (w.max(2) & !1, h.max(2) & !1));
+	let convert = match (convert, size) {
+		(WaylandConvert::Cpu, None) => "videoconvert n-threads=0 ! video/x-raw,format=NV12,colorimetry=bt709 ".to_string(),
+		(WaylandConvert::Cpu, Some((w, h))) => format!(
+			"videoconvert n-threads=0 ! video/x-raw,format=NV12,colorimetry=bt709 \
+			 ! videoscale n-threads=0 add-borders=true ! video/x-raw,width={w},height={h},pixel-aspect-ratio=1/1 "
 		),
-		None => String::new(),
+		(WaylandConvert::Va, None) => "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709 ".to_string(),
+		(WaylandConvert::Va, Some((w, h))) => format!(
+			"vapostproc add-borders=true \
+			 ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709,width={w},height={h},pixel-aspect-ratio=1/1 "
+		),
 	};
 	// NB: keep autoconnect at its default (true). It sets PW_STREAM_FLAG_AUTOCONNECT, which is
 	// what actually LINKS pipewiresrc to the `path` node — with autoconnect=false the stream
@@ -205,8 +256,7 @@ pub fn wayland_pipeline_sized(
 	format!(
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! video/x-raw,format=NV12 \
-		 {scale}! {fragment} \
+		 ! {convert}! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
 }
@@ -252,7 +302,7 @@ pub fn x11_pipeline(
 		format!(
 			"! video/x-raw,framerate={fps}/1 \
 			 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-			 ! videoconvert ! video/x-raw,format=I420 "
+			 ! videoconvert n-threads=0 ! video/x-raw,format=I420,colorimetry=bt709 "
 		)
 	};
 	// `PULSAR_DAMAGE=1` (opt-in, DEFAULT OFF): switch ximagesrc to damage-event capture
@@ -296,7 +346,7 @@ pub fn x11_window_pipeline(
 		"ximagesrc display-name={display} xid={xid} use-damage=0 show-pointer=true \
 		 ! video/x-raw,framerate={fps}/1 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! videoscale ! video/x-raw,format=I420,width={w},height={h},pixel-aspect-ratio=1/1 \
+		 ! videoconvert n-threads=0 ! videoscale n-threads=0 ! video/x-raw,format=I420,colorimetry=bt709,width={w},height={h},pixel-aspect-ratio=1/1 \
 		 ! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
@@ -356,7 +406,7 @@ pub fn probe_pipeline(fragment: &str) -> String {
 	format!(
 		"videotestsrc num-buffers=2 \
 		 ! video/x-raw,width=640,height=360,framerate=30/1 \
-		 ! videoconvert ! video/x-raw,format=NV12 \
+		 ! videoconvert ! video/x-raw,format=NV12,colorimetry=bt709 \
 		 ! {fragment} \
 		 ! fakesink sync=false"
 	)

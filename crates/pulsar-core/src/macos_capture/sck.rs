@@ -554,19 +554,25 @@ unsafe fn find_window(content: &AnyObject, id: u32) -> Result<Retained<AnyObject
 	Err(ScError::NoWindow(id))
 }
 
-/// Ask SCK for sRGB pixels with the BT.709 matrix (what the encoder signals and every client
-/// decodes as). A key this macOS lacks is skipped (SCK then keeps its default).
-pub(crate) unsafe fn request_bt709(cfg: &AnyObject) {
-	if responds(cfg, sel!(setColorSpaceName:)) {
-		if let Some(srgb) = ffi::cf_string_const(c"kCGColorSpaceSRGB") {
-			// The property is declared `CFStringRef`: pass it with that encoding (`CfStr`),
-			// not as an object; objc2 checks the argument type in debug builds.
-			let _: () = msg_send![cfg, setColorSpaceName: ffi::CfStr(srgb)];
-		}
-	}
+/// Pulsar's SDR colour rule on an `SCStreamConfiguration`: the NV12 (video range from the
+/// pixel format) is made with the **BT.709** matrix, from pixels in **sRGB** (a P3 / wide-gamut
+/// display is mapped into the BT.709 gamut, as a Windows desktop already is), so the stream
+/// says what the VideoToolbox / ffmpeg encoders write into the VUI and every client decodes.
+/// Without it the frames follow the display's own colour space. Both setters are looked up
+/// (macOS 12.3+); a missing constant leaves SCK's default. The CF strings go through
+/// `msg_send!` as [`ffi::CFStringObj`] pointers so objc2's debug encoding check matches.
+///
+/// # Safety
+/// `cfg` must be an `SCStreamConfiguration`.
+pub unsafe fn set_sdr_colour(cfg: &AnyObject) {
 	if responds(cfg, sel!(setColorMatrix:)) {
 		if let Some(m) = ffi::cf_string_const(c"kCGDisplayStreamYCbCrMatrix_ITU_R_709_2") {
-			let _: () = msg_send![cfg, setColorMatrix: ffi::CfStr(m)];
+			let _: () = msg_send![cfg, setColorMatrix: m.cast::<ffi::CFStringObj>()];
+		}
+	}
+	if responds(cfg, sel!(setColorSpaceName:)) {
+		if let Some(cs) = ffi::cf_string_const(c"kCGColorSpaceSRGB") {
+			let _: () = msg_send![cfg, setColorSpaceName: cs.cast::<ffi::CFStringObj>()];
 		}
 	}
 }
@@ -695,11 +701,9 @@ impl ScStream {
 			if window && responds(&cfg, sel!(setScalesToFit:)) {
 				let _: () = msg_send![&*cfg, setScalesToFit: Bool::YES];
 			}
-			if video.is_some() {
-				request_bt709(&cfg);
-			}
 			let _: () = msg_send![&*cfg, setMinimumFrameInterval: ffi::CMTime::new(1, fps as i32)];
 			let _: () = msg_send![&*cfg, setPixelFormat: ffi::PIXEL_FORMAT_NV12_VIDEO];
+			set_sdr_colour(&cfg);
 			let _: () = msg_send![&*cfg, setShowsCursor: Bool::new(cursor)];
 			// A few frames of slack so the encoder thread holding one never stalls SCK.
 			let _: () = msg_send![&*cfg, setQueueDepth: 5isize];

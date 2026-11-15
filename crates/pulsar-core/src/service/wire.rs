@@ -59,9 +59,15 @@ pub enum InputEvent {
 	/// Relative pointer movement (raw mouse deltas) — used by the native renderer,
 	/// where there's no canvas to read absolute positions from (and what games want).
 	PointerRelative { dx: f64, dy: f64 },
-	/// Mouse button (0=left, 1=right, 2=middle) pressed/released.
+	/// Mouse button pressed/released: 0=left, 1=right, 2=middle, 3=back (X1), 4=forward (X2)
+	/// ([`crate::input::mouse_button`]). 3 / 4 go only to hosts that advertise
+	/// [`crate::service::media::FEAT_MOUSE_X`]; hosts ignore ids they do not know.
 	PointerButton { button: u8, down: bool },
-	/// Smooth scroll delta.
+	/// Scroll delta in BROWSER wheel pixels: 100 = one wheel notch, +dy = down, +dx = right.
+	/// Fractions are meaningful and must survive end to end: a precision touchpad, a hi-res
+	/// wheel (1/120 notch = 0.833 px) or a Mac trackpad sends many small deltas. Hosts
+	/// inject them in their OS's fine unit ([`crate::input::wheel`]) instead of rounding to
+	/// notches; a host that still accumulates to whole notches stays correct, only coarser.
 	Scroll { dx: f64, dy: f64 },
 	/// Keyboard evdev keycode pressed/released.
 	Key { code: u32, down: bool },
@@ -411,6 +417,12 @@ pub struct StreamReq {
 	/// and an old host ignores the field.
 	#[serde(default)]
 	pub audio_quality: AudioQuality,
+	/// The client rebuilds lost audio from Reed-Solomon parity
+	/// ([`TAG_AUDIO_FEC`](crate::service::media::TAG_AUDIO_FEC), media-over-session only): the
+	/// host sends it next to the audio. `#[serde(default)]` (false): an old client never gets
+	/// a parity datagram, and an old host ignores the field.
+	#[serde(default)]
+	pub audio_fec: bool,
 }
 
 /// Client → host feedback the adaptive controller sends every window as
@@ -641,6 +653,10 @@ enum DataMsgWire {
 		#[serde(default)]
 		peak_nits: u16,
 	},
+	InputUnavailable {
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -689,6 +705,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::StreamedDisplay(i) => DataMsg::StreamedDisplay(i),
 			DataMsgWire::PadUnavailable { slot, reason } => DataMsg::PadUnavailable { slot, reason },
 			DataMsgWire::HdrMeta { sdr_white_nits, peak_nits } => DataMsg::HdrMeta { sdr_white_nits, peak_nits },
+			DataMsgWire::InputUnavailable { reason } => DataMsg::InputUnavailable { reason },
 		}
 	}
 }
@@ -958,6 +975,18 @@ pub enum DataMsg {
 		sdr_white_nits: u16,
 		#[serde(default)]
 		peak_nits: u16,
+	},
+	/// Host → client: the client's keyboard / mouse / pen / touch does not reach the host's
+	/// desktop (Linux: `/dev/uinput` not writable; macOS: no Accessibility grant; Android: the
+	/// control service is off) or the window in front (Windows: an elevated window while the
+	/// host is not elevated — UIPI). `reason` is an
+	/// [`InputFailure`](crate::input::InputFailure) wire token
+	/// ([`InputFailure::as_wire`](crate::input::InputFailure::as_wire)); the client shows a
+	/// localized notice for it. Sent at session start and when the condition first shows,
+	/// rate-limited by the host. Appended for additive wire compat (an old client ignores it).
+	InputUnavailable {
+		#[serde(default)]
+		reason: String,
 	},
 }
 
@@ -1370,6 +1399,14 @@ mod tests {
 		assert_eq!(QualityPref::default(), QualityPref::Balanced);
 	}
 
+	#[test]
+	fn input_unavailable_decodes_without_reason_and_wire_shape_is_stable() {
+		let m: DataMsg = serde_json::from_str(r#"{"InputUnavailable":{}}"#).unwrap();
+		assert_eq!(m, DataMsg::InputUnavailable { reason: String::new() });
+		let json = serde_json::to_string(&DataMsg::InputUnavailable { reason: "win_elevated".into() }).unwrap();
+		assert_eq!(json, r#"{"InputUnavailable":{"reason":"win_elevated"}}"#);
+	}
+
 	/// Guard against the DataMsgWire shadow-enum drift trap (bug C21).
 	///
 	/// Every `DataMsg` variant must survive a serialize→deserialize roundtrip
@@ -1447,6 +1484,8 @@ mod tests {
 			DataMsg::StreamedDisplay(1),
 			DataMsg::PadUnavailable { slot: 1, reason: "mac_entitlement".into() },
 			DataMsg::HdrMeta { sdr_white_nits: 240, peak_nits: 1000 },
+			DataMsg::InputUnavailable { reason: "uinput_denied".into() },
+			DataMsg::InputUnavailable { reason: String::new() },
 		];
 
 		for msg in cases {

@@ -25,8 +25,29 @@ pub mod pen_touch;
 /// user configured for the gesture — Windows registry, macOS trackpad prefs, GNOME / KDE).
 pub mod gesture;
 
+/// High-resolution scroll: wire browser pixels → each host OS's fine wheel unit
+/// (Windows WHEEL_DELTA fractions, Linux REL_WHEEL_HI_RES, macOS pixel scroll).
+pub mod wheel;
+
+/// Client-side batching of high-rate pointer motion / scroll (≤ one packet per ~1 ms per
+/// kind, no delay for the event that starts a burst, edges keep their order).
+pub mod coalesce;
+
 /// macOS host: the display behind an avfoundation capture device (pointer / pen geometry).
 pub mod avf_screens;
+
+/// Mouse button ids on the wire (left / right / middle / back / forward) and their per-OS
+/// codes, shared by every capture and injection path.
+pub mod mouse_button;
+
+/// Host keyboard tables that must compile (and be tested) on every target: the Linux host's
+/// character → key lookup over its own layout, and the macOS host's evdev → virtual key table.
+pub mod keytables;
+
+/// Host-side input permission checks (Linux uinput, macOS Accessibility, Windows UIPI) and
+/// the [`InputFailure`] wire token the host sends the client as `DataMsg::InputUnavailable`.
+pub mod permission;
+pub use permission::InputFailure;
 
 pub use types::{
 	axis_to_i16, button, create_virtual_pad, create_virtual_pad_checked, create_virtual_pad_target,
@@ -64,6 +85,10 @@ pub use duo::{duo_available, duo_ds5_interfaces, duo_pads_wanted, DuoDs5};
 /// Linux host-side uinput backends (virtual gamepad + desktop input).
 #[cfg(target_os = "linux")]
 mod uinput;
+
+/// Linux host: the host layout's character → key table for typing `InputEvent::Char`.
+#[cfg(target_os = "linux")]
+mod host_keymap_linux;
 
 /// DS4/DS5 touchpad-as-mouse gesture logic (one finger = pointer, two = scroll, press =
 /// click), shared by every client reader: Linux evdev below, and the desktop app's SDL3 /

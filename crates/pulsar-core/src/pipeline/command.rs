@@ -101,6 +101,46 @@ fn evened_size(plan: &StreamPlan) -> Option<(u32, u32)> {
 	(size != (plan.width, plan.height)).then_some(size)
 }
 
+/// Pulsar's SDR colour rule: **BT.709, limited (16-235) range** on every host and every
+/// client. Without a colour description ffmpeg converts RGB captures with the BT.601 matrix
+/// and writes nothing into the VUI, so each client guessed (Windows BT.601, Linux / macOS
+/// BT.709: skin tones and reds / greens shifted between them).
+///
+/// * The encoder options `-colorspace bt709 -color_range tv` (plus primaries / transfer for
+///   the encoders that read them from the context) make ffmpeg's colour negotiation
+///   (FFmpeg 7.1+, the bundled build) convert RGB → YUV with the BT.709 matrix into limited
+///   range, and the encoder writes that into the VUI / sequence header.
+/// * FFmpeg 7.1+ takes primaries and transfer from the FRAMES, not from those options (an
+///   untagged capture left them "unknown" in the VUI), so a `setparams` tag filter labels the
+///   frames too: primaries + transfer only for an RGB capture (the conversion picks matrix
+///   and range), all four for a capture that is YUV already ([`yuv_source`]), so nothing is
+///   converted there.
+/// * Every swscale conversion of an RGB capture is a `scale` this module writes itself with
+///   the matrix named ([`SDR_SCALE_OPTS`]): x11grab / gdigrab here, the ddagrab CPU bounces
+///   in `CaptureMethod::input_args`. An ffmpeg older than 7.1 (the Rockchip PPA build the
+///   OPi5 .deb ships, a system `/usr/bin/ffmpeg` on linux-arm64) still converts with swscale's
+///   BT.601 default wherever it inserts the scaler itself, which would contradict the tag.
+///   The ddagrab GPU scalers name it too (`scale_cuda` / `vpp_qsv` `out_color_matrix`).
+const SDR_ENCODER_OPTS: [&str; 8] = [
+	"-colorspace",
+	"bt709",
+	"-color_primaries",
+	"bt709",
+	"-color_trc",
+	"bt709",
+	"-color_range",
+	"tv",
+];
+const SDR_TAG_RGB: &str = "setparams=color_primaries=bt709:color_trc=bt709";
+const SDR_TAG_YUV: &str = "setparams=colorspace=bt709:range=tv:color_primaries=bt709:color_trc=bt709";
+pub(super) const SDR_SCALE_OPTS: &str = "out_color_matrix=bt709:out_range=tv";
+
+/// Does the capture hand over YUV frames the OS already converted (macOS ScreenCaptureKit
+/// NV12 video range = BT.709, avfoundation's UYVY)? Those are labelled, not re-converted.
+fn yuv_source(plan: &StreamPlan) -> bool {
+	matches!(plan.window, Some(WindowInput::RawNv12 { .. })) || plan.capture == CaptureMethod::AvFoundation
+}
+
 /// Build the host capture+encode command: `(program, args)`. Program is always
 /// `ffmpeg` (the bundled binary is substituted by the caller); the encoder is
 /// selected via ffmpeg's `-c:v` flag, no external wrapper.
@@ -158,12 +198,40 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 
 	// Screen capture (platform-specific).
 	a.extend(plan.capture.input_args(plan));
+	// SDR colour (see `SDR_ENCODER_OPTS`); HDR keeps its own signalling below.
+	let sdr = !plan.effective_hdr_yuv444().0;
+	let sdr_tag = if yuv_source(plan) { SDR_TAG_YUV } else { SDR_TAG_RGB };
 	// One `-vf` chain (a second `-vf` would replace the first).
 	let mut vf: Vec<String> = Vec::new();
+	// A capture whose chain is a `-filter_complex` (ddagrab) takes the tag at its end: a
+	// `-vf` cannot be added to a stream that comes out of a complex graph.
+	let complex = a.iter().position(|x| x == "-filter_complex").map(|i| i + 1).filter(|&i| i < a.len());
+	match complex {
+		Some(i) if sdr => a[i] = format!("{},{sdr_tag}", a[i]),
+		// YUV frames are labelled before anything reads them (no conversion in between).
+		None if sdr && yuv_source(plan) => vf.push(sdr_tag.to_string()),
+		_ => {}
+	}
 	// gdigrab captures the desktop at its own size (see CaptureMethod::input_args), and so
 	// does an x11grab of one window: scale both to the plan size.
-	if plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window() {
-		vf.push(format!("scale={}:{}", plan.width, plan.height));
+	let scaled = plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window();
+	if scaled {
+		let colour = if sdr { format!(":{SDR_SCALE_OPTS}") } else { String::new() };
+		vf.push(format!("scale={}:{}{colour}", plan.width, plan.height));
+	}
+	// Any other RGB capture would reach swscale through an AUTO-inserted scaler (the encoder's
+	// `-pix_fmt`, the VA-API / Vulkan upload's NV12): name the conversion here, so it never
+	// depends on FFmpeg 7.1+'s colour negotiation (an older ffmpeg converts BT.601 there) or on
+	// it crossing `hwupload`. The scale above, when there is one, already converts. An encoder
+	// that takes the RGB itself gets it through unchanged. Not kmsgrab (DRM-PRIME hw frames,
+	// no swscale) unless the old VA-API / Vulkan upload chain applies.
+	let cpu_rgb = complex.is_none() && plan.capture != CaptureMethod::Kmsgrab;
+	if sdr
+		&& !scaled
+		&& !yuv_source(plan)
+		&& (cpu_rgb || matches!(plan.encoder, HwEncoder::Vaapi | HwEncoder::Vulkan))
+	{
+		vf.push(format!("scale={SDR_SCALE_OPTS}"));
 	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
@@ -179,6 +247,11 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 			(false, false) => "nv12",
 		};
 		vf.push(format!("format={up},hwupload"));
+	}
+	// An RGB capture is labelled at the end of the chain (primaries / transfer only, so its
+	// place does not change the conversion).
+	if sdr && complex.is_none() && !yuv_source(plan) {
+		vf.push(sdr_tag.to_string());
 	}
 	if !vf.is_empty() {
 		a.extend([s("-vf"), vf.join(",")]);
@@ -342,6 +415,9 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		// formats (nv12/hwframes) via their own format= chains.
 		a.extend([s("-pix_fmt"), s("yuv420p")]);
 	}
+	if sdr {
+		a.extend(SDR_ENCODER_OPTS.iter().map(|x| s(x)));
+	}
 
 	// RTP/H.264 so the client can depacketize and feed WebCodecs in the webview.
 	// `dump_extra` re-inserts SPS/PPS so a mid-stream join still gets a keyframe.
@@ -352,7 +428,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		s("rtp"),
 		s("-payload_type"),
 		s("96"),
-		plan.dest.clone(),
+		rtp_output_url(&plan.dest),
 	]);
 
 	// Always invoke ffmpeg directly. NVENC works without any wrapper; if a user
@@ -477,6 +553,18 @@ pub fn decode_command(listen: &str) -> (String, Vec<String>) {
 			s(listen),
 		],
 	)
+}
+
+/// The ffmpeg RTP output URL for `dest`, with the packet size capped: ffmpeg's RTP muxer
+/// otherwise fills UDP's default 1472-byte packets, which the session framing pushes past a
+/// 1500-byte MTU (IP fragmentation on every path) and far past a 1280-byte overlay / relay
+/// one. See `service::media::RTP_MAX_PACKET`. A `dest` that already carries options is kept.
+pub fn rtp_output_url(dest: &str) -> String {
+	if dest.starts_with("rtp://") && !dest.contains('?') {
+		format!("{dest}?pkt_size={}", crate::service::media::RTP_MAX_PACKET)
+	} else {
+		dest.to_string()
+	}
 }
 
 #[cfg(test)]

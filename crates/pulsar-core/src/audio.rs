@@ -40,6 +40,9 @@ mod command;
 mod endpoint_route;
 // Jitter buffer + drift-correcting resampler for the host-silent virtual sink's loopback.
 mod jitter;
+// Client side: sequence order, Reed-Solomon audio parity, then loss reports for the decoder.
+mod repair;
+pub use repair::{AudioRepair, RepairStats, Repaired};
 #[cfg(windows)]
 mod endpoint_watch;
 #[cfg(windows)]

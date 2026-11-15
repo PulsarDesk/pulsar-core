@@ -63,6 +63,11 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # one window + XTest when it is in front. Pure-Rust connection (no libX11 link, X errors
 # come back as Results instead of a process-global Xlib error handler), Send.
 x11rb = { version = "0.13", default-features = false, features = ["randr", "xtest"] }
+# Linux host typing of `InputEvent::Char` (input/host_keymap_linux.rs): find the key + level that
+# types a character on the HOST's own layout (the compositor's wl_keyboard keymap, or the X
+# session's XKB names). Links the system libxkbcommon (libxkbcommon-dev), which the desktop app
+# already links for its client-side layout resolution.
+xkbcommon = "0.9"
 
 # Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
 # (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
@@ -103,6 +108,8 @@ windows-sys = { version = "0.61", features = [
 	"Win32_Storage_FileSystem",
 	"Win32_System_Com",
 	"Win32_UI_Shell",
+	# input/permission.rs: the input desktop's name (UAC prompt / lock screen = Winlogon).
+	"Win32_System_StationsAndDesktops",
 ] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).

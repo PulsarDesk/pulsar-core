@@ -37,7 +37,6 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use core_graphics::event::{
 	CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
-	ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::display::CGDisplay;
@@ -51,8 +50,8 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use super::macos::{evdev_modifier_flag, evdev_to_vk};
-use super::window_common::{clamp_to_area, norm_to_area, ScrollAcc};
+use super::macos::{button_events, evdev_modifier_flag, evdev_to_vk, held_other_button};
+use super::window_common::{clamp_to_area, norm_to_area};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -147,17 +146,6 @@ fn cached(slot: &Cell<Option<(Instant, bool)>>, query: impl FnOnce() -> bool) ->
 	v
 }
 
-fn button_events(button: u8, down: bool) -> (CGMouseButton, CGEventType) {
-	match (button, down) {
-		(1, true) => (CGMouseButton::Right, CGEventType::RightMouseDown),
-		(1, false) => (CGMouseButton::Right, CGEventType::RightMouseUp),
-		(2, true) => (CGMouseButton::Center, CGEventType::OtherMouseDown),
-		(2, false) => (CGMouseButton::Center, CGEventType::OtherMouseUp),
-		(_, true) => (CGMouseButton::Left, CGEventType::LeftMouseDown),
-		(_, false) => (CGMouseButton::Left, CGEventType::LeftMouseUp),
-	}
-}
-
 pub struct WindowInput {
 	id: CGWindowID,
 	pid: i32,
@@ -176,7 +164,7 @@ pub struct WindowInput {
 	held_keys: HashSet<u16>,
 	flags: CGEventFlags,
 	caps_lock: bool,
-	scroll: ScrollAcc,
+	scroll: super::wheel::MacScroll,
 }
 
 impl WindowInput {
@@ -200,7 +188,7 @@ impl WindowInput {
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
 			caps_lock: false,
-			scroll: ScrollAcc::default(),
+			scroll: Default::default(),
 		})
 	}
 
@@ -254,7 +242,7 @@ impl WindowInput {
 	fn move_type(&self) -> CGEventType {
 		if self.held_buttons.contains(&1) {
 			CGEventType::RightMouseDragged
-		} else if self.held_buttons.contains(&2) {
+		} else if held_other_button(&self.held_buttons).is_some() {
 			CGEventType::OtherMouseDragged
 		} else if self.held_buttons.contains(&0) {
 			CGEventType::LeftMouseDragged
@@ -264,9 +252,10 @@ impl WindowInput {
 	}
 
 	fn post_move(&mut self) {
+		let other = held_other_button(&self.held_buttons);
 		let btn = if self.held_buttons.contains(&1) {
 			CGMouseButton::Right
-		} else if self.held_buttons.contains(&2) {
+		} else if other.is_some() {
 			CGMouseButton::Center
 		} else {
 			CGMouseButton::Left
@@ -274,6 +263,9 @@ impl WindowInput {
 		let ty = self.move_type();
 		let pt = self.global();
 		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, pt, btn).ok()) {
+			if let (CGEventType::OtherMouseDragged, Some(n)) = (ty, other) {
+				ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, n);
+			}
 			ev.set_flags(self.flags);
 			self.post(&ev, true);
 		}
@@ -299,32 +291,32 @@ impl WindowInput {
 		self.post_move();
 	}
 
-	/// Press/release a mouse button (0=left, 1=right, 2=middle) at the cached point.
+	/// Press/release a mouse button (0=left, 1=right, 2=middle, 3=back, 4=forward) at the
+	/// cached point. Unknown ids are ignored.
 	pub fn button(&mut self, button: u8, down: bool) {
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
+		let Some((b, ty, number)) = button_events(button, down) else {
+			return;
+		};
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
 		}
 		self.refresh_bounds();
-		let (b, ty) = button_events(button, down);
 		let pt = self.global();
 		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, pt, b).ok()) {
+			ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
 			ev.set_flags(self.flags);
 			self.post(&ev, true);
 		}
 	}
 
-	/// Scroll by a browser-wheel delta (100 px per line), at the cached point.
+	/// Scroll by a browser-wheel delta (100 px per line) at the cached point: whole notches
+	/// as plain lines, finer deltas as fractional lines on the same scale, like
+	/// [`super::macos::DesktopInput::scroll`].
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		let (v, h) = self.scroll.push(dx, dy);
-		if v == 0 && h == 0 {
-			return;
-		}
+		let Some(out) = self.scroll.push(dx, dy) else { return };
 		let pt = self.global();
-		if let Some(ev) = Self::source()
-			.and_then(|s| CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, -v, -h, 0).ok())
-		{
+		if let Some(ev) = Self::source().and_then(|s| super::macos::mac_scroll_event(s, out)) {
 			ev.set_location(pt);
 			self.post(&ev, true);
 		}

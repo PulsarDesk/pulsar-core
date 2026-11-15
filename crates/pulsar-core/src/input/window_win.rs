@@ -32,12 +32,10 @@ use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
 	GetClientRect, IsWindow, PostMessageW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
 	WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-	WM_RBUTTONUP,
+	WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use super::windows::evdev_to_vk;
-
-const WHEEL_DELTA: i32 = 120;
 
 // `WM_MOUSEMOVE`/button-message wParam "which buttons are down" mask bits. These live
 // in `Win32::System::SystemServices` in windows-sys; defined locally (they're stable
@@ -45,6 +43,21 @@ const WHEEL_DELTA: i32 = 120;
 const MK_LBUTTON: u32 = 0x0001;
 const MK_RBUTTON: u32 = 0x0002;
 const MK_MBUTTON: u32 = 0x0010;
+const MK_XBUTTON1: u32 = 0x0020;
+const MK_XBUTTON2: u32 = 0x0040;
+
+/// `(MK_* held bit, down message, up message, XBUTTON high word)` of a button id
+/// ([`super::mouse_button`]); `None` for an id this host does not know.
+fn button_msgs(button: u8) -> Option<(u32, u32, u32, u16)> {
+	Some(match button {
+		0 => (MK_LBUTTON, WM_LBUTTONDOWN, WM_LBUTTONUP, 0),
+		1 => (MK_RBUTTON, WM_RBUTTONDOWN, WM_RBUTTONUP, 0),
+		2 => (MK_MBUTTON, WM_MBUTTONDOWN, WM_MBUTTONUP, 0),
+		3 => (MK_XBUTTON1, WM_XBUTTONDOWN, WM_XBUTTONUP, 1),
+		4 => (MK_XBUTTON2, WM_XBUTTONDOWN, WM_XBUTTONUP, 2),
+		_ => return None,
+	})
+}
 
 /// Pack a low/high 16-bit pair into an `LPARAM` (Win32 `MAKELPARAM`).
 #[inline]
@@ -83,10 +96,9 @@ pub struct WindowInput {
 	/// Held VK set — released on Drop / flush so a client that drops mid-press
 	/// doesn't leave a key latched down in the target window.
 	held_keys: std::collections::HashSet<u16>,
-	/// Carried-over fractional wheel notches (matches DesktopInput's behavior so
-	/// fine/precision scroll isn't lost to rounding).
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Wheel conversion with the sub-unit carry + notch counter (see [`super::wheel`]);
+	/// this injector posts whole notches only.
+	scroll: super::wheel::HiResScroll,
 }
 
 // HWND is a raw pointer (`*mut c_void`) → not auto-Send. The on_input closure runs
@@ -115,8 +127,7 @@ impl WindowInput {
 			last_y: 0,
 			btn_mask: 0,
 			held_keys: std::collections::HashSet::new(),
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 		})
 	}
 
@@ -199,29 +210,26 @@ impl WindowInput {
 		);
 	}
 
-	/// Press/release a mouse button (0=left, 1=right, 2=middle) at the cached point.
+	/// Press/release a mouse button (0=left, 1=right, 2=middle, 3=back, 4=forward) at the
+	/// cached point.
 	pub fn button(&mut self, button: u8, down: bool) {
-		let bit = match button {
-			1 => MK_RBUTTON,
-			2 => MK_MBUTTON,
-			_ => MK_LBUTTON,
+		let Some((bit, down_msg, up_msg, x)) = button_msgs(button) else {
+			return; // unknown button id: ignored, never a left click
 		};
+		let was_held = self.btn_mask & bit != 0;
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
+		}
 		if down {
 			self.btn_mask |= bit;
 		} else {
 			self.btn_mask &= !bit;
 		}
-		let msg = match (button, down) {
-			(1, true) => WM_RBUTTONDOWN,
-			(1, false) => WM_RBUTTONUP,
-			(2, true) => WM_MBUTTONDOWN,
-			(2, false) => WM_MBUTTONUP,
-			(_, true) => WM_LBUTTONDOWN,
-			(_, false) => WM_LBUTTONUP,
-		};
+		// WM_XBUTTON*: the XBUTTON number rides in wParam's high word (MAKEWPARAM).
+		let wparam = (self.btn_mask | ((x as u32) << 16)) as WPARAM;
 		self.post(
-			msg,
-			self.btn_mask as WPARAM,
+			if down { down_msg } else { up_msg },
+			wparam,
 			make_lparam(self.last_x, self.last_y),
 		);
 	}
@@ -230,14 +238,13 @@ impl WindowInput {
 	/// word and — unusually — the cursor position in **screen** coordinates in lParam,
 	/// so we map the cached client point through `ClientToScreen`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Same fractional-notch accumulation as DesktopInput. browser down(+) → wheel
-		// down (negative), so negate dy.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
+		// Whole notches only (× WHEEL_DELTA), like same-host co-op's raw-input path: this
+		// injector targets a launched GAME's window, and games often read
+		// `delta / WHEEL_DELTA` as an integer (a 15-unit hi-res step would be 0). The notch
+		// fires at the halfway point of a fine scroll (see `wheel::HiResScroll`).
+		let o = self.scroll.push(dx, dy);
+		let notch = |n: i32| n.saturating_mul(super::wheel::HI_RES_PER_NOTCH).clamp(i16::MIN as i32, i16::MAX as i32);
+		let (v, h) = (notch(o.v_notches), notch(o.h_notches));
 		let mut pt = POINT {
 			x: self.last_x,
 			y: self.last_y,
@@ -249,7 +256,7 @@ impl WindowInput {
 		if v != 0 {
 			self.post(
 				WM_MOUSEWHEEL,
-				make_wparam(state_low, (v * WHEEL_DELTA) as i16),
+				make_wparam(state_low, v as i16),
 				make_lparam(pt.x, pt.y),
 			);
 		}
@@ -259,7 +266,7 @@ impl WindowInput {
 			const WM_MOUSEHWHEEL: u32 = 0x020E;
 			self.post(
 				WM_MOUSEHWHEEL,
-				make_wparam(state_low, (h * WHEEL_DELTA) as i16),
+				make_wparam(state_low, h as i16),
 				make_lparam(pt.x, pt.y),
 			);
 		}
@@ -300,19 +307,11 @@ impl WindowInput {
 	/// is revoked mid-press ("Sadece izleme") or on teardown, so a held modifier / drag
 	/// doesn't latch in the target window after later up-events are dropped. Idempotent.
 	pub fn flush_held(&mut self) {
-		// Release buttons (left/right/middle) that are still in the held mask.
-		for (bit, up_msg) in [
-			(MK_LBUTTON, WM_LBUTTONUP),
-			(MK_RBUTTON, WM_RBUTTONUP),
-			(MK_MBUTTON, WM_MBUTTONUP),
-		] {
+		// Release buttons (left/right/middle/back/forward) still in the held mask.
+		for b in 0..=4u8 {
+			let Some((bit, _, _, _)) = button_msgs(b) else { continue };
 			if self.btn_mask & bit != 0 {
-				self.btn_mask &= !bit;
-				self.post(
-					up_msg,
-					self.btn_mask as WPARAM,
-					make_lparam(self.last_x, self.last_y),
-				);
+				self.button(b, false);
 			}
 		}
 		let keys: Vec<u16> = self.held_keys.drain().collect();

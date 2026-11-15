@@ -332,7 +332,8 @@ pub async fn serve_with(
 				| DataMsg::Displays(_)
 				| DataMsg::StreamedDisplay(_)
 				| DataMsg::PadUnavailable { .. }
-				| DataMsg::HdrMeta { .. } => {}
+				| DataMsg::HdrMeta { .. }
+				| DataMsg::InputUnavailable { .. } => {}
 				DataMsg::Rumble { .. } => {}
 				m @ (DataMsg::Ds5Caps { .. } | DataMsg::Ds5Feature { .. }) => (data.on_ds5)(m),
 				// host→client only; ignore if echoed back

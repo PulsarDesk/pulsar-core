@@ -25,6 +25,20 @@ pub type CVPixelBufferRef = *mut c_void;
 pub type CGDirectDisplayID = u32;
 pub type CGDisplayModeRef = *mut c_void;
 
+/// Opaque `CFString`, only so a `*const CFStringObj` passed through `msg_send!` encodes as
+/// `^{__CFString=}`: objc2 checks argument encodings in debug builds and panics on a plain
+/// `*const c_void` (`^v`) where a method takes a CF string.
+#[repr(C)]
+pub struct CFStringObj {
+	_p: [u8; 0],
+}
+
+// SAFETY: the encoding CoreFoundation's own headers give `CFStringRef` (as objc2-core-foundation).
+unsafe impl objc2::encode::RefEncode for CFStringObj {
+	const ENCODING_REF: objc2::encode::Encoding =
+		objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CFString", &[]));
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CGPoint {
@@ -72,21 +86,6 @@ unsafe impl Encode for CMTime {
 		&[i64::ENCODING, i32::ENCODING, u32::ENCODING, i64::ENCODING],
 	);
 }
-
-/// A `CFStringRef` as a message argument. Properties declared `CFStringRef` (not `NSString *`),
-/// such as `SCStreamConfiguration.colorSpaceName` / `.colorMatrix`, have the runtime type
-/// `^{__CFString=}`; objc2 checks argument encodings in debug builds, so passing the pointer as
-/// an object (`@`) panics there ("invalid message send"). Release builds skip the check.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug)]
-pub struct CfStr(pub CFStringRef);
-
-// SAFETY: a single pointer to an (opaque) `struct __CFString`, which is what `^{__CFString=}`
-// describes.
-unsafe impl Encode for CfStr {
-	const ENCODING: objc2::Encoding = objc2::Encoding::Pointer(&objc2::Encoding::Struct("__CFString", &[]));
-}
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -268,3 +267,15 @@ pub fn cf_number_i64(n: CFTypeRef) -> Option<i64> {
 	(ok != 0).then_some(v)
 }
 
+
+#[cfg(test)]
+mod tests {
+	/// objc2 checks `msg_send!` argument encodings in debug builds: SCK's colour setters take
+	/// `^{__CFString=}`, which a plain `*const c_void` (`^v`) does not match (panic).
+	#[test]
+	fn cf_string_pointer_encodes_as_cfstring() {
+		use objc2::encode::Encode;
+		assert!(<*const super::CFStringObj>::ENCODING.equivalent_to_str("^{__CFString=}"));
+		assert!(!<*const std::ffi::c_void>::ENCODING.equivalent_to_str("^{__CFString=}"));
+	}
+}

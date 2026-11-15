@@ -162,7 +162,20 @@ pub fn audio_command_quality(
 	// Capture (platform-specific input).
 	match input {
 		AudioInput::Dshow(dev) => a.extend([s("-f"), s("dshow"), s("-i"), format!("audio={dev}")]),
-		AudioInput::Pulse(src) => a.extend([s("-f"), s("pulse"), s("-i"), src.clone()]),
+		// The pulse demuxer reads in fragments the server sizes by itself (~50 ms measured on
+		// PipeWire's pulse server): each one waited that long on the host before it was
+		// encoded. 1920 B = 10 ms of the capture's default s16le stereo (one Opus frame), and
+		// `nobuffer` hands each fragment on at once (hidden-gaps 1.11c).
+		AudioInput::Pulse(src) => a.extend([
+			s("-fflags"),
+			s("nobuffer"),
+			s("-f"),
+			s("pulse"),
+			s("-fragment_size"),
+			PULSE_FRAGMENT_BYTES.to_string(),
+			s("-i"),
+			src.clone(),
+		]),
 		AudioInput::AvFoundation(idx) => {
 			a.extend([s("-f"), s("avfoundation"), s("-i"), format!(":{idx}")])
 		}
@@ -172,6 +185,10 @@ pub fn audio_command_quality(
 	a.extend(opus_rtp_output_quality(dest, layout, quality));
 	("ffmpeg".to_string(), a)
 }
+
+/// The pulse input's fragment: 10 ms of s16le stereo at 48 kHz (the demuxer's default
+/// format; no `-channels` is passed, so the capture is stereo whatever the encode layout).
+pub const PULSE_FRAGMENT_BYTES: usize = SAMPLE_RATE as usize / 100 * 2 * 2;
 
 // Compile-time assurance the stereo wrapper still emits the historical channel count.
 const _: () = assert!(CHANNELS == 2);
@@ -209,6 +226,18 @@ mod tests {
 		assert!(out.iter().any(|a| a == "rtp"));
 		// Both the dshow command and the loopback path end with the same RTP destination.
 		assert_eq!(out.last().unwrap(), "rtp://1.2.3.4:9100");
+	}
+
+	#[test]
+	fn pulse_input_reads_10ms_fragments_unbuffered() {
+		let (_, args) = audio_command(&AudioInput::Pulse("@DEFAULT_MONITOR@".into()), "rtp://1.2.3.4:1");
+		assert_eq!(PULSE_FRAGMENT_BYTES, 1920);
+		assert_eq!(val_after(&args, "-fragment_size"), Some("1920"));
+		assert_eq!(val_after(&args, "-fflags"), Some("nobuffer"));
+		// Input options go in front of the input they belong to.
+		let at = |x: &str| args.iter().position(|a| a == x).unwrap();
+		assert!(at("-fragment_size") < at("-i") && at("-f") < at("-i"));
+		assert_eq!(val_after(&args, "-i"), Some("@DEFAULT_MONITOR@"));
 	}
 
 	#[test]

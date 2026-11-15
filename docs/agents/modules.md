@@ -20,8 +20,20 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (v1 `parity_ratio` for mobile + v2 `FecPolicy` sized from pre-repair loss, desktop host).
   Simulation matrix in `tests/adapt_scenarios.rs`; design in `docs/adaptive-streaming.md`
   (poor-link rules of 2026-11-09: cautious 4 Mbit start, soft pins, point floor, goodput cut,
-  floor escape — `Sample::recv_bytes`/`window_ms` > 0 enables the goodput paths; mobile
-  passes 0 and keeps the old halving).
+  floor escape — `Sample::recv_bytes`/`window_ms` > 0 enables the goodput paths; both apps
+  pass them since 2026-11-15).
+  Client plumbing shared by BOTH apps (extracted 2026-11-15 from desktop `play/hold.rs` /
+  `play.rs` / `adapt_memory.rs`, desktop behaviour unchanged): `repair` = the video repair loop
+  (`RepairTracker`: seq gaps → reorder wait / FEC wait → NACK, one re-NACK ~1 RTT later,
+  write-off after the RTT-derived window; window counters incl. goodput; FEC share learned per
+  window and released when parity stops; `RttWindow`, `KeyframePacer` (`with_max`: a client
+  that freezes until the keyframe caps the gap at `KF_GAP_MAX_FROZEN`), `FrameClock`,
+  `decoder_overloaded` / `decoder_sheds`); `pong` = the uneven Ping cadence + `PongMatcher`; `caps` = `auto_cap_kbps` (15-150 Mbit, mobile
+  ≤ 50 Mbit) + `path_cap_kbps` (relay cap while relayed); `memory` = per-peer × `PathClass`
+  (lan / wan / relay) last-clean-rate file. With the ladder off (mobile) the decoder limit is
+  `Controller::client_decoder_sheds` (one fps rung down at the same size, the rung it left
+  retried after `POINT_RETRY_WINDOWS`, doubling); `client_decode_bound` (decode time) stays the
+  ladder-on path. `RepairTracker::reset_stream` = a client re-request rebuilt the encoder.
 - `connection/` — `Node`: register → relay-assigned stable 9-digit ID → P2P
   hole-punch → relay fallback; encrypted `Session`. Punching: opening burst + retransmits for
   `PUNCH_TIMEOUT`, then the session starts on the relay while BOTH ends keep punching for
@@ -52,6 +64,17 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   official public relay, written without a port because 21116 is implied when an address
   carries none (users can point at a self-hosted/local one, with or without a port);
   `NetworkMode`; `relay_keys` holds the access key each relay issued this device.
+- `input/keytables.rs` + `input/mouse_button.rs` — pure, tested everywhere:
+  `CLIENT_KEYS` (every evdev code a client sends; each host table is tested against it), the
+  macOS host table `mac_vk` (ISO swap), the Linux host's char → key table builder
+  (`build_char_table`, fed from libxkbcommon by `host_keymap_linux.rs`: Wayland `wl_keyboard`
+  keymap / X11 `_XKB_RULES_NAMES`, read on a process-wide worker thread, never on the input
+  path; main-block keys win over extended ones; a Caps table when KEY_CAPSLOCK locks Caps;
+  dead-key-only chars as dead key + Space; misses go to 32 LRU X11 scratch keycodes or the
+  GTK/IBus Ctrl+Shift+U entry), and the wire mouse button ids (3 = back, 4 = forward,
+  `FEAT_MOUSE_X`; hosts ignore unknown ids and drop side-button ups they never pressed). Linux code here is type-checked from Windows with
+  `cargo check --target x86_64-unknown-linux-gnu` and `SYSTEM_DEPS_<LIB>_NO_PKG_CONFIG=1` +
+  `SYSTEM_DEPS_<LIB>_LIB=<name>` for the glib/gio/gobject/gstreamer(-base/-video) sys crates.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),
   ViGEmBus X360+DS4 (`vigem.rs`), Win32 `SendInput`, macOS CGEvent, and the
   per-window co-op injector `WindowInput` (same API on each OS: `window_win.rs`
@@ -59,6 +82,17 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   CGEventPostToPid; pure helpers + tests in `window_common.rs`; native Wayland is
   impossible; Linux/macOS untested on hardware; `is_alive`/`in_front`/size/X11 child
   under the pointer are cached 200 ms — the host asks per input event),
+  hi-res scroll (`wheel.rs`: wire `Scroll` = browser px, 100 per notch, fractions kept →
+  Windows desktop session `mouseData` in 1/120 notch, but WHOLE notches (×120) in a game
+  session / while the client pointer is relative (`DesktopInput::set_whole_notch_wheel`,
+  set by the host app) and always on the per-window injector — games do `delta / 120` as
+  an integer; Linux `REL_WHEEL_HI_RES` + legacy notch at the halfway point like the
+  kernel's hid scroll counter; macOS one scale: LINE events, finer deltas with fractional
+  lines in the fixed-point fields (+ points at 10/line, unmeasured on hardware); X11
+  per-window stays whole notches — core events have no finer unit), client motion
+  batching (`coalesce.rs`: token bucket per motion kind, 2 deep, one per 0.8 ms — a 1 kHz
+  mouse with jitter is never held; `push_backlog` merges a channel backlog but sends it at
+  once; edges flush first; used by the desktop session loop),
   DS4/DS5 touchpad-as-mouse (`touchpad_mouse.rs` = the shared,
   unit-tested gesture machine — pointer / two-finger scroll / click / two-finger right
   click — used by the Linux evdev reader `touchpad_linux.rs` and by the desktop app's
@@ -90,6 +124,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `SecTaskCopyValueForEntitlement`) → `RecordingPad`. `create_virtual_pad_checked` returns the
   `PadFailure` for every OS (`vigem_missing`, `uinput_denied`, …); the app relays it as
   `DataMsg::PadUnavailable { slot, reason }`. Untested on macOS hardware.
+  **Input permission** (`input/permission.rs`): `preflight()` = can this host inject desktop
+  input at all (Linux `/dev/uinput` writable, macOS `AXIsProcessTrusted`; never prompts),
+  `foreground_window_blocked()` (Windows, keys) / `pointer_target_blocked()` (Windows,
+  clicks / scroll / pen / touch: the top-level window under the cursor) = that window belongs
+  to a higher-integrity process (token integrity RID; when the token is closed, "query yes /
+  `PROCESS_VM_READ` no" = no-read-up) so UIPI drops the input; the secure desktop (UAC
+  prompt, lock screen: input desktop not `Default`) is reported as `SECURE_DESKTOP` (-1).
+  `InputFailure` wire tokens (`uinput_denied`, `mac_accessibility`, `win_elevated`,
+  `win_secure_desktop`, `android_control_off`, `android_control_missing`, unknown → `unavailable`) travel as
+  `DataMsg::InputUnavailable { reason }`.
   **Touchpad pinch injection** (`DesktopInput::pinch`, `InputEvent::Pinch`, advertised by the
   desktop host as `FEAT_PINCH`): Windows = two-finger touch injection (`windows.rs`); Linux =
   a lazily created virtual uinput TOUCHPAD ("Pulsar Virtual Touchpad", `uinput.rs`) whose two
@@ -134,6 +178,17 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   x11grab (`-window_id`, scaled to the plan size; `fit_window_size` / `fit_within` pick it)
   — used by both the per-window "Pencere" pick and the Linux per-window co-op capture
   source — or `WindowInput::RawNv12` (macOS ScreenCaptureKit frames).
+  SDR colour rule (2026-11-15): every encode command signals **BT.709 limited range**
+  (`command.rs` `SDR_ENCODER_OPTS` + a `setparams` tag; gst `videoconvert` caps carry
+  `colorimetry=bt709`); macOS ScreenCaptureKit is set to the BT.709 matrix from sRGB
+  (`macos_capture::sck::set_sdr_colour`). Clients decode the stream's tag, BT.709 limited
+  when absent (pulsar-desktop `pulsar-render/src/colour.rs`). Every RGB → YUV conversion
+  the ffmpeg CLI runs names the matrix (`SDR_SCALE_OPTS`: x11grab / gdigrab `scale`, the
+  ddagrab CPU bounces, `scale_cuda` and `vpp_qsv` options), so an FFmpeg older than 7.1
+  (Rockchip PPA, system ffmpeg) cannot convert BT.601 under the BT.709 tag; only ddagrab →
+  NVENC without the CUDA map hands NVENC the BGRA. SCK's CF strings go through `msg_send!` as
+  `ffi::CFStringObj` pointers: objc2 checks argument encodings in debug builds and panics on
+  `*const c_void` (`^v`) where a method takes `^{__CFString=}`.
 - `x11win.rs` — X11 top-level window list (`_NET_CLIENT_LIST`) and launched-game →
   window lookup (`_NET_WM_PID` over the `/proc` process tree) for the co-op path; the Linux
   counterpart of `pulsar-capture`'s `window.rs`. Overlaps `window_capture/x11.rs` (the
@@ -144,6 +199,15 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   PipeWire → an **in-process GStreamer pipeline** (gstreamer-rs; live `set_bitrate`,
   `request_keyframe`, `set_short_gop`); `is_wayland()`. Build needs the GStreamer dev
   headers (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
+  Colour conversion (2026-11-15, untested on hardware): `videoconvert n-threads=0` everywhere;
+  with a `vah26Xenc` fragment the in-process pipeline first tries `vapostproc` → VAMemory NV12
+  (GPU, zero-copy where PipeWire negotiates DMA-BUF), verified by a frame reaching the encoder
+  within 3 s, else the CPU convert (`gst::WaylandConvert`, `PULSAR_WAYLAND_CPU_CONVERT=1`).
+  The GPU attempt goes first in each of the 3 start slots (a "not PLAYING" failure is usually
+  the PipeWire node lagging the portal reply), with the CPU convert right after it in the same
+  slot; a parse failure or no frame after PLAYING marks it broken for the process
+  (`VA_CONVERT_BROKEN`). `run_pipeline` is cancel-safe (`NullOnDrop`: a start future dropped
+  during the verify wait sets its pipeline to NULL).
   `start_with_frames(.., Some(factory))` (`capture/frames.rs`, 2026-11-14, untested on
   hardware): the pipeline ends in NV12 frames (`fakesink` handoff) for an app-supplied
   `FrameEncoder` (the desktop's NVENC SDK encoder — reference-frame invalidation via
@@ -207,7 +271,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   force-mutes the captured endpoint), endpoint redirect sinks. macOS: `sck_loopback.rs`
   (`run_system_audio_capture`, the system mix via ScreenCaptureKit — the counterpart of the
   Windows process loopback in `Exclude` mode); `Config::audio_loopback()` = "system mix" on
-  Windows and macOS when no device is named.
+  Windows and macOS when no device is named. The ffmpeg pulse input reads 10 ms fragments
+  (`-fragment_size 1920 -fflags nobuffer`). Client side: `audio::AudioRepair` (`repair.rs`,
+  used by desktop `native_audio` and the mobile feeder) puts audio RTP back in order, rebuilds
+  losses from `TAG_AUDIO_FEC` parity and holds a hole for a caller-chosen time before it
+  reports it lost, counted from the earliest arrival behind the hole (no packet waits longer
+  than the hold; a second hole gets its own time once the first fills). Parity is taken only
+  in audio shapes (k ≤ 4, m ≤ 2, shard ≤ `FEC_MAX_PACKET` + 2), so stray datagrams can't make
+  the decoder store big blocks (2026-11-15, untested in a real session).
 - `displays.rs` (+ `displays/{macos,linux}.rs`) — the host's monitors for the platforms the app
   can't enumerate itself: macOS (`CGGetActiveDisplayList` order = avfoundation `Capture screen N`,
   `NSScreen.localizedName` names, `CGDirectDisplayID` as `Monitor::id`) and Linux Wayland
@@ -218,7 +289,12 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   without a platform name has an empty `name` + `builtin` flag (the app localizes the label).
   `DataMsg::StreamedDisplay(idx)` (service/wire.rs) tells the client which monitor the Wayland
   portal pick really streams. Pure helpers unit-tested; untested on macOS / Wayland hardware.
-- `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC.
+- `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC. The beacon name is a label the user chose or the
+  hostname (never the OS user's real name), and apps keep the beacon silent (`set_paused`) while unattended access is on.
+- `netpath.rs` — shared path facts: `classify` (Lan / Wan / Relay; overlay VPNs = Wan via
+  interface name, the routed adapter's type and a 12 ms RTT fallback), the overlay /
+  virtual interface name lists, and the UDP socket-buffer tuning + report (`SO_RCVBUFFORCE`
+  on Linux, a WARN under 1 MiB, `--selftest` check, `UdpRcvbufErrors`).
 - `service/` — the app protocol over the encrypted session: OTP auth (non-empty
   passwords via **SPAKE2 PAKE** in `service/pake.rs`, MAC'd over the channel binding —
   the password never travels; new clients refuse to send one to an old host
@@ -226,7 +302,9 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   keepalive `Ping`/`Pong`/`Bye` (no ping id — the desktop client's `PongMatcher` copes),
   media framing + NACK + **FEC parity** — Reed-Solomon (`TAG_FEC_RS`; `RsFecEncoder::new`
   groups up to 3 small frames within 25 ms into one block, `per_frame` = old behaviour,
-  released decoders unchanged), XOR kept for v0.11.0 clients, `MediaSendStats` send counters
+  released decoders unchanged), XOR kept for v0.11.0 clients, audio parity (`TAG_AUDIO_FEC`
+  0x07, `AudioFecEncoder`: RS(2+1) per 10 ms Opus / RS(4+2) per 5 ms L16, only to clients
+  with `StreamReq::audio_fec`), `MediaSendStats` send counters
   (`media.rs`), and **`DataMsg` side channels** (clipboard/chat/file/mic-audio/
   avatar/fs-browse/client `Stats` JSON/…) in `wire.rs`.
   **`DataMsg` lives HERE, not in pulsar-proto** — proto only covers the
