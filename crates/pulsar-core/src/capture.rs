@@ -27,6 +27,7 @@
 
 mod frames;
 pub use frames::{FrameEncoder, FrameEncoderFactory, RawFrame};
+use crate::pipeline::gst::WaylandConvert;
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -368,9 +369,18 @@ pub async fn start_full(
 	if window {
 		tracing::info!(?cast_size, ?size, "wayland window cast");
 	}
-	let desc = |fd: i32| {
-		crate::pipeline::gst::wayland_pipeline_sized(fd, node_id, encoder_fragment, ip, port, size)
+	let desc = |fd: i32, convert: WaylandConvert| {
+		crate::pipeline::gst::wayland_pipeline_conv(fd, node_id, encoder_fragment, ip, port, size, convert)
 	};
+	// GPU colour conversion for the `va` encoders (hidden-gaps 1.10), in-process only: the
+	// first frame has to reach the encoder within `GPU_CONVERT_VERIFY` or the CPU convert
+	// takes over on the same portal session (a `vapostproc` that is missing, too old for
+	// `add-borders`, or can't negotiate with this PipeWire then costs one short start, not
+	// the stream). `PULSAR_WAYLAND_CPU_CONVERT=1` skips it.
+	let gpu_convert = in_process
+		&& crate::pipeline::gst::wayland_convert_for(encoder_fragment) == WaylandConvert::Va
+		&& std::env::var("PULSAR_WAYLAND_CPU_CONVERT").as_deref() != Ok("1")
+		&& gst::ElementFactory::find("vapostproc").is_some();
 	// A window cast has no place in the output layout (the pointer can't be confined to
 	// it through uinput), so no pointer region.
 	let stream_rect = if window { None } else { stream_rect };
@@ -410,23 +420,35 @@ pub async fn start_full(
 	}
 
 	// The PipeWire node can lag the portal reply by a moment: retry the pipeline start a
-	// few times before giving up (each attempt tears its pipeline down cleanly).
+	// few times before giving up (each attempt tears its pipeline down cleanly). A GPU
+	// conversion attempt, when there is one, goes first and is not retried.
+	let mut plan: Vec<WaylandConvert> = Vec::with_capacity(4);
+	if gpu_convert {
+		plan.push(WaylandConvert::Va);
+	}
+	plan.extend([WaylandConvert::Cpu; 3]);
 	let mut last_err: Option<anyhow::Error> = None;
-	for attempt in 0u32..3 {
-		if attempt > 0 {
-			tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+	let mut attempt = 0u32;
+	for convert in plan {
+		if convert == WaylandConvert::Cpu {
+			if attempt > 0 {
+				tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+			}
+			attempt += 1;
 		}
 		let started = if in_process {
-			run_pipeline(&desc(pw_fd.as_raw_fd()))
+			let verify = (convert == WaylandConvert::Va).then_some(GPU_CONVERT_VERIFY);
+			run_pipeline(&desc(pw_fd.as_raw_fd(), convert), verify)
 				.await
 				.map(|(pipeline, venc)| Backend::InProcess { pipeline, venc })
 		} else {
-			run_child(&desc(pw_fd.as_raw_fd()))
+			run_child(&desc(pw_fd.as_raw_fd(), convert))
 				.await
 				.map(|child| Backend::Child(std::sync::Mutex::new(child)))
 		};
 		match started {
 			Ok(backend) => {
+				tracing::info!(?convert, in_process, "wayland capture colour conversion");
 				let session = guard.0.take().expect("session present on success");
 				let dead = Arc::new(AtomicBool::new(false));
 				let short_gop = Arc::new(AtomicBool::new(false));
@@ -447,6 +469,9 @@ pub async fn start_full(
 					},
 					token,
 				));
+			}
+			Err(e) if convert == WaylandConvert::Va => {
+				tracing::warn!("wayland GPU colour conversion (vapostproc) unavailable, using the CPU convert: {e}");
 			}
 			Err(e) => {
 				tracing::warn!(attempt, in_process, "gst pipeline start failed, retrying: {e}");
@@ -811,7 +836,19 @@ mod tests {
 /// Build the pipeline from the same description string the `gst-launch` path used, set it
 /// PLAYING and confirm it really got there (a PipeWire node that isn't ready fails the
 /// state change instead of streaming). Returns the pipeline + the encoder element.
-async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
+/// How long a GPU-conversion pipeline gets to deliver its first frame to the encoder before
+/// the CPU convert takes over. PipeWire sends the cast's first frame on connect and
+/// `keepalive-time=1000` repeats the last one every second, so a working pipeline is far
+/// inside this.
+const GPU_CONVERT_VERIFY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Build and start a pipeline. `verify`: also wait (bounded) until a buffer reaches the
+/// encoder's sink pad — caps negotiation only happens once data flows, so a live source
+/// reaches PLAYING even when the elements behind it can never agree on a format.
+async fn run_pipeline(
+	desc: &str,
+	verify: Option<std::time::Duration>,
+) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
 	let element = gst::parse::launch(desc)
 		.map_err(|e| anyhow::anyhow!("gst pipeline parse failed (gstreamer plugins kurulu mu?): {e}"))?;
 	let pipeline = element
@@ -820,6 +857,17 @@ async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::
 	let venc = pipeline.by_name(ENCODER_NAME);
 	if venc.is_none() {
 		tracing::warn!("wayland pipeline has no `{ENCODER_NAME}` element — live bitrate/keyframe controls disabled");
+	}
+	let first_buffer = Arc::new(AtomicBool::new(false));
+	if verify.is_some() {
+		let Some(pad) = venc.as_ref().and_then(|e| e.static_pad("sink")) else {
+			return Err(anyhow::anyhow!("no encoder sink pad to verify the pipeline on"));
+		};
+		let seen = first_buffer.clone();
+		let _ = pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+			seen.store(true, Ordering::SeqCst);
+			gst::PadProbeReturn::Remove
+		});
 	}
 	pipeline
 		.set_state(gst::State::Playing)
@@ -839,6 +887,26 @@ async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::
 		return Err(anyhow::anyhow!(
 			"gst pipeline failed to reach PLAYING (pipewire/portal node not ready?): {msg}"
 		));
+	}
+	if let Some(limit) = verify {
+		let deadline = std::time::Instant::now() + limit;
+		while !first_buffer.load(Ordering::SeqCst) {
+			let err = pipeline
+				.bus()
+				.and_then(|b| b.pop_filtered(&[gst::MessageType::Error]))
+				.and_then(|m| match m.view() {
+					gst::MessageView::Error(e) => Some(format!("{}", e.error())),
+					_ => None,
+				});
+			if err.is_some() || std::time::Instant::now() >= deadline {
+				let _ = pipeline.set_state(gst::State::Null);
+				return Err(anyhow::anyhow!(
+					"no frame reached the encoder: {}",
+					err.unwrap_or_else(|| format!("timed out after {limit:?}"))
+				));
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		}
 	}
 	Ok((pipeline, venc))
 }
