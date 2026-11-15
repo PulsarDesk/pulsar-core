@@ -28,6 +28,14 @@ pub mod gesture;
 /// macOS host: the display behind an avfoundation capture device (pointer / pen geometry).
 pub mod avf_screens;
 
+/// Mouse button ids on the wire (left / right / middle / back / forward) and their per-OS
+/// codes, shared by every capture and injection path.
+pub mod mouse_button;
+
+/// Host keyboard tables that must compile (and be tested) on every target: the Linux host's
+/// character → key lookup over its own layout, and the macOS host's evdev → virtual key table.
+pub mod keytables;
+
 pub use types::{
 	axis_to_i16, button, create_virtual_pad, create_virtual_pad_checked, create_virtual_pad_target,
 	ds4_report_fields, touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons,
@@ -64,6 +72,10 @@ pub use duo::{duo_available, duo_ds5_interfaces, duo_pads_wanted, DuoDs5};
 /// Linux host-side uinput backends (virtual gamepad + desktop input).
 #[cfg(target_os = "linux")]
 mod uinput;
+
+/// Linux host: the host layout's character → key table for typing `InputEvent::Char`.
+#[cfg(target_os = "linux")]
+mod host_keymap_linux;
 
 /// DS4/DS5 touchpad-as-mouse gesture logic (one finger = pointer, two = scroll, press =
 /// click), shared by every client reader: Linux evdev below, and the desktop app's SDL3 /

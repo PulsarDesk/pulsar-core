@@ -40,23 +40,22 @@ impl ScrollAcc {
 	}
 }
 
-/// X11 core-protocol button number for our button id (0=left, 1=right, 2=middle).
+/// X11 core-protocol button number for our button id (0=left, 1=right, 2=middle, 3=back →
+/// 8, 4=forward → 9); `None` for an id the host does not know (ignored, never a left click).
 #[allow(dead_code)]
-pub(crate) fn x11_button(button: u8) -> u8 {
-	match button {
-		1 => 3,
-		2 => 2,
-		_ => 1,
-	}
+pub(crate) fn x11_button(button: u8) -> Option<u8> {
+	super::mouse_button::to_x11(button)
 }
 
 /// X11 `KeyButMask` bit that a held button sets in an event's `state`.
 #[allow(dead_code)]
 pub(crate) fn x11_button_mask(button: u8) -> u16 {
 	match x11_button(button) {
-		1 => 1 << 8, // Button1
-		2 => 1 << 9, // Button2
-		_ => 1 << 10, // Button3
+		Some(1) => 1 << 8, // Button1
+		Some(2) => 1 << 9, // Button2
+		Some(3) => 1 << 10, // Button3
+		// Buttons 8 / 9 (back / forward) have no core-protocol state bit.
+		_ => 0,
 	}
 }
 
@@ -166,11 +165,15 @@ mod tests {
 
 	#[test]
 	fn x11_buttons_and_masks() {
-		assert_eq!(x11_button(0), 1);
-		assert_eq!(x11_button(1), 3);
-		assert_eq!(x11_button(2), 2);
+		assert_eq!(x11_button(0), Some(1));
+		assert_eq!(x11_button(1), Some(3));
+		assert_eq!(x11_button(2), Some(2));
+		assert_eq!(x11_button(3), Some(8));
+		assert_eq!(x11_button(4), Some(9));
+		assert_eq!(x11_button(5), None);
 		assert_eq!(x11_button_mask(0), 0x100);
 		assert_eq!(x11_button_mask(1), 0x400);
+		assert_eq!(x11_button_mask(3), 0);
 		assert_eq!(x11_modifier_mask(42), Some(1));
 		assert_eq!(x11_modifier_mask(29), Some(4));
 		assert_eq!(x11_modifier_mask(30), None);

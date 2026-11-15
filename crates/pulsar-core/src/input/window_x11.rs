@@ -515,7 +515,13 @@ impl WindowInput {
 		} else {
 			xproto::BUTTON_RELEASE_EVENT
 		};
-		self.pointer_event(kind, x11_button(button));
+		let Some(detail) = x11_button(button) else {
+			return; // unknown button id: ignored, never a left click
+		};
+		if super::mouse_button::drop_unpaired_release(button, down, self.held_buttons.contains(&button)) {
+			return;
+		}
+		self.pointer_event(kind, detail);
 		if down {
 			self.held_buttons.insert(button);
 		} else {

@@ -24,8 +24,9 @@ use core_graphics::geometry::CGPoint;
 use std::collections::HashSet;
 
 /// Map a Linux evdev keycode (what the client sends — see `keymap.ts`) to a macOS
-/// virtual key code (the `kVK_*` constants from `<HIToolbox/Events.h>`). Pure +
-/// testable. Mirrors the coverage of the Windows `evdev_to_vk` table.
+/// virtual key code (the `kVK_*` constants from `<HIToolbox/Events.h>`). The table itself is
+/// [`super::keytables::mac_vk`] (pure, tested on every target against every key a client
+/// sends); this picks the ISO variant when the host's keyboard is ISO.
 ///
 /// Note: macOS virtual key codes are positional (ANSI layout), not character
 /// codes — `kVK_ANSI_A` (0x00) is the *physical* A key. Layout translation for
@@ -33,111 +34,24 @@ use std::collections::HashSet;
 /// is for non-text keys (modifiers, arrows, F-keys, Enter, etc.) and the ASCII
 /// fast path.
 pub(super) fn evdev_to_vk(code: u32) -> Option<u16> {
-	Some(match code {
-		1 => 0x35,  // Escape       (kVK_Escape)
-		2 => 0x12,  // Digit1       (kVK_ANSI_1)
-		3 => 0x13,  // Digit2
-		4 => 0x14,  // Digit3
-		5 => 0x15,  // Digit4
-		6 => 0x17,  // Digit5
-		7 => 0x16,  // Digit6
-		8 => 0x1A,  // Digit7
-		9 => 0x1C,  // Digit8
-		10 => 0x19, // Digit9
-		11 => 0x1D, // Digit0
-		12 => 0x1B, // Minus        (kVK_ANSI_Minus)
-		13 => 0x18, // Equal        (kVK_ANSI_Equal)
-		14 => 0x33, // Backspace    (kVK_Delete)
-		15 => 0x30, // Tab          (kVK_Tab)
-		16 => 0x0C, // Q
-		17 => 0x0D, // W
-		18 => 0x0E, // E
-		19 => 0x0F, // R
-		20 => 0x11, // T
-		21 => 0x10, // Y
-		22 => 0x20, // U
-		23 => 0x22, // I
-		24 => 0x1F, // O
-		25 => 0x23, // P
-		26 => 0x21, // [            (kVK_ANSI_LeftBracket)
-		27 => 0x1E, // ]            (kVK_ANSI_RightBracket)
-		28 => 0x24, // Enter        (kVK_Return)
-		29 => 0x3B, // Left Ctrl    (kVK_Control)
-		30 => 0x00, // A
-		31 => 0x01, // S
-		32 => 0x02, // D
-		33 => 0x03, // F
-		34 => 0x05, // G
-		35 => 0x04, // H
-		36 => 0x26, // J
-		37 => 0x28, // K
-		38 => 0x25, // L
-		39 => 0x29, // ;            (kVK_ANSI_Semicolon)
-		40 => 0x27, // '            (kVK_ANSI_Quote)
-		41 => 0x32, // `            (kVK_ANSI_Grave)
-		42 => 0x38, // Left Shift   (kVK_Shift)
-		43 => 0x2A, // \            (kVK_ANSI_Backslash)
-		44 => 0x06, // Z
-		45 => 0x07, // X
-		46 => 0x08, // C
-		47 => 0x09, // V
-		48 => 0x0B, // B
-		49 => 0x2D, // N
-		50 => 0x2E, // M
-		51 => 0x2B, // ,            (kVK_ANSI_Comma)
-		52 => 0x2F, // .            (kVK_ANSI_Period)
-		53 => 0x2C, // /            (kVK_ANSI_Slash)
-		54 => 0x3C, // Right Shift  (kVK_RightShift)
-		55 => 0x43, // Numpad *     (kVK_ANSI_KeypadMultiply)
-		56 => 0x3A, // Left Alt     (kVK_Option)
-		57 => 0x31, // Space        (kVK_Space)
-		58 => 0x39, // Caps Lock    (kVK_CapsLock)
-		59 => 0x7A, // F1
-		60 => 0x78, // F2
-		61 => 0x63, // F3
-		62 => 0x76, // F4
-		63 => 0x60, // F5
-		64 => 0x61, // F6
-		65 => 0x62, // F7
-		66 => 0x64, // F8
-		67 => 0x65, // F9
-		68 => 0x6D, // F10
-		69 => 0x47, // Num Lock → Keypad Clear (kVK_ANSI_KeypadClear; no NumLock on Mac)
-		// 70 Scroll Lock — no macOS equivalent
-		71 => 0x59, // Numpad 7
-		72 => 0x5B, // Numpad 8
-		73 => 0x5C, // Numpad 9
-		74 => 0x4E, // Numpad -     (kVK_ANSI_KeypadMinus)
-		75 => 0x56, // Numpad 4
-		76 => 0x57, // Numpad 5
-		77 => 0x58, // Numpad 6
-		78 => 0x45, // Numpad +     (kVK_ANSI_KeypadPlus)
-		79 => 0x53, // Numpad 1
-		80 => 0x54, // Numpad 2
-		81 => 0x55, // Numpad 3
-		82 => 0x52, // Numpad 0
-		83 => 0x41, // Numpad .     (kVK_ANSI_KeypadDecimal)
-		87 => 0x67, // F11
-		88 => 0x6F, // F12
-		96 => 0x4C, // Numpad Enter (kVK_ANSI_KeypadEnter)
-		97 => 0x3E, // Right Ctrl   (kVK_RightControl)
-		98 => 0x4B, // Numpad /     (kVK_ANSI_KeypadDivide)
-		100 => 0x3D, // Right Alt   (kVK_RightOption)
-		102 => 0x73, // Home        (kVK_Home)
-		103 => 0x7E, // Arrow Up    (kVK_UpArrow)
-		104 => 0x74, // Page Up     (kVK_PageUp)
-		105 => 0x7B, // Arrow Left  (kVK_LeftArrow)
-		106 => 0x7C, // Arrow Right (kVK_RightArrow)
-		107 => 0x77, // End         (kVK_End)
-		108 => 0x7D, // Arrow Down  (kVK_DownArrow)
-		109 => 0x79, // Page Down   (kVK_PageDown)
-		110 => 0x72, // Insert → Help (kVK_Help; closest macOS slot)
-		111 => 0x75, // Delete (forward) (kVK_ForwardDelete)
-		125 => 0x37, // Left Win  → Command (kVK_Command)
-		126 => 0x36, // Right Win → Right Command (kVK_RightCommand)
-		// 127 Context Menu — no macOS equivalent
-		_ => return None,
-	})
+	super::keytables::mac_vk(code, host_keyboard_is_iso())
+}
+
+// HIToolbox (Carbon umbrella): the physical keyboard type, for the ISO key swap (the same
+// query pulsar-macinput's client tap makes).
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+	fn LMGetKbdType() -> u8;
+	fn KBGetLayoutType(keyboard_type: i16) -> u32;
+}
+
+/// The host's keyboard is ISO (`KBGetLayoutType(LMGetKbdType()) == kKeyboardISO`): macOS then
+/// reports the key left of 1 and the key right of Left Shift swapped, and the layouts are
+/// written against those reported codes, so the injected code must be swapped too. Read
+/// once per process (the keyboard type of a host rarely changes mid-session).
+fn host_keyboard_is_iso() -> bool {
+	static ISO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ISO.get_or_init(|| unsafe { KBGetLayoutType(LMGetKbdType() as i16) } == u32::from_be_bytes(*b"ISO "))
 }
 
 /// Stamped into `kCGEventSourceUserData` of every event this backend posts, so a listener
@@ -209,17 +123,25 @@ pub struct DesktopInput {
 	display: Option<u32>,
 }
 
-/// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
-/// the down/up CGEventType, and the Dragged type used when the button is held.
-fn button_events(button: u8, down: bool) -> (CGMouseButton, CGEventType) {
-	match (button, down) {
-		(1, true) => (CGMouseButton::Right, CGEventType::RightMouseDown),
-		(1, false) => (CGMouseButton::Right, CGEventType::RightMouseUp),
-		(2, true) => (CGMouseButton::Center, CGEventType::OtherMouseDown),
-		(2, false) => (CGMouseButton::Center, CGEventType::OtherMouseUp),
-		(_, true) => (CGMouseButton::Left, CGEventType::LeftMouseDown),
-		(_, false) => (CGMouseButton::Left, CGEventType::LeftMouseUp),
-	}
+/// Translate our button id ([`super::mouse_button`]) to the CGMouseButton plus the down/up
+/// CGEventType and the `kCGMouseEventButtonNumber` to stamp (2 = center, 3 / 4 = the side
+/// buttons, posted as "other" mouse events like a real 5-button mouse). `None` = a button id
+/// this host does not know: ignored, never a left click.
+pub(super) fn button_events(button: u8, down: bool) -> Option<(CGMouseButton, CGEventType, i64)> {
+	let number = super::mouse_button::to_mac_number(button)?;
+	Some(match (button, down) {
+		(0, true) => (CGMouseButton::Left, CGEventType::LeftMouseDown, number),
+		(0, false) => (CGMouseButton::Left, CGEventType::LeftMouseUp, number),
+		(1, true) => (CGMouseButton::Right, CGEventType::RightMouseDown, number),
+		(1, false) => (CGMouseButton::Right, CGEventType::RightMouseUp, number),
+		(_, true) => (CGMouseButton::Center, CGEventType::OtherMouseDown, number),
+		(_, false) => (CGMouseButton::Center, CGEventType::OtherMouseUp, number),
+	})
+}
+
+/// The "other" button (middle / back / forward) a drag holds, as its button number.
+pub(super) fn held_other_button(held: &HashSet<u8>) -> Option<i64> {
+	[2u8, 3, 4].into_iter().find(|b| held.contains(b)).and_then(super::mouse_button::to_mac_number)
 }
 
 impl DesktopInput {
@@ -304,7 +226,7 @@ impl DesktopInput {
 	fn move_event_type(&self) -> CGEventType {
 		if self.held_buttons.contains(&1) {
 			CGEventType::RightMouseDragged
-		} else if self.held_buttons.contains(&2) {
+		} else if held_other_button(&self.held_buttons).is_some() {
 			CGEventType::OtherMouseDragged
 		} else if self.held_buttons.contains(&0) {
 			CGEventType::LeftMouseDragged
@@ -315,14 +237,18 @@ impl DesktopInput {
 
 	fn post_mouse(&self, ty: CGEventType, point: CGPoint) {
 		// Center maps to "other"; left/right are ignored for Moved/Dragged anyway.
+		let other = held_other_button(&self.held_buttons);
 		let btn = if self.held_buttons.contains(&1) {
 			CGMouseButton::Right
-		} else if self.held_buttons.contains(&2) {
+		} else if other.is_some() {
 			CGMouseButton::Center
 		} else {
 			CGMouseButton::Left
 		};
 		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, btn).ok()) {
+			if let (CGEventType::OtherMouseDragged, Some(n)) = (ty, other) {
+				ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, n);
+			}
 			ev.set_flags(self.flags);
 			post(&ev);
 		}
@@ -377,19 +303,22 @@ impl DesktopInput {
 		self.post_mouse(ty, CGPoint::new(cur.x + dx, cur.y + dy));
 	}
 
-	/// Press/release a mouse button (0=left, 1=right, 2=middle).
+	/// Press/release a mouse button (0=left, 1=right, 2=middle, 3=back, 4=forward; unknown
+	/// ids are ignored).
 	pub fn button(&mut self, button: u8, down: bool) {
+		let Some((cg_btn, ty, number)) = button_events(button, down) else {
+			return;
+		};
 		// Update held set FIRST so the event posts at the live cursor location.
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
 		}
-		let (cg_btn, ty) = button_events(button, down);
 		let point = self.current_location();
 		if let Some(ev) =
 			Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
 		{
+			ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
 			ev.set_flags(self.flags);
 			post(&ev);
 		}
@@ -501,10 +430,11 @@ impl DesktopInput {
 		}
 		let point = self.current_location();
 		for b in self.held_buttons.clone() {
-			let (cg_btn, ty) = button_events(b, false);
+			let Some((cg_btn, ty, number)) = button_events(b, false) else { continue };
 			if let Some(ev) =
 				Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
 			{
+				ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
 				post(&ev);
 			}
 		}
