@@ -661,6 +661,19 @@ impl RepairTracker {
 		self.last_vseq = Some(seq);
 	}
 
+	/// The client re-requested the stream with a new codec / size (the host restarts its
+	/// encoder and RTP sequence base): forget the stream's gaps and FEC state, keep the RTT and
+	/// the window counters. (A restart is also detected from the seq jump; this covers a new
+	/// base that happens to land close to the old one.)
+	pub fn reset_stream(&mut self) {
+		self.missing.clear();
+		self.fec_pending.clear();
+		self.fec_rebuilt.clear();
+		self.fec_xor.reset();
+		self.fec_rs.reset();
+		self.last_vseq = None;
+	}
+
 	/// A video RTP packet `seq` (`rtp` = the whole RTP datagram) arrived at `now`. Gap tracking:
 	/// counts the loss for the controller and holds each freshly-missing seq back (the reorder
 	/// wait, plus FEC's go while parity flows) before NACKing it. `fps` = the stream's current
@@ -1172,6 +1185,23 @@ mod tests {
 		assert!(tr.on_video(10, &rtp(10, 0, 10), t0, true, 60).restart);
 		assert!(!tr.on_video(11, &rtp(11, 0, 10), t0, true, 60).restart);
 		assert_eq!(tr.take_window().lost, 0);
+	}
+
+	#[test]
+	fn a_stream_reset_forgets_the_gaps_but_keeps_the_rtt() {
+		let t0 = Instant::now();
+		let mut tr = RepairTracker::new();
+		tr.on_rtt(30.0);
+		tr.on_video(10, &rtp(10, 0, 10), t0, true, 60);
+		tr.on_video(14, &rtp(14, 0, 10), t0, true, 60);
+		assert_eq!(tr.missing_count(), 3);
+		tr.reset_stream();
+		assert_eq!(tr.missing_count(), 0);
+		// The new base close to the old one is not a gap.
+		let o = tr.on_video(20, &rtp(20, 0, 10), t0, true, 60);
+		assert!(o.nacks.is_empty() && !o.restart);
+		assert_eq!(tr.missing_count(), 0);
+		assert_eq!(tr.rtt().median(0.0), 30.0);
 	}
 
 	#[test]
