@@ -12,7 +12,7 @@ impl Node {
 			return Ok(Transport::Relay);
 		}
 		let (peer_addr, peer_lan) = match self.inner.lock().await.sessions.get(&session) {
-			Some(s) => (s.peer_addr, s.peer_lan),
+			Some(s) => (s.peer_addr, s.peer_lan.clone()),
 			None => return Err(ConnError::P2pFailed),
 		};
 		tracing::info!(session, peer = %peer_addr, lan = ?peer_lan, "p2p: punching the peer");
@@ -25,7 +25,7 @@ impl Node {
 		// the public addr is a router hairpin there (lossy); whichever path answers first
 		// wins `peer_addr` (LAN preferred, see the Punch handler).
 		while seq < PUNCH_ATTEMPTS as u32 {
-			self.send_punch(session, seq, peer_addr, peer_lan).await;
+			self.send_punch(session, seq, peer_addr, &peer_lan).await;
 			seq += 1;
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
@@ -40,7 +40,7 @@ impl Node {
 			if timeout(left.min(PUNCH_RETRY), pk.notified()).await.is_ok() {
 				break true;
 			}
-			self.send_punch(session, seq, peer_addr, peer_lan).await;
+			self.send_punch(session, seq, peer_addr, &peer_lan).await;
 			seq += 1;
 		};
 		// The waiter is only needed during the punch — remove it on every path so the
@@ -74,11 +74,11 @@ impl Node {
 		session: SessionId,
 		seq: u32,
 		peer_addr: SocketAddr,
-		peer_lan: Option<SocketAddr>,
+		peer_lan: &[SocketAddr],
 	) {
 		let msg = encode(&PeerMsg::Punch { session, seq });
 		let _ = self.sock.send_to(&msg, peer_addr).await;
-		if let Some(lan) = peer_lan {
+		for lan in peer_lan {
 			let _ = self.sock.send_to(&msg, lan).await;
 		}
 	}
@@ -116,7 +116,7 @@ impl Node {
 				tokio::time::sleep(gap).await;
 				let Some(node) = weak.upgrade() else { return };
 				let (addr, lan) = match node.inner.lock().await.sessions.get(&session) {
-					Some(s) if !s.direct_ok && s.watch.punch_gen == gen => (s.peer_addr, s.peer_lan),
+					Some(s) if !s.direct_ok && s.watch.punch_gen == gen => (s.peer_addr, s.peer_lan.clone()),
 					_ => return, // direct already, a newer loop took over, or the session is gone
 				};
 				if !told && started.elapsed() >= BACKGROUND_PUNCH {
@@ -128,7 +128,7 @@ impl Node {
 						"p2p: no direct path found — the session stays on the relay, retrying slowly"
 					);
 				}
-				node.send_punch(session, seq, addr, lan).await;
+				node.send_punch(session, seq, addr, &lan).await;
 				seq = seq.wrapping_add(1) % super::path::PROBE_SEQ;
 			}
 		});
@@ -223,7 +223,7 @@ impl Node {
 					tracing::warn!(session, "PeerFound answer blob too short");
 					return;
 				};
-				let peer_lan = parse_lan_candidate(&answer);
+				let peer_lan = super::node::usable_peer_lans(parse_lan_candidates(&answer), &super::node::local_lan_ifaces());
 				let mut g = self.inner.lock().await;
 				// If the caller pinned the expected identity for this id (TOFU /
 				// known-host), DROP a PeerFound whose key differs: the relay only
@@ -423,7 +423,8 @@ impl Node {
 			tracing::warn!(session, "incoming hello blob too short");
 			return;
 		};
-		let peer_lan = parse_lan_candidate(&hello);
+		let peer_cands = parse_lan_candidates(&hello);
+		let peer_lan = super::node::usable_peer_lans(peer_cands.clone(), &super::node::local_lan_ifaces());
 		// Retransmit guard: a duplicated requester Connect (UDP can duplicate) makes the
 		// relay emit a 2nd Incoming. If this session already exists, re-send Accept with
 		// the SAME salt we already committed — minting a fresh salt would derive a
@@ -432,7 +433,7 @@ impl Node {
 		{
 			let g = self.inner.lock().await;
 			if let Some(s) = g.sessions.get(&session) {
-				let answer = self.handshake_blob(&s.our_hs);
+				let answer = self.answer_blob(&s.our_hs, &peer_cands);
 				let (id, token) = (g.self_id, g.token);
 				drop(g);
 				if let (Some(id), Some(token)) = (id, token) {
@@ -457,7 +458,7 @@ impl Node {
 		let crypto = self
 			.identity
 			.session_hs(key, Role::Responder, session, &our_hs, &peer_hs);
-		let answer = self.handshake_blob(&our_hs);
+		let answer = self.answer_blob(&our_hs, &peer_cands);
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 
 		// Read self_id + token BEFORE inserting the session so we never leak a
@@ -478,7 +479,7 @@ impl Node {
 				session,
 				SessionState {
 					peer_addr: from_addr,
-					peer_lan,
+					peer_lan: peer_lan.clone(),
 					crypto,
 					peer_pubkey: key,
 					transport: Transport::Relay,
@@ -524,7 +525,7 @@ impl Node {
 			let node = self.clone();
 			tokio::spawn(async move {
 				for seq in 0..PUNCH_ATTEMPTS as u32 {
-					node.send_punch(session, seq, from_addr, peer_lan).await;
+					node.send_punch(session, seq, from_addr, &peer_lan).await;
 					tokio::time::sleep(Duration::from_millis(20)).await;
 				}
 				node.punch_in_background(session, PUNCH_ATTEMPTS as u32);
@@ -776,7 +777,7 @@ impl Node {
 			session,
 			SessionState {
 				peer_addr: from,
-				peer_lan: None, // direct-IP: the typed address IS the path
+				peer_lan: Vec::new(), // direct-IP: the typed address IS the path
 				crypto,
 				peer_pubkey: pubkey,
 				transport: Transport::Direct,
@@ -859,7 +860,7 @@ impl Node {
 				session,
 				SessionState {
 					peer_addr: from,
-					peer_lan: None, // direct-IP: the typed address IS the path
+					peer_lan: Vec::new(), // direct-IP: the typed address IS the path
 					crypto,
 					peer_pubkey: pubkey,
 					transport: Transport::Direct,
@@ -996,7 +997,7 @@ impl Node {
 /// another Pulsar instance, not the peer). Session ids are 53 random bits known only to the
 /// relay and the two peers, so a stray sender on the same carrier IP can't guess one.
 fn punch_candidate(s: &SessionState, from: SocketAddr) -> Option<bool> {
-	if from == s.peer_addr || Some(from) == s.peer_lan {
+	if from == s.peer_addr || s.peer_lan.contains(&from) {
 		return Some(false);
 	}
 	let public = !is_private_v4(from) && !from.ip().is_loopback() && !from.ip().is_unspecified();
@@ -1084,7 +1085,7 @@ mod tests {
 			let g = node.inner.lock().await;
 			let s = g.sessions.get(&SESSION).expect("session after PeerFound");
 			assert_eq!(s.peer_addr, public);
-			assert_eq!(s.peer_lan, Some(lan));
+			assert_eq!(s.peer_lan, vec![lan]);
 			assert!(!s.direct_ok);
 		}
 
@@ -1324,7 +1325,7 @@ mod tests {
 			target: DeviceId(1),
 			target_addr: public,
 			session: SESSION,
-			answer: handshake_blob(peer_id.public_bytes(), &peer_hs, None),
+			answer: handshake_blob(peer_id.public_bytes(), &peer_hs, &[]),
 			rate_cap_kbps: 0,
 		})
 		.await;
@@ -1510,5 +1511,69 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(1100)).await;
 		node2.handle_relay(relay_data(3, vec![0u8; 40])).await;
 		assert_eq!(sess2.live_transport().await, Transport::Direct);
+	}
+
+	/// A responder tells a requester about a second NIC only when the requester sits on its
+	/// subnet; the default-route candidate goes out as before.
+	#[test]
+	fn responder_offers_only_extras_on_a_shared_subnet() {
+		let a = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+		let ip = |s: &str| -> std::net::Ipv4Addr { s.parse().unwrap() };
+		let m24 = ip("255.255.255.0");
+		let ours = vec![a("192.168.1.5:5000"), a("10.20.0.7:5000"), a("172.16.9.2:5000")];
+		let local = [(ip("192.168.1.5"), m24), (ip("10.20.0.7"), m24), (ip("172.16.9.2"), m24)];
+		// The requester sits on 10.20.0.x: the default-route candidate + that one NIC.
+		let got = super::super::node::answer_lans(ours.clone(), &local, &[a("10.20.0.99:6000")]);
+		assert_eq!(got, vec![ours[0], ours[1]]);
+		// A requester on none of our subnets learns only the default-route candidate.
+		let got = super::super::node::answer_lans(ours.clone(), &local, &[a("192.168.50.3:6000")]);
+		assert_eq!(got, vec![ours[0]]);
+		assert_eq!(super::super::node::answer_lans(ours.clone(), &local, &[]), vec![ours[0]]);
+		assert!(super::super::node::answer_lans(Vec::new(), &local, &[]).is_empty());
+	}
+
+	/// Extra LAN candidates ride a tail old peers never read: the LAN slot and the v1
+	/// extension stay where they were, and the list round-trips.
+	#[test]
+	fn handshake_blob_carries_extra_lan_candidates() {
+		let hs = LocalHs::new();
+		let lans = [addr("192.168.1.20:5000"), addr("10.0.0.7:5000"), addr("172.16.4.2:5000")];
+		let blob = handshake_blob([3u8; 32], &hs, &lans);
+		// Old-peer view: the LAN slot holds the primary, the v1 extension follows at 70.
+		assert_eq!(&blob[64..70], &[192, 168, 1, 20, 0x13, 0x88]);
+		assert_eq!(blob[70], HS_EXT_V1);
+		let (key, peer, _) = split_handshake(&blob).expect("parses");
+		assert_eq!(key, [3u8; 32]);
+		assert!(peer.eph.is_some());
+		assert_eq!(parse_lan_candidates(&blob), lans.to_vec());
+		// One candidate: no tail at all (byte-identical to the old blob).
+		let one = handshake_blob([3u8; 32], &hs, &lans[..1]);
+		assert_eq!(one.len(), HS_BLOB_LEN);
+		assert_eq!(parse_lan_candidates(&one), vec![lans[0]]);
+		// None: zero slot, nothing parsed.
+		assert!(parse_lan_candidates(&handshake_blob([3u8; 32], &hs, &[])).is_empty());
+		// A truncated / lying tail stops at the end of the buffer.
+		let mut cut = blob.clone();
+		cut.truncate(HS_BLOB_LEN + 2 + 6 + 3);
+		assert_eq!(parse_lan_candidates(&cut), lans[..2].to_vec());
+	}
+
+	/// Extras are punched only when they sit on one of our own LAN subnets (and are not our
+	/// own address); the primary candidate keeps the old unconditional behaviour.
+	#[test]
+	fn only_reachable_extra_candidates_are_punched() {
+		use std::net::Ipv4Addr;
+		let local = [(Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(255, 255, 255, 0))];
+		let cands = vec![
+			addr("10.99.0.5:7000"),      // primary: kept as-is
+			addr("192.168.1.33:7000"),   // our subnet: kept
+			addr("172.17.0.1:7000"),     // a docker bridge somewhere: not ours, dropped
+			addr("192.168.1.10:7000"),   // our own address: dropped
+			addr("192.168.1.33:7000"),   // duplicate: dropped
+		];
+		assert_eq!(
+			super::super::node::usable_peer_lans(cands, &local),
+			vec![addr("10.99.0.5:7000"), addr("192.168.1.33:7000")]
+		);
 	}
 }

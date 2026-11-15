@@ -4,11 +4,11 @@ use super::*;
 
 pub(super) struct SessionState {
 	pub(super) peer_addr: SocketAddr,
-	/// The peer's same-LAN candidate from its handshake blob tail (see
-	/// `parse_lan_candidate`): punched ALONGSIDE the relay-observed public addr,
-	/// so same-NAT peers converge on the true LAN path instead of the lossy
-	/// router hairpin. `None` for old peers / cross-network connects.
-	pub(super) peer_lan: Option<SocketAddr>,
+	/// The peer's same-LAN candidates from its handshake blob (see
+	/// `parse_lan_candidates` / `usable_peer_lans`): punched ALONGSIDE the relay-observed
+	/// public addr, so same-NAT peers converge on the true LAN path instead of the lossy
+	/// router hairpin. Empty for old peers without a candidate / direct-IP sessions.
+	pub(super) peer_lan: Vec<SocketAddr>,
 	pub(super) crypto: Crypto,
 	/// The peer's static X25519 public key that this session's key was derived
 	/// against. Exposed via `Session::peer_pubkey` so the layer above can pin it

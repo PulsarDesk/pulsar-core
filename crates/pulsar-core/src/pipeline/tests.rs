@@ -453,6 +453,8 @@ fn nvenc_command_invokes_ffmpeg_directly_with_encoder() {
 	assert!(args.iter().any(|a| a == "ull")); // low-latency tune
 	assert!(args.iter().any(|a| a == "rtp")); // RTP output for WebCodecs
 	assert!(args.last().unwrap().starts_with("rtp://"));
+	// Packet size capped for 1280-byte overlay / relay MTUs (ffmpeg's default is 1472).
+	assert!(args.last().unwrap().ends_with(&format!("?pkt_size={}", crate::service::media::RTP_MAX_PACKET)));
 }
 
 #[test]
@@ -566,7 +568,10 @@ fn gst_fragment_mpp_h265_matches_verified_pi_pipeline() {
 	let f = gst::encoder_fragment(gst::GstEncoder::Mpp, VCodec::H265, 8000, 60).unwrap();
 	assert!(f.contains("mpph265enc name=venc bps=8000000 gop=60 header-mode=each-idr"));
 	assert!(f.contains("h265parse"));
-	assert!(f.contains("rtph265pay config-interval=1 pt=96 mtu=1200"));
+	assert!(f.contains(&format!(
+		"rtph265pay config-interval=1 pt=96 mtu={}",
+		crate::service::media::RTP_MAX_PACKET
+	)));
 }
 
 #[test]

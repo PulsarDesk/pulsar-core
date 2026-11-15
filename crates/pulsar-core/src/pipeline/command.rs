@@ -323,7 +323,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		s("rtp"),
 		s("-payload_type"),
 		s("96"),
-		plan.dest.clone(),
+		rtp_output_url(&plan.dest),
 	]);
 
 	// Always invoke ffmpeg directly. NVENC works without any wrapper; if a user
@@ -440,6 +440,18 @@ pub fn decode_command(listen: &str) -> (String, Vec<String>) {
 			s(listen),
 		],
 	)
+}
+
+/// The ffmpeg RTP output URL for `dest`, with the packet size capped: ffmpeg's RTP muxer
+/// otherwise fills UDP's default 1472-byte packets, which the session framing pushes past a
+/// 1500-byte MTU (IP fragmentation on every path) and far past a 1280-byte overlay / relay
+/// one. See `service::media::RTP_MAX_PACKET`. A `dest` that already carries options is kept.
+pub fn rtp_output_url(dest: &str) -> String {
+	if dest.starts_with("rtp://") && !dest.contains('?') {
+		format!("{dest}?pkt_size={}", crate::service::media::RTP_MAX_PACKET)
+	} else {
+		dest.to_string()
+	}
 }
 
 #[cfg(test)]
