@@ -143,9 +143,12 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
-	// format matches the requested depth/chroma (p010 for HDR, yuv444 for 4:4:4).
+	// format matches the effective depth/chroma (p010 for HDR, yuv444 for 4:4:4) — the same
+	// `effective_hdr_yuv444` the `-pix_fmt` below uses, so an SDR capture is never uploaded
+	// as P010 while the encoder is told something else.
 	if plan.encoder == HwEncoder::Vaapi || plan.encoder == HwEncoder::Vulkan {
-		let up = match (plan.yuv444, plan.hdr) {
+		let (eff_hdr, eff_yuv444) = plan.effective_hdr_yuv444();
+		let up = match (eff_yuv444, eff_hdr) {
 			(true, true) => "yuv444p10le",
 			(true, false) => "yuv444p",
 			(false, true) => "p010le",
@@ -294,7 +297,9 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		};
 		a.extend([s("-pix_fmt"), s(pix)]);
 		// HDR10 signaling: BT.2020 primaries + SMPTE-2084 (PQ) transfer + non-constant
-		// luminance matrix. The client carries these through to its display.
+		// luminance matrix. Only for a capture that really delivers HDR pixels
+		// (`effective_hdr_yuv444`; none of the ffmpeg inputs does today) — an 8-bit SDR
+		// source tagged PQ decodes to wrong colours on every client.
 		if eff_hdr {
 			a.extend([
 				s("-color_primaries"),

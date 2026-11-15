@@ -196,6 +196,13 @@ pub struct DisplayInfo {
 	/// than its own panel refreshes.
 	#[serde(default)]
 	pub refresh_hz: u32,
+	/// The monitor is in HDR mode right now (Windows "Use HDR": its colour space is BT.2020 /
+	/// PQ). A host that advertises [`FEAT_HDR`](crate::service::media::FEAT_HDR) streams real
+	/// 10-bit HDR from such a monitor when the client asks ([`StreamReq::hdr`]); from an SDR
+	/// monitor the stream stays SDR whatever was asked. `#[serde(default)]` (false) — an old
+	/// host / a host that cannot tell omits it.
+	#[serde(default)]
+	pub hdr: bool,
 }
 
 /// One host top-level WINDOW the client can pick as a per-window capture target
@@ -277,8 +284,13 @@ pub struct StreamReq {
 	/// keeps today's `game_mode`-driven behavior on the host.
 	#[serde(default)]
 	pub quality: QualityPref,
-	/// Request 10-bit **HDR** encode (BT.2020/PQ). `#[serde(default)]` (false) for wire compat
-	/// — only honored when the chosen encoder+codec actually validates for it.
+	/// Request 10-bit **HDR** (HDR10: BT.2020 primaries, SMPTE ST 2084 PQ, HEVC Main10 / AV1
+	/// 10-bit). `#[serde(default)]` (false) for wire compat. A client sets it only when the
+	/// host advertises [`FEAT_HDR`](crate::service::media::FEAT_HDR) and the client can
+	/// decode 10-bit HEVC / AV1 and show it (on an HDR display, or tone-mapped to SDR). The
+	/// host honours it only when the captured monitor really is in HDR mode and the codec is
+	/// HEVC / AV1 on an encoder that does 10-bit; otherwise the stream is SDR (never an 8-bit
+	/// picture tagged as PQ).
 	#[serde(default)]
 	pub hdr: bool,
 	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop).
@@ -1043,11 +1055,15 @@ mod tests {
 				primary: true,
 				modes: vec![(2560, 1440), (1920, 1080)],
 				refresh_hz: 144,
+				hdr: true,
 			}],
 		};
 		let json = serde_json::to_string(&caps).unwrap();
 		let back: StreamCaps = serde_json::from_str(&json).unwrap();
 		assert_eq!(caps, back);
+		// An old host's display entry has no `hdr` flag: SDR.
+		let old_disp = r#"{"idx":0,"name":"D","width":1920,"height":1080}"#;
+		assert!(!serde_json::from_str::<DisplayInfo>(old_disp).unwrap().hdr);
 		// An OLD host's reply has no `features`/`displays` — must deserialize to empty.
 		let old = r#"{"codecs":["h264"],"encoders":["software"]}"#;
 		let caps: StreamCaps = serde_json::from_str(old).unwrap();
@@ -1331,6 +1347,7 @@ mod tests {
 				primary: false,
 				modes: vec![(2560, 1440), (1920, 1080)],
 				refresh_hz: 144,
+				hdr: false,
 			}]),
 			DataMsg::Displays(vec![]),
 			DataMsg::StreamedDisplay(1),

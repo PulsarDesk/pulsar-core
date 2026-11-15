@@ -169,11 +169,12 @@ fn ddagrab_nvenc_qsv_degrade_hdr_yuv444_to_sdr_420() {
 	}
 }
 
-/// AMF/Software ddagrab: hdr/yuv444 are NOT degraded — they flow through to both
-/// the filter format and -pix_fmt, and they must agree.
+/// AMF/Software ddagrab: yuv444 is NOT degraded — it flows through to both the filter
+/// format and -pix_fmt, and they must agree. HDR is dropped: ddagrab hands over 8-bit BGRA,
+/// which is SDR (no P010, no PQ tags).
 #[test]
-fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
-	// AMF + HDR: filter must end in format=p010le, command must have -pix_fmt p010le.
+fn ddagrab_cpu_bounce_encoders_honor_yuv444_but_not_fake_hdr() {
+	// AMF + HDR request: the 8-bit BGRA capture stays SDR NV12, untagged.
 	let p = StreamPlan {
 		encoder: HwEncoder::Amf,
 		codec: VCodec::H265,
@@ -182,17 +183,12 @@ fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
 		yuv444: false,
 		..plan(HwEncoder::Amf)
 	};
-	assert_eq!(p.effective_hdr_yuv444(), (true, false));
+	assert_eq!(p.effective_hdr_yuv444(), (false, false));
 	let (_, args) = encode_command(&p);
 	let joined = args.join(" ");
-	assert!(
-		joined.contains("format=p010le"),
-		"AMF ddagrab HDR: filter must end in format=p010le"
-	);
-	assert!(
-		joined.contains("-pix_fmt p010le"),
-		"AMF ddagrab HDR: command must have -pix_fmt p010le"
-	);
+	assert!(joined.contains("format=nv12"), "AMF ddagrab: SDR nv12 filter, got {joined}");
+	assert!(!joined.contains("p010le"), "AMF ddagrab: no 10-bit re-quantisation of SDR");
+	assert!(!joined.contains("smpte2084") && !joined.contains("bt2020"), "AMF ddagrab: no fake PQ");
 
 	// Software + yuv444: filter must end in format=yuv444p, command -pix_fmt yuv444p.
 	let q = StreamPlan {
@@ -360,16 +356,55 @@ fn resolve_codec_honors_then_falls_back() {
 	);
 }
 
+/// Every ffmpeg capture input is 8-bit SDR: an HDR request must never produce PQ / BT.2020
+/// tags or a 10-bit re-quantisation, on any OS's capture or any encoder.
+#[test]
+fn hdr_request_never_tags_an_8bit_capture_as_pq() {
+	let captures = [
+		CaptureMethod::X11grab,
+		CaptureMethod::Kmsgrab,
+		CaptureMethod::Gdigrab,
+		CaptureMethod::Ddagrab,
+		CaptureMethod::AvFoundation,
+	];
+	let encoders = [
+		HwEncoder::Nvenc,
+		HwEncoder::Amf,
+		HwEncoder::Qsv,
+		HwEncoder::Vaapi,
+		HwEncoder::Vulkan,
+		HwEncoder::VideoToolbox,
+		HwEncoder::MediaFoundation,
+		HwEncoder::Software,
+	];
+	for capture in captures {
+		for enc in encoders {
+			for codec in [VCodec::H264, VCodec::H265, VCodec::Av1] {
+				let mut p = plan(enc);
+				p.capture = capture;
+				p.codec = codec;
+				p.hdr = true;
+				assert!(!p.capture_delivers_hdr());
+				assert!(!p.effective_hdr_yuv444().0, "{capture:?} {enc:?} {codec:?}");
+				let j = encode_command(&p).1.join(" ");
+				for bad in ["smpte2084", "bt2020", "p010le", "main10", "high10", "yuv444p10le"] {
+					assert!(!j.contains(bad), "{capture:?} {enc:?} {codec:?} emitted {bad}: {j}");
+				}
+			}
+		}
+	}
+}
+
 #[test]
 fn hdr_and_yuv444_set_pixfmt_profile_colorspace() {
-	// HDR HEVC: p010 + main10 + BT2020/PQ.
+	// An HDR request on an 8-bit capture: plain SDR (no 10-bit, no PQ).
 	let mut p = plan(HwEncoder::Nvenc);
 	p.codec = VCodec::H265;
 	p.hdr = true;
 	let j = encode_command(&p).1.join(" ");
-	assert!(j.contains("-pix_fmt p010le"));
-	assert!(j.contains("-profile:v main10"));
-	assert!(j.contains("smpte2084") && j.contains("bt2020"));
+	assert!(!j.contains("-pix_fmt p010le"));
+	assert!(!j.contains("-profile:v main10"));
+	assert!(!j.contains("smpte2084") && !j.contains("bt2020"));
 	// YUV444 H.264: high444p + yuv444p, no HDR colorspace.
 	let mut q = plan(HwEncoder::Software);
 	q.codec = VCodec::H264;
