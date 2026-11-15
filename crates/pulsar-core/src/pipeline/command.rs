@@ -380,10 +380,18 @@ pub fn probe_command(
 	match encoder {
 		HwEncoder::Vaapi | HwEncoder::Vulkan => a.extend([s("-vf"), s("format=nv12,hwupload")]),
 		HwEncoder::Qsv => a.extend([s("-vf"), s("format=nv12,hwupload=extra_hw_frames=4")]),
+		// The stream feeds Media Foundation NV12 and forces the hardware MFT (`encode_command`);
+		// the probe must too. The Qualcomm HEVC / AV1 MFTs reject testsrc's yuv420p
+		// ("failed processing input"), so without this they were never listed although they
+		// stream fine (measured 2026-11-15, Snapdragon X Elite).
+		HwEncoder::MediaFoundation => a.extend([s("-vf"), s("format=nv12")]),
 		_ => {}
 	}
 
 	a.extend([s("-c:v"), s(name)]);
+	if encoder == HwEncoder::MediaFoundation {
+		a.extend([s("-hw_encoding"), s("1")]);
+	}
 
 	// Mirror the encoder-specific options from encode_command so the probe exercises the
 	// same init path the real spawn uses.  Without this, a Software+AV1 probe passes
