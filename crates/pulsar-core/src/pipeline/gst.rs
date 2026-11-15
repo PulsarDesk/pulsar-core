@@ -159,8 +159,11 @@ pub fn encoder_fragment_with(
 		VCodec::H265 => ("h265parse", "rtph265pay"),
 		VCodec::Av1 => return None,
 	};
+	// `mtu` = whole RTP packet, sized to fit a 1280-byte overlay / relay MTU after the
+	// session framing (see `service::media::RTP_MAX_PACKET`).
 	Some(format!(
-		"{enc_props} ! {parse} ! {pay} config-interval=1 pt=96 mtu=1200"
+		"{enc_props} ! {parse} ! {pay} config-interval=1 pt=96 mtu={}",
+		crate::service::media::RTP_MAX_PACKET
 	))
 }
 

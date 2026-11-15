@@ -27,7 +27,10 @@ pub async fn request_games(session: &mut Session) -> Result<Vec<GameInfo>, ConnE
 }
 
 /// Client: ask the host what it can actually stream (validated codec + encoder caps,
-/// best-first). Empty on timeout/old host — the caller falls back to H.264. Used to
+/// best-first). An ERROR (`TimedOut`) when no answer came: "no answer" is not "an old host
+/// with no features" — defaulting to empty caps used to turn a dropped caps exchange into a
+/// plaintext media stream (no `mos`). Callers must not stream without
+/// [`media::encrypted_media`] in the answer. Used to
 /// resolve the client's "auto" codec BEFORE writing its decoder SDP (so the SDP and
 /// the stream can never disagree) and to gate the session-menu options.
 pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, ConnError> {
@@ -59,7 +62,10 @@ pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, Conn
 			}
 		}
 	}
-	Ok(StreamCaps::default())
+	Err(ConnError::Io(std::io::Error::new(
+		std::io::ErrorKind::TimedOut,
+		"the host did not answer the stream-caps query",
+	)))
 }
 
 /// Client: run the session-start bandwidth probe (`adapt::probe`) — ask the host for packet

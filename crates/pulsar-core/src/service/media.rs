@@ -23,6 +23,28 @@ pub const TAG_AUDIO: u8 = 0x02;
 pub const FEAT_MOS: &str = "mos";
 pub const FEAT_NACK: &str = "nack";
 
+/// Media-over-session is the ONLY encrypted media path: without it the host would send the
+/// RTP as plain UDP to the client's ports. A client must refuse to stream (and a host must
+/// refuse to send) instead of falling back to that — an on-path attacker who drops the caps
+/// exchange for two seconds must not get a plaintext stream. Every Pulsar host since the
+/// single-socket transport advertises [`FEAT_MOS`]; the pure-RTP legacy flows remain only as
+/// the encoders' loopback intake.
+pub fn encrypted_media(features: &[String]) -> bool {
+	features.iter().any(|f| f == FEAT_MOS)
+}
+
+/// Largest video RTP packet (RTP header + payload) any host packetizer may emit.
+///
+/// Sized so the WORST datagram it becomes — a Reed-Solomon parity packet for it (1 tag +
+/// 7 header + 2 length + packet), sealed (+16 Poly1305), framed as `PeerMsg::Data` (+28) and
+/// wrapped in the sender-side `ClientMsg::RelayData` (+40), in UDP over IPv6 (+48) — still
+/// fits a 1280-byte MTU: the IPv6 minimum, Tailscale's tunnel MTU, a WireGuard/ZeroTier
+/// overlay at its tightest. 1200 (the old value) produced 1282-byte direct and ~1320-byte
+/// relayed packets, which such tunnels fragment (one lost fragment loses the packet, and the
+/// FEC loses a whole shard). The cost on a 1500-byte LAN is ~5 % more packets. Pinned by the
+/// `rtp_packets_fit_a_1280_mtu` test against the real encoders.
+pub const RTP_MAX_PACKET: usize = 1136;
+
 /// Build one media session-payload: `[tag][rtp…]`.
 pub fn frame(tag: u8, rtp: &[u8]) -> Vec<u8> {
 	let mut v = Vec::with_capacity(1 + rtp.len());
@@ -63,6 +85,30 @@ pub fn seq_forward(a: u16, b: u16) -> u16 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The largest datagram a [`RTP_MAX_PACKET`] video packet turns into on the wire — its
+	/// RS or XOR parity, sealed, as `PeerMsg::Data`, wrapped in the client-side relay frame
+	/// (the bigger of the two relay frames), in UDP over IPv6 — fits a 1280-byte MTU.
+	#[test]
+	fn rtp_packets_fit_a_1280_mtu() {
+		use pulsar_proto::{encode, ClientMsg, DeviceId, PeerMsg, Token};
+		let pkt = vec![0x80u8; RTP_MAX_PACKET];
+		let video = frame(TAG_VIDEO, &pkt);
+		let rs = rs_parity_frames_m(0, &[&pkt[..], &pkt[..]], 1).remove(0);
+		let xor = parity_frame(0, &[&pkt[..], &pkt[..]]).unwrap();
+		let biggest = [video.len(), rs.len(), xor.len()].into_iter().max().unwrap();
+		let sealed = vec![0u8; biggest + 16]; // ChaCha20-Poly1305 tag
+		let data = encode(&PeerMsg::Data { session: u64::MAX, seq: u64::MAX, payload: sealed });
+		let relayed = encode(&ClientMsg::RelayData {
+			id: DeviceId(999_999_999),
+			token: Token([0; 16]),
+			session: u64::MAX,
+			payload: data.clone(),
+		});
+		const UDP_IPV6: usize = 8 + 40;
+		assert!(relayed.len() + UDP_IPV6 <= 1280, "relayed {} B + {UDP_IPV6}", relayed.len());
+		assert!(data.len() + UDP_IPV6 <= 1280, "direct {} B + {UDP_IPV6}", data.len());
+	}
 
 	#[test]
 	fn frame_parse_roundtrip() {
