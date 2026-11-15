@@ -14,12 +14,9 @@
 //! next write.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-
-use crate::Transport;
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -30,58 +27,10 @@ pub struct Entry {
 /// The memory file's contents.
 pub type MemoryMap = HashMap<String, Entry>;
 
-/// What kind of network path a session runs on — the memory's second key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PathClass {
-	/// Direct to a private / link-local / loopback address: a local network.
-	Lan,
-	/// Direct to a public address: the internet (incl. a punched mobile / CGNAT path).
-	Wan,
-	/// Relayed by the rendezvous server.
-	Relay,
-}
-
-impl PathClass {
-	pub fn as_str(self) -> &'static str {
-		match self {
-			PathClass::Lan => "lan",
-			PathClass::Wan => "wan",
-			PathClass::Relay => "relay",
-		}
-	}
-
-	/// Classify a live path: relayed, or direct to `peer` (its address; unknown → `wan`, the
-	/// cautious answer — a wrong `lan` would seed a thin path with a LAN rate).
-	pub fn of(transport: Transport, peer: Option<IpAddr>) -> Self {
-		match transport {
-			Transport::Relay => PathClass::Relay,
-			Transport::Direct => match peer {
-				Some(ip) if is_local_ip(ip) => PathClass::Lan,
-				_ => PathClass::Wan,
-			},
-		}
-	}
-}
-
-/// Private (RFC 1918 / IPv6 unique-local), link-local or loopback. The CGNAT shared space
-/// (100.64/10) is NOT local: a direct path to it is a carrier network or an overlay VPN
-/// (Tailscale) that crosses the internet.
-pub fn is_local_ip(ip: IpAddr) -> bool {
-	match ip {
-		IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
-		IpAddr::V6(v6) => {
-			if let Some(v4) = v6.to_ipv4_mapped() {
-				return is_local_ip(IpAddr::V4(v4));
-			}
-			let s0 = v6.segments()[0];
-			v6.is_loopback()
-				// fc00::/7 unique-local
-				|| (s0 & 0xfe00) == 0xfc00
-				// fe80::/10 link-local
-				|| (s0 & 0xffc0) == 0xfe80
-		}
-	}
-}
+/// What kind of network path a session runs on — the memory's second key. One type with the
+/// path classification (`crate::netpath`): classify a live path with
+/// [`crate::netpath::classify`] (overlay VPNs and the round trip count, not only the address).
+pub use crate::netpath::PathClass;
 
 fn key(peer: &str, class: PathClass) -> String {
 	format!("{peer}|{}", class.as_str())
@@ -140,34 +89,6 @@ pub fn remember(path: &Path, peer: &str, class: PathClass, kbps: u32) {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	fn ip(s: &str) -> Option<IpAddr> {
-		Some(s.parse().unwrap())
-	}
-
-	#[test]
-	fn classifies_the_path() {
-		assert_eq!(PathClass::of(Transport::Relay, ip("192.168.1.5")), PathClass::Relay);
-		assert_eq!(PathClass::of(Transport::Relay, None), PathClass::Relay);
-		for local in [
-			"192.168.1.61",
-			"10.0.0.2",
-			"172.16.4.1",
-			"169.254.3.3",
-			"127.0.0.1",
-			"::1",
-			"fe80::1",
-			"fd12::3",
-			"::ffff:192.168.1.2",
-		] {
-			assert_eq!(PathClass::of(Transport::Direct, ip(local)), PathClass::Lan, "{local}");
-		}
-		for public in ["2.28.36.116", "100.72.1.1", "172.32.0.1", "2001:db8::1", "::ffff:8.8.8.8"] {
-			assert_eq!(PathClass::of(Transport::Direct, ip(public)), PathClass::Wan, "{public}");
-		}
-		// Unknown address: the cautious class.
-		assert_eq!(PathClass::of(Transport::Direct, None), PathClass::Wan);
-	}
 
 	#[test]
 	fn memory_is_keyed_by_peer_and_path_class() {
