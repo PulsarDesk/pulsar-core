@@ -25,6 +25,20 @@ pub type CVPixelBufferRef = *mut c_void;
 pub type CGDirectDisplayID = u32;
 pub type CGDisplayModeRef = *mut c_void;
 
+/// Opaque `CFString`, only so a `*const CFStringObj` passed through `msg_send!` encodes as
+/// `^{__CFString=}`: objc2 checks argument encodings in debug builds and panics on a plain
+/// `*const c_void` (`^v`) where a method takes a CF string.
+#[repr(C)]
+pub struct CFStringObj {
+	_p: [u8; 0],
+}
+
+// SAFETY: the encoding CoreFoundation's own headers give `CFStringRef` (as objc2-core-foundation).
+unsafe impl objc2::encode::RefEncode for CFStringObj {
+	const ENCODING_REF: objc2::encode::Encoding =
+		objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CFString", &[]));
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CGPoint {
@@ -254,3 +268,15 @@ pub fn cf_number_i64(n: CFTypeRef) -> Option<i64> {
 	(ok != 0).then_some(v)
 }
 
+
+#[cfg(test)]
+mod tests {
+	/// objc2 checks `msg_send!` argument encodings in debug builds: SCK's colour setters take
+	/// `^{__CFString=}`, which a plain `*const c_void` (`^v`) does not match (panic).
+	#[test]
+	fn cf_string_pointer_encodes_as_cfstring() {
+		use objc2::encode::Encode;
+		assert!(<*const super::CFStringObj>::ENCODING.equivalent_to_str("^{__CFString=}"));
+		assert!(!<*const std::ffi::c_void>::ENCODING.equivalent_to_str("^{__CFString=}"));
+	}
+}

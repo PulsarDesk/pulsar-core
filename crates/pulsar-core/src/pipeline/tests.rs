@@ -718,9 +718,13 @@ fn window_none_keeps_screen_args() {
 	let args = encode_command(&plan(HwEncoder::Software)).1;
 	assert!(!args.iter().any(|a| a == "-window_id"));
 	assert!(args.iter().any(|a| a == "1920x1080"));
-	// The only filter of a plain x11grab screen is the SDR colour tag.
+	// The only filters of a plain x11grab screen are the SDR conversion + colour tag (no resize).
 	let vf = args.iter().position(|a| a == "-vf").map(|i| args[i + 1].as_str());
-	assert_eq!(vf, Some("setparams=color_primaries=bt709:color_trc=bt709"), "{args:?}");
+	assert_eq!(
+		vf,
+		Some("scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709"),
+		"{args:?}"
+	);
 	let k = StreamPlan {
 		capture: CaptureMethod::Kmsgrab,
 		window: Some(WindowInput::X11 { id: 5 }),
@@ -823,8 +827,36 @@ fn sdr_streams_signal_bt709_limited() {
 			if capture == CaptureMethod::Ddagrab && enc != HwEncoder::Vaapi {
 				assert!(at("-vf").is_none(), "[{enc:?}] no -vf beside a complex graph: {j}");
 			}
+			// Every RGB → YUV conversion names BT.709 limited, ahead of the format constraint
+			// (an ffmpeg older than 7.1 would otherwise convert BT.601 under the BT.709 tag).
+			// The one exception: ddagrab → NVENC without the CUDA map hands NVENC the BGRA.
+			let hands_rgb = capture == CaptureMethod::Ddagrab && enc == HwEncoder::Nvenc;
+			let conv = chain.find("out_color_matrix=bt709:out_range=tv");
+			assert_eq!(conv.is_some(), !hands_rgb, "[{enc:?} {capture:?}] {chain}");
+			if let (Some(c), Some(f)) = (conv, chain.rfind("format=")) {
+				let scaler = chain[..c].rfind("scale").or_else(|| chain[..c].rfind("vpp_qsv")).unwrap();
+				assert!(scaler < c, "[{enc:?} {capture:?}] {chain}");
+				// The format the conversion feeds comes after (or is the scaler's own option).
+				assert!(f > scaler, "[{enc:?} {capture:?}] {chain}");
+			}
 		}
 	}
+	// The ddagrab GPU scalers convert too: CUDA (zero-copy NVENC) and QSV name the matrix.
+	for enc in [HwEncoder::Nvenc, HwEncoder::Qsv] {
+		let p = StreamPlan { capture: CaptureMethod::Ddagrab, gpu_zerocopy: true, ..plan(enc) };
+		let args = encode_command(&p).1;
+		let fc = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+		assert!(fc.contains("format=nv12:out_color_matrix=bt709:out_range=tv"), "[{enc:?}] {fc}");
+	}
+	// An x11grab with no scale of its own gets an explicit one in front of the encoder's format.
+	let p = StreamPlan { capture: CaptureMethod::X11grab, ..plan(HwEncoder::Software) };
+	let args = encode_command(&p).1;
+	let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+	assert_eq!(at("-vf").as_deref(), Some("scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709"));
+	assert!(args.iter().position(|a| a == "-vf") < args.iter().position(|a| a == "-pix_fmt"));
+	// Kmsgrab frames are DRM-PRIME (no swscale): no CPU scale for an encoder that takes them.
+	let p = StreamPlan { capture: CaptureMethod::Kmsgrab, ..plan(HwEncoder::Nvenc) };
+	assert!(!encode_command(&p).1.join(" ").contains("scale="), "{:?}", encode_command(&p).1);
 	// macOS frames are NV12 / UYVY already: the tag labels them before anything converts.
 	let p = StreamPlan {
 		capture: CaptureMethod::AvFoundation,
@@ -867,19 +899,18 @@ fn sdr_colour_bars_through_ffmpeg() {
 		("white", (235, 128, 128)),
 		("black", (16, 128, 128)),
 	];
-	for (name, (y, cb, cr)) in bars {
-		let p = StreamPlan {
-			capture: CaptureMethod::Gdigrab,
-			width: 64,
-			height: 64,
-			..plan(HwEncoder::Software)
-		};
+	// gdigrab (its own resize carries the matrix) and x11grab (the explicit conversion scale).
+	for ((name, (y, cb, cr)), (capture, from, to)) in bars
+		.into_iter()
+		.flat_map(|b| [(b, (CaptureMethod::Gdigrab, "gdigrab", "desktop")), (b, (CaptureMethod::X11grab, "x11grab", ":0.0"))])
+	{
+		let p = StreamPlan { capture, width: 64, height: 64, ..plan(HwEncoder::Software) };
 		let mut args = encode_command(&p).1;
-		let i = args.iter().position(|a| a == "gdigrab").unwrap() - 1;
-		let j = args.iter().position(|a| a == "desktop").unwrap();
+		let i = args.iter().position(|a| a == from).unwrap() - 1;
+		let j = args.iter().position(|a| a == to).unwrap();
 		args.splice(i..=j, ["-f", "lavfi", "-i", &format!("color=c={name}:s=64x64:r=60,format=bgr0")].map(String::from));
 		let k = args.iter().position(|a| a == "-bsf:v").unwrap();
-		let out = dir.join(format!("{name}.h264"));
+		let out = dir.join(format!("{name}-{from}.h264"));
 		args.truncate(k);
 		args.extend(["-frames:v", "1", "-f", "h264", "-y"].map(String::from));
 		args.push(out.to_string_lossy().into_owned());
@@ -896,7 +927,7 @@ fn sdr_colour_bars_through_ffmpeg() {
 		assert_eq!(px.len(), 64 * 64 * 3 / 2, "{name}");
 		let got = (px[64 * 32 + 32], px[64 * 64 + 16 * 32 + 16], px[64 * 64 + 32 * 32 + 16 * 32 + 16]);
 		let near = |a: u8, b: u8| a.abs_diff(b) <= 3;
-		assert!(near(got.0, y) && near(got.1, cb) && near(got.2, cr), "{name}: got {got:?}, BT.709 limited {:?}", (y, cb, cr));
+		assert!(near(got.0, y) && near(got.1, cb) && near(got.2, cr), "{name} {from}: got {got:?}, BT.709 limited {:?}", (y, cb, cr));
 		let info = std::process::Command::new(&ffmpeg).args(["-hide_banner", "-i"]).arg(&out).output().unwrap();
 		let info = String::from_utf8_lossy(&info.stderr);
 		assert!(info.contains("yuv420p(tv, bt709"), "{name}: VUI not BT.709 limited: {info}");

@@ -104,8 +104,12 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 ///   frames too: primaries + transfer only for an RGB capture (the conversion picks matrix
 ///   and range), all four for a capture that is YUV already ([`yuv_source`]), so nothing is
 ///   converted there.
-/// * The `scale` filters this function writes itself name the matrix explicitly
-///   ([`SDR_SCALE_OPTS`]), so an older ffmpeg found on PATH still converts BT.709 there.
+/// * Every swscale conversion of an RGB capture is a `scale` this module writes itself with
+///   the matrix named ([`SDR_SCALE_OPTS`]): x11grab / gdigrab here, the ddagrab CPU bounces
+///   in `CaptureMethod::input_args`. An ffmpeg older than 7.1 (the Rockchip PPA build the
+///   OPi5 .deb ships, a system `/usr/bin/ffmpeg` on linux-arm64) still converts with swscale's
+///   BT.601 default wherever it inserts the scaler itself, which would contradict the tag.
+///   The ddagrab GPU scalers name it too (`scale_cuda` / `vpp_qsv` `out_color_matrix`).
 const SDR_ENCODER_OPTS: [&str; 8] = [
 	"-colorspace",
 	"bt709",
@@ -118,7 +122,7 @@ const SDR_ENCODER_OPTS: [&str; 8] = [
 ];
 const SDR_TAG_RGB: &str = "setparams=color_primaries=bt709:color_trc=bt709";
 const SDR_TAG_YUV: &str = "setparams=colorspace=bt709:range=tv:color_primaries=bt709:color_trc=bt709";
-const SDR_SCALE_OPTS: &str = "out_color_matrix=bt709:out_range=tv";
+pub(super) const SDR_SCALE_OPTS: &str = "out_color_matrix=bt709:out_range=tv";
 
 /// Does the capture hand over YUV frames the OS already converted (macOS ScreenCaptureKit
 /// NV12 video range = BT.709, avfoundation's UYVY)? Those are labelled, not re-converted.
@@ -191,10 +195,18 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		let colour = if sdr { format!(":{SDR_SCALE_OPTS}") } else { String::new() };
 		vf.push(format!("scale={}:{}{colour}", plan.width, plan.height));
 	}
-	// The GPU upload below takes NV12 from an auto-inserted scaler: name the conversion, so it
-	// never depends on the colour negotiation crossing `hwupload` (the scale above, when there
-	// is one, already converts into the upload's NV12).
-	if sdr && !scaled && !yuv_source(plan) && matches!(plan.encoder, HwEncoder::Vaapi | HwEncoder::Vulkan) {
+	// Any other RGB capture would reach swscale through an AUTO-inserted scaler (the encoder's
+	// `-pix_fmt`, the VA-API / Vulkan upload's NV12): name the conversion here, so it never
+	// depends on FFmpeg 7.1+'s colour negotiation (an older ffmpeg converts BT.601 there) or on
+	// it crossing `hwupload`. The scale above, when there is one, already converts. An encoder
+	// that takes the RGB itself gets it through unchanged. Not kmsgrab (DRM-PRIME hw frames,
+	// no swscale) unless the old VA-API / Vulkan upload chain applies.
+	let cpu_rgb = complex.is_none() && plan.capture != CaptureMethod::Kmsgrab;
+	if sdr
+		&& !scaled
+		&& !yuv_source(plan)
+		&& (cpu_rgb || matches!(plan.encoder, HwEncoder::Vaapi | HwEncoder::Vulkan))
+	{
 		vf.push(format!("scale={SDR_SCALE_OPTS}"));
 	}
 

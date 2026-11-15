@@ -148,13 +148,19 @@ impl CaptureMethod {
 					(false, true) => "p010le",
 					(false, false) => "yuv420p",
 				};
+				// SDR: every RGB → YUV conversion of the chain names Pulsar's BT.709 limited rule
+				// (`command::SDR_SCALE_OPTS`; the stream is tagged so): swscale's default is
+				// BT.601, and the GPU scalers' default is not pinned either. HDR keeps its own.
+				let sdr = if eff_hdr { String::new() } else { format!(":{}", super::command::SDR_SCALE_OPTS) };
 				let filter = match plan.encoder {
 					// NVENC + display on the NVIDIA GPU: fully zero-copy (D3D11→CUDA→NVENC).
 					// HDR/YUV444 on the CUDA path would require scale_cuda to produce
 					// p010le/yuv444p10le — risky driver/format compat; degraded to SDR 4:2:0
 					// (eff_hdr/eff_yuv444 are false for this branch, matching encode_command).
+					// scale_cuda converts the BGRA itself: its `out_color_matrix` / `out_range`
+					// (FFmpeg 8, the bundled build) pin BT.709 limited.
 					HwEncoder::Nvenc if plan.gpu_zerocopy => format!(
-						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=cuda,scale_cuda={w}:{h}:format=nv12"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=cuda,scale_cuda={w}:{h}:format=nv12{sdr}"
 					),
 					// NVENC where the zero-copy CUDA map isn't available (hybrid laptop: the
 					// display is on the iGPU, so ffmpeg's `hwmap=derive_device=cuda` fails with
@@ -179,7 +185,7 @@ impl CaptureMethod {
 					// (download + BGRA→NV12 + scale) — far lighter than the old yuv420p path.
 					// AMF goes through cpu_fmt (eff_hdr/eff_yuv444 honored; AMF supports 10-bit).
 					HwEncoder::Amf => format!(
-						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={f}",
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h}{sdr},format={f}",
 						f = if eff_hdr || eff_yuv444 { cpu_fmt } else { "nv12" }
 					),
 					// Windows Media Foundation (the Qualcomm / ARM hardware MFT): it accepts only
@@ -189,19 +195,21 @@ impl CaptureMethod {
 					// the QCOM MFT has no 10-bit / 4:4:4 input (measured 2026-11-10, p010le
 					// rejected), so HDR/YUV444 are clamped to SDR 4:2:0 (effective_hdr_yuv444).
 					HwEncoder::MediaFoundation => format!(
-						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format=nv12"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h}{sdr},format=nv12"
 					),
 					// Intel QSV: fully on-GPU. scale_qsv only supports nv12 and p010 (QSV
 					// internal 10-bit); yuv444 via QSV on ddagrab is not reliably supported.
 					// HDR/YUV444 degraded to SDR 4:2:0 (eff_hdr/eff_yuv444 false for QSV
-					// ddagrab, matching encode_command).
+					// ddagrab, matching encode_command). `vpp_qsv` = scale_qsv's own VPP with the
+					// colour options scale_qsv lacks (`out_color_matrix` / `out_range`), so the
+					// conversion is pinned BT.709 limited instead of the VPP's default.
 					HwEncoder::Qsv => format!(
-						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=qsv,format=qsv,scale_qsv=w={w}:h={h}:format=nv12"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=qsv,format=qsv,vpp_qsv=w={w}:h={h}:format=nv12{sdr}"
 					),
 					// Software / VAAPI / VideoToolbox / Auto: CPU frame (yuv420p, or the HDR/444
 					// format when requested) as before.
 					_ => format!(
-						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={cpu_fmt}"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h}{sdr},format={cpu_fmt}"
 					),
 				};
 				vec![s("-filter_complex"), filter]

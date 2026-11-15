@@ -530,19 +530,20 @@ unsafe fn find_display(content: &AnyObject, id: u32) -> Result<Retained<AnyObjec
 /// display is mapped into the BT.709 gamut, as a Windows desktop already is), so the stream
 /// says what the VideoToolbox / ffmpeg encoders write into the VUI and every client decodes.
 /// Without it the frames follow the display's own colour space. Both setters are looked up
-/// (macOS 12.3+); a missing constant leaves SCK's default.
+/// (macOS 12.3+); a missing constant leaves SCK's default. The CF strings go through
+/// `msg_send!` as [`ffi::CFStringObj`] pointers so objc2's debug encoding check matches.
 ///
 /// # Safety
 /// `cfg` must be an `SCStreamConfiguration`.
 pub unsafe fn set_sdr_colour(cfg: &AnyObject) {
 	if responds(cfg, sel!(setColorMatrix:)) {
 		if let Some(m) = ffi::cf_string_const(c"kCGDisplayStreamYCbCrMatrix_ITU_R_709_2") {
-			let _: () = msg_send![cfg, setColorMatrix: m];
+			let _: () = msg_send![cfg, setColorMatrix: m.cast::<ffi::CFStringObj>()];
 		}
 	}
 	if responds(cfg, sel!(setColorSpaceName:)) {
 		if let Some(cs) = ffi::cf_string_const(c"kCGColorSpaceSRGB") {
-			let _: () = msg_send![cfg, setColorSpaceName: cs];
+			let _: () = msg_send![cfg, setColorSpaceName: cs.cast::<ffi::CFStringObj>()];
 		}
 	}
 }
