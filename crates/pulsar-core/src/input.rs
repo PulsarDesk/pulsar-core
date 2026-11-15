@@ -36,6 +36,11 @@ pub mod mouse_button;
 /// character → key lookup over its own layout, and the macOS host's evdev → virtual key table.
 pub mod keytables;
 
+/// Host-side input permission checks (Linux uinput, macOS Accessibility, Windows UIPI) and
+/// the [`InputFailure`] wire token the host sends the client as `DataMsg::InputUnavailable`.
+pub mod permission;
+pub use permission::InputFailure;
+
 pub use types::{
 	axis_to_i16, button, create_virtual_pad, create_virtual_pad_checked, create_virtual_pad_target,
 	ds4_report_fields, touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons,

@@ -589,6 +589,10 @@ enum DataMsgWire {
 		#[serde(default)]
 		reason: String,
 	},
+	InputUnavailable {
+		#[serde(default)]
+		reason: String,
+	},
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -636,6 +640,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::Displays(d) => DataMsg::Displays(d),
 			DataMsgWire::StreamedDisplay(i) => DataMsg::StreamedDisplay(i),
 			DataMsgWire::PadUnavailable { slot, reason } => DataMsg::PadUnavailable { slot, reason },
+			DataMsgWire::InputUnavailable { reason } => DataMsg::InputUnavailable { reason },
 		}
 	}
 }
@@ -887,6 +892,18 @@ pub enum DataMsg {
 	/// compat (an old client ignores the unknown variant).
 	PadUnavailable {
 		slot: u8,
+		#[serde(default)]
+		reason: String,
+	},
+	/// Host → client: the client's keyboard / mouse / pen / touch does not reach the host's
+	/// desktop (Linux: `/dev/uinput` not writable; macOS: no Accessibility grant; Android: the
+	/// control service is off) or the window in front (Windows: an elevated window while the
+	/// host is not elevated — UIPI). `reason` is an
+	/// [`InputFailure`](crate::input::InputFailure) wire token
+	/// ([`InputFailure::as_wire`](crate::input::InputFailure::as_wire)); the client shows a
+	/// localized notice for it. Sent at session start and when the condition first shows,
+	/// rate-limited by the host. Appended for additive wire compat (an old client ignores it).
+	InputUnavailable {
 		#[serde(default)]
 		reason: String,
 	},
@@ -1262,6 +1279,14 @@ mod tests {
 		assert_eq!(QualityPref::default(), QualityPref::Balanced);
 	}
 
+	#[test]
+	fn input_unavailable_decodes_without_reason_and_wire_shape_is_stable() {
+		let m: DataMsg = serde_json::from_str(r#"{"InputUnavailable":{}}"#).unwrap();
+		assert_eq!(m, DataMsg::InputUnavailable { reason: String::new() });
+		let json = serde_json::to_string(&DataMsg::InputUnavailable { reason: "win_elevated".into() }).unwrap();
+		assert_eq!(json, r#"{"InputUnavailable":{"reason":"win_elevated"}}"#);
+	}
+
 	/// Guard against the DataMsgWire shadow-enum drift trap (bug C21).
 	///
 	/// Every `DataMsg` variant must survive a serialize→deserialize roundtrip
@@ -1337,6 +1362,8 @@ mod tests {
 			DataMsg::Displays(vec![]),
 			DataMsg::StreamedDisplay(1),
 			DataMsg::PadUnavailable { slot: 1, reason: "mac_entitlement".into() },
+			DataMsg::InputUnavailable { reason: "uinput_denied".into() },
+			DataMsg::InputUnavailable { reason: String::new() },
 		];
 
 		for msg in cases {

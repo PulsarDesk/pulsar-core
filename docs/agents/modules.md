@@ -101,6 +101,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `SecTaskCopyValueForEntitlement`) → `RecordingPad`. `create_virtual_pad_checked` returns the
   `PadFailure` for every OS (`vigem_missing`, `uinput_denied`, …); the app relays it as
   `DataMsg::PadUnavailable { slot, reason }`. Untested on macOS hardware.
+  **Input permission** (`input/permission.rs`): `preflight()` = can this host inject desktop
+  input at all (Linux `/dev/uinput` writable, macOS `AXIsProcessTrusted`; never prompts),
+  `foreground_window_blocked()` (Windows, keys) / `pointer_target_blocked()` (Windows,
+  clicks / scroll / pen / touch: the top-level window under the cursor) = that window belongs
+  to a higher-integrity process (token integrity RID; when the token is closed, "query yes /
+  `PROCESS_VM_READ` no" = no-read-up) so UIPI drops the input; the secure desktop (UAC
+  prompt, lock screen: input desktop not `Default`) is reported as `SECURE_DESKTOP` (-1).
+  `InputFailure` wire tokens (`uinput_denied`, `mac_accessibility`, `win_elevated`,
+  `win_secure_desktop`, `android_control_off`, `android_control_missing`, unknown → `unavailable`) travel as
+  `DataMsg::InputUnavailable { reason }`.
   **Touchpad pinch injection** (`DesktopInput::pinch`, `InputEvent::Pinch`, advertised by the
   desktop host as `FEAT_PINCH`): Windows = two-finger touch injection (`windows.rs`); Linux =
   a lazily created virtual uinput TOUCHPAD ("Pulsar Virtual Touchpad", `uinput.rs`) whose two
