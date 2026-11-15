@@ -205,7 +205,7 @@ pub fn wayland_pipeline_sized(
 	format!(
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! video/x-raw,format=NV12 \
+		 ! videoconvert ! video/x-raw,format=NV12,colorimetry=bt709 \
 		 {scale}! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
@@ -252,7 +252,7 @@ pub fn x11_pipeline(
 		format!(
 			"! video/x-raw,framerate={fps}/1 \
 			 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-			 ! videoconvert ! video/x-raw,format=I420 "
+			 ! videoconvert ! video/x-raw,format=I420,colorimetry=bt709 "
 		)
 	};
 	// `PULSAR_DAMAGE=1` (opt-in, DEFAULT OFF): switch ximagesrc to damage-event capture
@@ -296,7 +296,7 @@ pub fn x11_window_pipeline(
 		"ximagesrc display-name={display} xid={xid} use-damage=0 show-pointer=true \
 		 ! video/x-raw,framerate={fps}/1 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! videoscale ! video/x-raw,format=I420,width={w},height={h},pixel-aspect-ratio=1/1 \
+		 ! videoconvert ! videoscale ! video/x-raw,format=I420,colorimetry=bt709,width={w},height={h},pixel-aspect-ratio=1/1 \
 		 ! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
@@ -356,7 +356,7 @@ pub fn probe_pipeline(fragment: &str) -> String {
 	format!(
 		"videotestsrc num-buffers=2 \
 		 ! video/x-raw,width=640,height=360,framerate=30/1 \
-		 ! videoconvert ! video/x-raw,format=NV12 \
+		 ! videoconvert ! video/x-raw,format=NV12,colorimetry=bt709 \
 		 ! {fragment} \
 		 ! fakesink sync=false"
 	)

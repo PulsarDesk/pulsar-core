@@ -481,7 +481,7 @@ pub fn self_check(encoder_fragment: &str) -> Result<(), String> {
 	}
 	let desc = format!(
 		"videotestsrc num-buffers=30 ! video/x-raw,width=640,height=360,framerate=30/1 \
-		 ! videoconvert ! video/x-raw,format=NV12 ! {encoder_fragment} ! fakesink sync=false"
+		 ! videoconvert ! video/x-raw,format=NV12,colorimetry=bt709 ! {encoder_fragment} ! fakesink sync=false"
 	);
 	let pipeline = gst::parse::launch(&desc)
 		.map_err(|e| format!("parse: {e}"))?

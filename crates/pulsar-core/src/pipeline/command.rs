@@ -1,6 +1,6 @@
 //! ffmpeg/ffplay command builders for the host encode + client decode paths.
 
-use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec};
+use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec, WindowInput};
 use crate::service::LossRecovery;
 
 /// Refresh period (frames) of the loss-recovery modes: after a loss the picture is whole
@@ -90,6 +90,42 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 	}
 }
 
+/// Pulsar's SDR colour rule: **BT.709, limited (16-235) range** on every host and every
+/// client. Without a colour description ffmpeg converts RGB captures with the BT.601 matrix
+/// and writes nothing into the VUI, so each client guessed (Windows BT.601, Linux / macOS
+/// BT.709: skin tones and reds / greens shifted between them).
+///
+/// * The encoder options `-colorspace bt709 -color_range tv` (plus primaries / transfer for
+///   the encoders that read them from the context) make ffmpeg's colour negotiation
+///   (FFmpeg 7.1+, the bundled build) convert RGB → YUV with the BT.709 matrix into limited
+///   range, and the encoder writes that into the VUI / sequence header.
+/// * FFmpeg 7.1+ takes primaries and transfer from the FRAMES, not from those options (an
+///   untagged capture left them "unknown" in the VUI), so a `setparams` tag filter labels the
+///   frames too: primaries + transfer only for an RGB capture (the conversion picks matrix
+///   and range), all four for a capture that is YUV already ([`yuv_source`]), so nothing is
+///   converted there.
+/// * The `scale` filters this function writes itself name the matrix explicitly
+///   ([`SDR_SCALE_OPTS`]), so an older ffmpeg found on PATH still converts BT.709 there.
+const SDR_ENCODER_OPTS: [&str; 8] = [
+	"-colorspace",
+	"bt709",
+	"-color_primaries",
+	"bt709",
+	"-color_trc",
+	"bt709",
+	"-color_range",
+	"tv",
+];
+const SDR_TAG_RGB: &str = "setparams=color_primaries=bt709:color_trc=bt709";
+const SDR_TAG_YUV: &str = "setparams=colorspace=bt709:range=tv:color_primaries=bt709:color_trc=bt709";
+const SDR_SCALE_OPTS: &str = "out_color_matrix=bt709:out_range=tv";
+
+/// Does the capture hand over YUV frames the OS already converted (macOS ScreenCaptureKit
+/// NV12 video range = BT.709, avfoundation's UYVY)? Those are labelled, not re-converted.
+fn yuv_source(plan: &StreamPlan) -> bool {
+	matches!(plan.window, Some(WindowInput::RawNv12 { .. })) || plan.capture == CaptureMethod::AvFoundation
+}
+
 /// Build the host capture+encode command: `(program, args)`. Program is always
 /// `ffmpeg` (the bundled binary is substituted by the caller); the encoder is
 /// selected via ffmpeg's `-c:v` flag, no external wrapper.
@@ -134,12 +170,32 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 
 	// Screen capture (platform-specific).
 	a.extend(plan.capture.input_args(plan));
+	// SDR colour (see `SDR_ENCODER_OPTS`); HDR keeps its own signalling below.
+	let sdr = !plan.effective_hdr_yuv444().0;
+	let sdr_tag = if yuv_source(plan) { SDR_TAG_YUV } else { SDR_TAG_RGB };
 	// One `-vf` chain (a second `-vf` would replace the first).
 	let mut vf: Vec<String> = Vec::new();
+	// A capture whose chain is a `-filter_complex` (ddagrab) takes the tag at its end: a
+	// `-vf` cannot be added to a stream that comes out of a complex graph.
+	let complex = a.iter().position(|x| x == "-filter_complex").map(|i| i + 1).filter(|&i| i < a.len());
+	match complex {
+		Some(i) if sdr => a[i] = format!("{},{sdr_tag}", a[i]),
+		// YUV frames are labelled before anything reads them (no conversion in between).
+		None if sdr && yuv_source(plan) => vf.push(sdr_tag.to_string()),
+		_ => {}
+	}
 	// gdigrab captures the desktop at its own size (see CaptureMethod::input_args), and so
 	// does an x11grab of one window: scale both to the plan size.
-	if plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window() {
-		vf.push(format!("scale={}:{}", plan.width, plan.height));
+	let scaled = plan.capture == CaptureMethod::Gdigrab || plan.captures_x11_window();
+	if scaled {
+		let colour = if sdr { format!(":{SDR_SCALE_OPTS}") } else { String::new() };
+		vf.push(format!("scale={}:{}{colour}", plan.width, plan.height));
+	}
+	// The GPU upload below takes NV12 from an auto-inserted scaler: name the conversion, so it
+	// never depends on the colour negotiation crossing `hwupload` (the scale above, when there
+	// is one, already converts into the upload's NV12).
+	if sdr && !scaled && !yuv_source(plan) && matches!(plan.encoder, HwEncoder::Vaapi | HwEncoder::Vulkan) {
+		vf.push(format!("scale={SDR_SCALE_OPTS}"));
 	}
 
 	// VA-API / Vulkan upload CPU frames into a GPU hwframe before the encoder. The upload
@@ -152,6 +208,11 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 			(false, false) => "nv12",
 		};
 		vf.push(format!("format={up},hwupload"));
+	}
+	// An RGB capture is labelled at the end of the chain (primaries / transfer only, so its
+	// place does not change the conversion).
+	if sdr && complex.is_none() && !yuv_source(plan) {
+		vf.push(sdr_tag.to_string());
 	}
 	if !vf.is_empty() {
 		a.extend([s("-vf"), vf.join(",")]);
@@ -312,6 +373,9 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		// (the "stream runs, screen stays black" failure). HW encoders keep their native
 		// formats (nv12/hwframes) via their own format= chains.
 		a.extend([s("-pix_fmt"), s("yuv420p")]);
+	}
+	if sdr {
+		a.extend(SDR_ENCODER_OPTS.iter().map(|x| s(x)));
 	}
 
 	// RTP/H.264 so the client can depacketize and feed WebCodecs in the webview.
