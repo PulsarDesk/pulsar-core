@@ -361,3 +361,71 @@ pub fn probe_pipeline(fragment: &str) -> String {
 		 ! fakesink sync=false"
 	)
 }
+
+/// Per-frame encode time of an IN-PROCESS gst encoder, fed from pad probes on the encoder
+/// element itself: [`Self::frame_in`] when a raw frame enters its sink pad,
+/// [`Self::frame_out`] when the encoded frame with the same PTS leaves its src pad. That is
+/// the real time the frame spent in the encoder (what the in-process libav host reports as
+/// "ms kodlama"), not the gap between two encoded frames that the `gst-launch -v` pace meter
+/// has to settle for — which reads ~16.7 at 60 fps however fast the encoder is.
+///
+/// Pure bookkeeping (no gst types) so it is unit-tested on every OS; the probes live in
+/// `capture/live.rs` (Linux). Frames that never come out (an encoder that drops one) are
+/// forgotten once a later frame comes out, and at most [`Self::MAX_INFLIGHT`] are held.
+#[derive(Debug, Default)]
+pub struct EncodeTimer {
+	inflight: std::collections::VecDeque<(u64, std::time::Instant)>,
+	ema_ms: f32,
+	last_report: Option<std::time::Instant>,
+}
+
+impl EncodeTimer {
+	/// Raw frames waiting for their encoded output, at most (an encoder never holds this many
+	/// in a no-B-frame low-latency setup; the bound only keeps a PTS-rewriting element from
+	/// growing the queue forever).
+	pub const MAX_INFLIGHT: usize = 64;
+	/// How often [`Self::frame_out`] hands out the smoothed value.
+	pub const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+	/// A raw frame with presentation time `pts_ns` entered the encoder at `now`.
+	pub fn frame_in(&mut self, pts_ns: u64, now: std::time::Instant) {
+		if self.inflight.len() >= Self::MAX_INFLIGHT {
+			self.inflight.pop_front();
+		}
+		self.inflight.push_back((pts_ns, now));
+	}
+
+	/// The encoded frame with presentation time `pts_ns` left the encoder at `now`. Returns
+	/// the smoothed encode time (ms) when a report is due (about once per
+	/// [`Self::REPORT_EVERY`]), else `None`. An output whose PTS never went in (codec headers,
+	/// an element that re-stamps) is ignored.
+	pub fn frame_out(&mut self, pts_ns: u64, now: std::time::Instant) -> Option<f32> {
+		let idx = self.inflight.iter().position(|(p, _)| *p == pts_ns)?;
+		let (_, t_in) = self.inflight[idx];
+		// Everything older than this frame never came out: forget it.
+		self.inflight.drain(..=idx);
+		let ms = now.saturating_duration_since(t_in).as_secs_f32() * 1000.0;
+		self.ema_ms = if self.ema_ms == 0.0 { ms } else { self.ema_ms * 0.9 + ms * 0.1 };
+		match self.last_report {
+			None => {
+				self.last_report = Some(now);
+				None
+			}
+			Some(at) if now.saturating_duration_since(at) >= Self::REPORT_EVERY => {
+				self.last_report = Some(now);
+				Some(self.ema_ms)
+			}
+			Some(_) => None,
+		}
+	}
+
+	/// The current smoothed encode time (ms); 0 before the first encoded frame.
+	pub fn ema_ms(&self) -> f32 {
+		self.ema_ms
+	}
+
+	/// Raw frames currently inside the encoder.
+	pub fn inflight(&self) -> usize {
+		self.inflight.len()
+	}
+}
