@@ -56,9 +56,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `CLIENT_KEYS` (every evdev code a client sends; each host table is tested against it), the
   macOS host table `mac_vk` (ISO swap), the Linux host's char → key table builder
   (`build_char_table`, fed from libxkbcommon by `host_keymap_linux.rs`: Wayland `wl_keyboard`
-  keymap / X11 `_XKB_RULES_NAMES`; misses go to an X11 scratch keycode or the GTK/IBus
-  Ctrl+Shift+U entry), and the wire mouse button ids (3 = back, 4 = forward, `FEAT_MOUSE_X`;
-  hosts ignore unknown ids). Linux code here is type-checked from Windows with
+  keymap / X11 `_XKB_RULES_NAMES`, read on a process-wide worker thread, never on the input
+  path; main-block keys win over extended ones; a Caps table when KEY_CAPSLOCK locks Caps;
+  dead-key-only chars as dead key + Space; misses go to 32 LRU X11 scratch keycodes or the
+  GTK/IBus Ctrl+Shift+U entry), and the wire mouse button ids (3 = back, 4 = forward,
+  `FEAT_MOUSE_X`; hosts ignore unknown ids and drop side-button ups they never pressed). Linux code here is type-checked from Windows with
   `cargo check --target x86_64-unknown-linux-gnu` and `SYSTEM_DEPS_<LIB>_NO_PKG_CONFIG=1` +
   `SYSTEM_DEPS_<LIB>_LIB=<name>` for the glib/gio/gobject/gstreamer(-base/-video) sys crates.
 - `input/` — controller types/normalization + virtual pads: uinput (Linux),

@@ -13,41 +13,157 @@
 //! 3. `XKB_DEFAULT_*` environment, `/etc/X11/xorg.conf.d/00-keyboard.conf`,
 //!    `/etc/default/keyboard`, else libxkbcommon's default (`us`).
 //!
+//! The layout is read on a process-wide worker thread (Wayland: our own `wl_keyboard`, kept
+//! open, rebuilt on every keymap event; otherwise re-read every 60 s and, rate limited, when a
+//! character is missing), never on the session's input path: `type_char` only reads the last
+//! published tables (the built-in US one until the first read is done).
+//!
 //! Known limits: only the first layout group is used (a `tr,us` session switched to its
 //! second group types with the first group's keys), Caps Lock is tracked only for the
-//! presses Pulsar injects itself, and a character the layout lacks goes through
-//! [`X11Scratch`] (X11) or the Unicode entry (GTK / IBus, see `uinput.rs`).
+//! presses Pulsar injects itself (and only where KEY_CAPSLOCK locks Caps on the host layout),
+//! a character the layout has only as a dead key is typed as dead key + Space (or the dead key
+//! twice), and one the layout lacks goes through [`X11Scratch`] (X11) or the Unicode entry
+//! (GTK / IBus, see `uinput.rs`).
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use xkbcommon::xkb;
 
 use super::keytables::{
-	build_char_table, parse_default_keyboard, parse_xkb_rules_names, parse_xorg_keyboard_conf, us_layout,
-	KeyChord, XkbNames, EVDEV_ALTGR, EVDEV_LSHIFT,
+	build_char_table, build_dead_table, parse_default_keyboard, parse_xkb_rules_names, parse_xorg_keyboard_conf,
+	us_layout, us_layout_caps, DeadKey, KeyChord, ScratchSlots, XkbNames, EVDEV_ALTGR, EVDEV_LSHIFT,
 };
 
-/// The host layout's character → key table, and where it came from (for the log).
+/// The host layout's character tables, and where they came from (for the log).
 pub(super) struct HostKeymap {
+	/// Character → key + level with Caps Lock off.
 	pub table: HashMap<char, KeyChord>,
+	/// The same with Caps Lock locked (letters swap levels as the layout's key types say:
+	/// TR-Q AltGr+a 'æ' is FOUR_LEVEL_SEMIALPHABETIC and does not).
+	pub table_caps: HashMap<char, KeyChord>,
+	/// Characters this layout has only as a dead key: the chords to tap (dead key, then Space or
+	/// the dead key again).
+	pub dead: HashMap<char, Vec<KeyChord>>,
+	/// KEY_CAPSLOCK locks Caps on this layout. False under `caps:escape`, `ctrl:nocaps`,
+	/// `caps:ctrl_modifier`, `grp:caps_toggle` and the like, where a forwarded Caps press must
+	/// not flip the case of later typed letters.
+	pub caps_locks: bool,
 	pub source: &'static str,
-	pub built: Instant,
 }
 
 impl HostKeymap {
-	/// Read the host layout now (a Wayland round-trip or an X property read, plus an xkb
-	/// compile: a few ms).
-	pub fn load() -> Self {
-		let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+	/// The tables of `keymap`, or the built-in US ones when the keymap types nothing.
+	fn from_xkb(keymap: &xkb::Keymap, source: &'static str) -> Self {
+		let km = tables(keymap, source);
+		if km.table.is_empty() {
+			Self::builtin_us()
+		} else {
+			km
+		}
+	}
+
+	/// The built-in US tables: used until the worker has read the host layout, and when no
+	/// keymap compiles at all (no xkeyboard-config data on a bare server).
+	fn builtin_us() -> Self {
+		Self {
+			table: build_char_table(us_layout),
+			table_caps: build_char_table(us_layout_caps),
+			dead: HashMap::new(),
+			caps_locks: true,
+			source: "builtin-us",
+		}
+	}
+}
+
+/// The polled layout (X11 / no session) is re-read when it is this old.
+const KEYMAP_MAX_AGE: Duration = Duration::from_secs(60);
+/// A `Char` the layout lacks asks the worker to re-read it (the user may have switched
+/// layouts), at most this often.
+const KEYMAP_MISS_RELOAD: Duration = Duration::from_secs(5);
+
+/// The process-wide keymap worker: owns every blocking layout read (a Wayland connection
+/// with its round-trips, an X property read, an xkb compile: 5-50 ms, more on an RK3588 / Pi)
+/// so the session's input path never waits on one.
+struct Worker {
+	current: Arc<Mutex<Option<Arc<HostKeymap>>>>,
+	nudge: mpsc::SyncSender<()>,
+}
+
+fn worker() -> &'static Worker {
+	static WORKER: OnceLock<Worker> = OnceLock::new();
+	WORKER.get_or_init(|| {
+		let current = Arc::new(Mutex::new(None));
+		// One pending nudge is enough: more while a read runs say nothing new.
+		let (nudge, nudges) = mpsc::sync_channel(1);
+		let out = current.clone();
+		if let Err(e) = std::thread::Builder::new().name("pulsar-host-keymap".into()).spawn(move || run(out, nudges)) {
+			tracing::warn!(err = %e, "host keymap worker failed to start; typing with the built-in US layout");
+		}
+		Worker { current, nudge }
+	})
+}
+
+/// Start reading the host layout in the background (called when the injector is created, so
+/// the table is ready by the first typed character).
+pub(super) fn start() {
+	worker();
+}
+
+/// The current host layout tables. Never blocks on a layout read: the built-in US tables until
+/// the worker has published the host's.
+pub(super) fn current() -> Arc<HostKeymap> {
+	static US: OnceLock<Arc<HostKeymap>> = OnceLock::new();
+	let published = worker().current.lock().unwrap_or_else(|e| e.into_inner()).clone();
+	published.unwrap_or_else(|| US.get_or_init(|| Arc::new(HostKeymap::builtin_us())).clone())
+}
+
+/// A character was missing from the table: ask the worker to re-read the layout (rate
+/// limited there; a no-op while the Wayland keymap is watched live).
+pub(super) fn nudge() {
+	let _ = worker().nudge.try_send(());
+}
+
+fn run(current: Arc<Mutex<Option<Arc<HostKeymap>>>>, nudges: mpsc::Receiver<()>) {
+	let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+	let publish = |km: HostKeymap| {
+		tracing::info!(
+			source = km.source,
+			chars = km.table.len(),
+			caps_locks = km.caps_locks,
+			"host keyboard layout for typed characters"
+		);
+		*current.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(km));
+	};
+	// Wayland: keep our wl_keyboard and rebuild on every keymap the compositor sends (it sends
+	// a new one when the session's layouts change) — no polling.
+	if wayland_session() {
+		if let Some(mut watch) = wayland::Watch::connect() {
+			while let Some(keymap) = watch.next_keymap(&ctx) {
+				if let Some(k) = keymap {
+					publish(HostKeymap::from_xkb(&k, "wayland"));
+				}
+			}
+			tracing::info!("host keymap: Wayland connection closed, polling the layout instead");
+		}
+	}
+	loop {
 		let (keymap, source) = load_keymap(&ctx);
-		let (table, source) = match keymap.as_ref().map(char_table) {
-			Some(t) if !t.is_empty() => (t, source),
-			// No keymap compiled (no xkeyboard-config data): the built-in US table.
-			_ => (build_char_table(us_layout), "builtin-us"),
-		};
-		tracing::info!(source, chars = table.len(), "host keyboard layout for typed characters");
-		Self { table, source, built: Instant::now() }
+		publish(match keymap {
+			Some(k) => HostKeymap::from_xkb(&k, source),
+			None => HostKeymap::builtin_us(),
+		});
+		let read_at = Instant::now();
+		loop {
+			let left = (read_at + KEYMAP_MAX_AGE).saturating_duration_since(Instant::now());
+			match nudges.recv_timeout(left) {
+				Ok(()) if read_at.elapsed() >= KEYMAP_MISS_RELOAD => break,
+				Ok(()) => {} // too soon after the last read
+				Err(mpsc::RecvTimeoutError::Timeout) => break,
+				Err(mpsc::RecvTimeoutError::Disconnected) => return,
+			}
+		}
 	}
 }
 
@@ -58,7 +174,7 @@ fn wayland_session() -> bool {
 
 fn load_keymap(ctx: &xkb::Context) -> (Option<xkb::Keymap>, &'static str) {
 	if wayland_session() {
-		if let Some(k) = wayland::keymap(ctx) {
+		if let Some(k) = wayland::Watch::connect().and_then(|mut w| w.next_keymap(ctx)).flatten() {
 			return (Some(k), "wayland");
 		}
 	} else if let Some(names) = x11_rules_names() {
@@ -93,25 +209,43 @@ fn compile(ctx: &xkb::Context, n: &XkbNames) -> Option<xkb::Keymap> {
 	xkb::Keymap::new_from_names(ctx, &n.rules, &n.model, &n.layout, &n.variant, options, xkb::KEYMAP_COMPILE_NO_FLAGS)
 }
 
-/// Build the table by asking xkb what each key types with Shift and/or AltGr really pressed
-/// (the same physical keys the injector then presses), so the answer is exactly what the
-/// compositor computes for the injected events.
-fn char_table(keymap: &xkb::Keymap) -> HashMap<char, KeyChord> {
-	let held = |shift: bool, altgr: bool| {
+/// Build the tables by asking xkb what each key types with Shift and/or AltGr really pressed
+/// (the same physical keys the injector then presses) and, for the Caps table, after a real
+/// Caps Lock press — so every answer is exactly what the compositor computes for the injected
+/// events, including how this layout's key types treat Lock.
+fn tables(keymap: &xkb::Keymap, source: &'static str) -> HostKeymap {
+	let kc = |evdev: u16| xkb::Keycode::new(evdev as u32 + 8);
+	let state = |caps: bool, shift: bool, altgr: bool| {
 		let mut st = xkb::State::new(keymap);
+		if caps {
+			st.update_key(kc(58), xkb::KeyDirection::Down);
+			st.update_key(kc(58), xkb::KeyDirection::Up);
+		}
 		if shift {
-			st.update_key(xkb::Keycode::new(EVDEV_LSHIFT as u32 + 8), xkb::KeyDirection::Down);
+			st.update_key(kc(EVDEV_LSHIFT), xkb::KeyDirection::Down);
 		}
 		if altgr {
-			st.update_key(xkb::Keycode::new(EVDEV_ALTGR as u32 + 8), xkb::KeyDirection::Down);
+			st.update_key(kc(EVDEV_ALTGR), xkb::KeyDirection::Down);
 		}
 		st
 	};
-	let states = [held(false, false), held(true, false), held(false, true), held(true, true)];
-	build_char_table(|code, shift, altgr| {
-		let st = &states[shift as usize + 2 * altgr as usize];
-		char::from_u32(st.key_get_utf32(xkb::Keycode::new(code as u32 + 8))).filter(|&c| c != '\0')
-	})
+	let caps_locks = state(true, false, false).mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_LOCKED);
+	let levels = |caps: bool| {
+		[state(caps, false, false), state(caps, true, false), state(caps, false, true), state(caps, true, true)]
+	};
+	let char_table = |states: &[xkb::State; 4]| {
+		build_char_table(|code, shift, altgr| {
+			let st = &states[shift as usize + 2 * altgr as usize];
+			char::from_u32(st.key_get_utf32(kc(code))).filter(|&c| c != '\0')
+		})
+	};
+	let plain = levels(false);
+	let table = char_table(&plain);
+	let table_caps = if caps_locks { char_table(&levels(true)) } else { table.clone() };
+	let dead = build_dead_table(|code, shift, altgr| {
+		DeadKey::from_keysym(plain[shift as usize + 2 * altgr as usize].key_get_one_sym(kc(code)).raw())
+	});
+	HostKeymap { table, table_caps, dead, caps_locks, source }
 }
 
 /// The X root window's `_XKB_RULES_NAMES`, `None` without an X display.
@@ -133,11 +267,11 @@ fn x11_rules_names() -> Option<XkbNames> {
 mod wayland {
 	use std::os::fd::OwnedFd;
 	use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
-	use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle, WEnum};
+	use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 	use xkbcommon::xkb;
 
 	#[derive(Default)]
-	struct State {
+	pub(super) struct State {
 		seat: Option<wl_seat::WlSeat>,
 		has_keyboard: bool,
 		keymap: Option<(OwnedFd, u32)>,
@@ -183,31 +317,54 @@ mod wayland {
 		}
 	}
 
-	pub(super) fn keymap(ctx: &xkb::Context) -> Option<xkb::Keymap> {
-		let conn = Connection::connect_to_env().ok()?;
-		let mut queue = conn.new_event_queue();
-		let qh = queue.handle();
-		conn.display().get_registry(&qh, ());
-		let mut state = State::default();
-		queue.roundtrip(&mut state).ok()?; // globals → seat bound
-		queue.roundtrip(&mut state).ok()?; // seat capabilities
-		if !state.has_keyboard {
-			return None;
+	/// Our own `wl_keyboard`, kept for the compositor's keymap events.
+	pub(super) struct Watch {
+		conn: Connection,
+		queue: EventQueue<State>,
+		state: State,
+		keyboard: wl_keyboard::WlKeyboard,
+	}
+
+	impl Watch {
+		pub(super) fn connect() -> Option<Self> {
+			let conn = Connection::connect_to_env().ok()?;
+			let mut queue = conn.new_event_queue();
+			let qh = queue.handle();
+			conn.display().get_registry(&qh, ());
+			let mut state = State::default();
+			queue.roundtrip(&mut state).ok()?; // globals → seat bound
+			queue.roundtrip(&mut state).ok()?; // seat capabilities
+			if !state.has_keyboard {
+				return None;
+			}
+			let keyboard = state.seat.as_ref()?.get_keyboard(&qh, ());
+			Some(Self { conn, queue, state, keyboard })
 		}
-		let keyboard = state.seat.as_ref()?.get_keyboard(&qh, ());
-		queue.roundtrip(&mut state).ok()?; // keymap
-		let km = state.keymap.take().and_then(|(fd, size)| {
+
+		/// Block until the compositor sends a keymap (the first one comes right after
+		/// `get_keyboard`, later ones when the session's layouts change). `None` = the
+		/// connection is gone; `Some(None)` = a keymap that did not compile.
+		pub(super) fn next_keymap(&mut self, ctx: &xkb::Context) -> Option<Option<xkb::Keymap>> {
+			while self.state.keymap.is_none() {
+				self.queue.blocking_dispatch(&mut self.state).ok()?;
+			}
+			let (fd, size) = self.state.keymap.take()?;
 			// SAFETY: the compositor's keymap fd, `size` bytes, mapped read-only/private as the
 			// protocol requires (libxkbcommon's `new_from_fd`).
-			unsafe { xkb::Keymap::new_from_fd(ctx, fd, size as usize, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS) }
-				.ok()
-				.flatten()
-		});
-		if keyboard.version() >= 3 {
-			keyboard.release();
+			let km = unsafe {
+				xkb::Keymap::new_from_fd(ctx, fd, size as usize, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS)
+			};
+			Some(km.ok().flatten())
 		}
-		let _ = conn.flush();
-		km
+	}
+
+	impl Drop for Watch {
+		fn drop(&mut self) {
+			if self.keyboard.version() >= 3 {
+				self.keyboard.release();
+			}
+			let _ = self.conn.flush();
+		}
 	}
 }
 
@@ -218,15 +375,14 @@ mod wayland {
 pub(super) struct X11Scratch {
 	conn: x11rb::rust_connection::RustConnection,
 	syms_per: usize,
-	scratch: Vec<u8>,
-	next: usize,
-	/// Characters currently mapped on a scratch keycode.
-	mapped: HashMap<char, u8>,
+	/// Borrowed keycodes and the character on each, least recently used reused first.
+	slots: ScratchSlots,
 }
 
-/// How many keycodes the scratch remap may borrow (round-robin), so a remap for the next
-/// character doesn't race a client still translating the previous one.
-const SCRATCH_KEYCODES: usize = 4;
+/// How many keycodes the scratch remap may borrow. Enough for a language's extra letters in
+/// both cases (Turkish on a US host: 12), so each is mapped once per session and later presses
+/// cost no remap (a MappingNotify to every X client and a round-trip each).
+const SCRATCH_KEYCODES: usize = 32;
 
 impl X11Scratch {
 	/// `None` on Wayland (the compositor, not X, translates uinput keys there) or without a
@@ -243,34 +399,38 @@ impl X11Scratch {
 		let map = conn.get_keyboard_mapping(min, max - min + 1).ok()?.reply().ok()?;
 		let syms_per = map.keysyms_per_keycode as usize;
 		// Keycodes the uinput keyboard can press (evdev 1..=248 → X 9..=256).
-		let scratch: Vec<u8> = super::window_common::free_keycodes(&map.keysyms, syms_per, min, 64)
-			.into_iter()
-			.filter(|&kc| kc >= 9)
-			.take(SCRATCH_KEYCODES)
-			.collect();
-		(!scratch.is_empty()).then(|| Self { conn, syms_per, scratch, next: 0, mapped: HashMap::new() })
+		let slots = ScratchSlots::new(
+			super::window_common::free_keycodes(&map.keysyms, syms_per, min, 64)
+				.into_iter()
+				.filter(|&kc| kc >= 9)
+				.take(SCRATCH_KEYCODES),
+		);
+		(!slots.is_empty()).then(|| Self { conn, syms_per, slots })
 	}
 
-	/// The evdev code that types `c` after mapping it onto a scratch keycode.
+	/// The evdev code that types `c` after mapping it onto a scratch keycode (no X request
+	/// when `c` is still mapped from an earlier press).
 	pub fn evdev_for(&mut self, c: char) -> Option<u16> {
 		use x11rb::connection::Connection as _;
 		use x11rb::protocol::xproto::ConnectionExt as _;
-		if let Some(&kc) = self.mapped.get(&c) {
+		let sym = super::window_common::char_to_keysym(c)?;
+		let (kc, mapped) = self.slots.assign(c)?;
+		if mapped {
 			return Some(kc as u16 - 8);
 		}
-		let sym = super::window_common::char_to_keysym(c)?;
-		let kc = *self.scratch.get(self.next)?;
-		self.next = (self.next + 1) % self.scratch.len();
 		let per = self.syms_per.max(1);
 		let mut syms = vec![0u32; per];
 		syms[0] = sym;
 		if per > 1 {
 			syms[1] = sym;
 		}
-		self.conn.change_keyboard_mapping(1, kc, per as u8, &syms).ok()?.check().ok()?;
+		// Checked: the server must have applied the mapping before our key press reaches it.
+		let applied = self.conn.change_keyboard_mapping(1, kc, per as u8, &syms).ok().and_then(|c| c.check().ok());
 		let _ = self.conn.flush();
-		self.mapped.retain(|_, &mut k| k != kc);
-		self.mapped.insert(c, kc);
+		if applied.is_none() {
+			self.slots.forget(kc);
+			return None;
+		}
 		Some(kc as u16 - 8)
 	}
 }
@@ -280,7 +440,7 @@ impl Drop for X11Scratch {
 		use x11rb::connection::Connection as _;
 		use x11rb::protocol::xproto::ConnectionExt as _;
 		let per = self.syms_per.max(1);
-		for &kc in self.mapped.values() {
+		for kc in self.slots.mapped() {
 			let _ = self.conn.change_keyboard_mapping(1, kc, per as u8, &vec![0u32; per]);
 		}
 		let _ = self.conn.flush();

@@ -63,25 +63,161 @@ fn skip_for_chars(code: u16) -> bool {
 	)
 }
 
+/// The order [`build_char_table`] / [`build_dead_table`] look at keys in: the main block
+/// first (Esc..Caps Lock), then the ISO key next to Left Shift, then the extended codes. A
+/// character on the main block wins even when an extended key has it on a lower level:
+/// xkeyboard-config's `inet(evdev)` puts `(` / `)` on KEY_KPLEFTPAREN / KPRIGHTPAREN and a
+/// US pc105 keymap puts `<` / `>` on KEY_102ND, and apps that translate keycodes positionally
+/// (Wine / Proton read <LSGT> as VK_OEM_102 = `\` on a US Windows layout, some games, VNC-style
+/// forwarders) type the wrong character from those — Shift+9 / Shift+comma work everywhere.
+fn char_key_tiers() -> [Vec<u16>; 3] {
+	[(1u16..=58).collect(), vec![86], (59u16..=248).filter(|&c| c != 86).collect()]
+}
+
 /// Build the character → key table of a layout. `resolve(code, shift, altgr)` returns the
-/// character the host layout produces for evdev `code` with those levels held (no Caps /
-/// Num Lock), or `None`. Lower levels win (a char on the base level never needs Shift), then
-/// lower codes; control characters are left out (the client sends those keys as `Key`).
+/// character the host layout produces for evdev `code` with those levels held, or `None`.
+/// Main-block keys win over extended ones ([`char_key_tiers`]); within a tier lower levels win
+/// (a char on the base level never needs Shift), then lower codes. Control characters are left
+/// out (the client sends those keys as `Key`).
 pub fn build_char_table(mut resolve: impl FnMut(u16, bool, bool) -> Option<char>) -> HashMap<char, KeyChord> {
 	let mut table = HashMap::new();
-	for (shift, altgr) in [(false, false), (true, false), (false, true), (true, true)] {
-		for code in 1u16..=248 {
-			if skip_for_chars(code) {
-				continue;
+	for tier in char_key_tiers() {
+		for (shift, altgr) in [(false, false), (true, false), (false, true), (true, true)] {
+			for &code in &tier {
+				if skip_for_chars(code) {
+					continue;
+				}
+				let Some(c) = resolve(code, shift, altgr) else { continue };
+				if c.is_control() {
+					continue;
+				}
+				table.entry(c).or_insert(KeyChord { code, shift, altgr });
 			}
-			let Some(c) = resolve(code, shift, altgr) else { continue };
-			if c.is_control() {
-				continue;
-			}
-			table.entry(c).or_insert(KeyChord { code, shift, altgr });
 		}
 	}
 	table
+}
+
+/// The dead keys whose spacing character [`build_dead_table`] types. A layout that has `^`,
+/// `` ` `` or `´` only as a dead key (de, fr, us-intl) yields 0 from `xkb_state_key_get_utf32`
+/// for it, so those characters are missing from the char table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadKey {
+	Grave,
+	Acute,
+	Circumflex,
+	Tilde,
+	Diaeresis,
+}
+
+impl DeadKey {
+	/// The dead key of an XKB keysym (`dead_grave` 0xfe50 .. `dead_diaeresis` 0xfe57).
+	pub fn from_keysym(sym: u32) -> Option<Self> {
+		Some(match sym {
+			0xfe50 => Self::Grave,
+			0xfe51 => Self::Acute,
+			0xfe52 => Self::Circumflex,
+			0xfe53 => Self::Tilde,
+			0xfe57 => Self::Diaeresis,
+			_ => return None,
+		})
+	}
+
+	/// What the standard compose sequences (libX11 / xkbcommon / IBus / GTK Compose) type:
+	/// the dead key then Space, and the dead key pressed twice.
+	fn composed(self) -> [(char, bool); 2] {
+		// (char, true = dead key twice / false = dead key + Space)
+		match self {
+			Self::Grave => [('`', false), ('`', true)],
+			Self::Acute => [('\'', false), ('´', true)],
+			Self::Circumflex => [('^', false), ('^', true)],
+			Self::Tilde => [('~', false), ('~', true)],
+			Self::Diaeresis => [('"', false), ('¨', true)],
+		}
+	}
+}
+
+/// The Space key, the second key of a dead-key compose.
+const SPACE_CHORD: KeyChord = KeyChord { code: 57, shift: false, altgr: false };
+
+/// Characters the layout types only through a dead key: char → the chords to tap in order
+/// (the dead key, then Space or the dead key again). `dead_at(code, shift, altgr)` returns the
+/// dead key on that key and level. Used only for characters the char table lacks.
+pub fn build_dead_table(mut dead_at: impl FnMut(u16, bool, bool) -> Option<DeadKey>) -> HashMap<char, Vec<KeyChord>> {
+	let mut keys: Vec<(DeadKey, KeyChord)> = Vec::new();
+	for tier in char_key_tiers() {
+		for (shift, altgr) in [(false, false), (true, false), (false, true), (true, true)] {
+			for &code in &tier {
+				if skip_for_chars(code) {
+					continue;
+				}
+				if let Some(d) = dead_at(code, shift, altgr) {
+					if !keys.iter().any(|&(k, _)| k == d) {
+						keys.push((d, KeyChord { code, shift, altgr }));
+					}
+				}
+			}
+		}
+	}
+	let mut table = HashMap::new();
+	// "Dead key + Space" before "dead key twice": one key less to go wrong.
+	for twice in [false, true] {
+		for &(d, chord) in &keys {
+			for (c, t) in d.composed() {
+				if t == twice {
+					table.entry(c).or_insert_with(|| vec![chord, if twice { chord } else { SPACE_CHORD }]);
+				}
+			}
+		}
+	}
+	table
+}
+
+/// Least-recently-used assignment of characters to the keycodes the Linux X11 host borrows
+/// for characters its layout lacks (`host_keymap_linux::X11Scratch`). With enough slots a
+/// language's extra letters are each mapped once per session; every later press of one costs
+/// no `ChangeKeyboardMapping` (a MappingNotify to every X client plus a round-trip), and a slot
+/// is reused only long after its last press, so no app is still translating it.
+pub struct ScratchSlots {
+	/// (keycode, character mapped on it, last use)
+	slots: Vec<(u8, Option<char>, u64)>,
+	tick: u64,
+}
+
+impl ScratchSlots {
+	pub fn new(keycodes: impl IntoIterator<Item = u8>) -> Self {
+		Self { slots: keycodes.into_iter().map(|kc| (kc, None, 0)).collect(), tick: 0 }
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.slots.is_empty()
+	}
+
+	/// The keycode for `c`: `(keycode, true)` when `c` is already mapped on it, `(keycode,
+	/// false)` when the caller must map `c` onto it first (an unused or the least recently used
+	/// slot, now recorded as `c`'s). `None` without slots.
+	pub fn assign(&mut self, c: char) -> Option<(u8, bool)> {
+		self.tick += 1;
+		if let Some(s) = self.slots.iter_mut().find(|s| s.1 == Some(c)) {
+			s.2 = self.tick;
+			return Some((s.0, true));
+		}
+		let s = self.slots.iter_mut().min_by_key(|s| (s.1.is_some(), s.2))?;
+		*s = (s.0, Some(c), self.tick);
+		Some((s.0, false))
+	}
+
+	/// The mapping of `keycode` failed: it holds nothing now.
+	pub fn forget(&mut self, keycode: u8) {
+		if let Some(s) = self.slots.iter_mut().find(|s| s.0 == keycode) {
+			s.1 = None;
+		}
+	}
+
+	/// Keycodes that currently carry a character (to restore on drop).
+	pub fn mapped(&self) -> impl Iterator<Item = u8> + '_ {
+		self.slots.iter().filter(|s| s.1.is_some()).map(|s| s.0)
+	}
 }
 
 /// The US layout as a [`build_char_table`] resolver: the Linux host's last resort when no
@@ -104,6 +240,12 @@ pub fn us_layout(code: u16, shift: bool, altgr: bool) -> Option<char> {
 	})
 }
 
+/// [`us_layout`] with Caps Lock on: letters swap levels, everything else is unaffected.
+pub fn us_layout_caps(code: u16, shift: bool, altgr: bool) -> Option<char> {
+	let letter = us_layout(code, false, false).is_some_and(|c| c.is_ascii_alphabetic());
+	us_layout(code, shift != letter, altgr)
+}
+
 /// The key a control character is typed with on every layout (Enter / Tab / Backspace / Esc).
 pub fn control_char_key(c: char) -> Option<u16> {
 	Some(match c {
@@ -120,17 +262,6 @@ pub fn control_char_key(c: char) -> Option<u16> {
 /// (Ctrl+Shift+U, the digits, Space).
 pub fn unicode_hex(c: char) -> String {
 	format!("{:x}", c as u32)
-}
-
-/// With Caps Lock on, a letter's case comes out flipped: type the other level instead.
-/// Only for characters that have a case (digits and symbols ignore Caps Lock).
-pub fn caps_adjust(c: char, chord: KeyChord, caps_on: bool) -> KeyChord {
-	let cased = c.is_lowercase() || c.is_uppercase();
-	if caps_on && cased {
-		KeyChord { shift: !chord.shift, ..chord }
-	} else {
-		chord
-	}
 }
 
 /// Key edges `(evdev code, 1 = down / 0 = up)` that tap `chord` given which keys the host
@@ -515,14 +646,73 @@ mod tests {
 		assert_eq!(k('0'), Some((11, false)));
 		// Every printable ASCII char.
 		assert_eq!((' '..='~').filter(|c| t.contains_key(c)).count(), 95);
+		let caps = build_char_table(us_layout_caps);
+		assert_eq!(caps[&'a'], KeyChord { code: 30, shift: true, altgr: false });
+		assert_eq!(caps[&'A'], KeyChord { code: 30, shift: false, altgr: false });
+		assert_eq!(caps[&'1'], KeyChord { code: 2, shift: false, altgr: false });
+		assert_eq!(caps[&'!'], KeyChord { code: 2, shift: true, altgr: false });
 	}
 
 	#[test]
-	fn caps_lock_flips_only_cased_chars() {
-		let a = KeyChord { code: 30, shift: false, altgr: false };
-		assert!(caps_adjust('a', a, true).shift);
-		assert!(!caps_adjust('a', a, false).shift);
-		assert!(!caps_adjust('1', KeyChord { code: 2, ..a }, true).shift);
+	fn main_block_wins_over_extended_keys() {
+		// US pc105 with inet(evdev): '(' / ')' also on KEY_KPLEFTPAREN / KPRIGHTPAREN (base
+		// level), '<' / '>' also on KEY_102ND (base / Shift).
+		let t = build_char_table(|code, shift, altgr| match (code, shift, altgr) {
+			(179, false, false) => Some('('),
+			(180, false, false) => Some(')'),
+			(86, false, false) => Some('<'),
+			(86, true, false) => Some('>'),
+			_ => us_layout(code, shift, altgr),
+		});
+		let k = |c| t.get(&c).map(|k| (k.code, k.shift, k.altgr));
+		assert_eq!(k('('), Some((10, true, false)));
+		assert_eq!(k(')'), Some((11, true, false)));
+		assert_eq!(k('<'), Some((51, true, false)));
+		assert_eq!(k('>'), Some((52, true, false)));
+		// Only on an extended key: still typed with it.
+		let t = build_char_table(|code, _, _| (code == 179).then_some('('));
+		assert_eq!(t[&'('].code, 179);
+		// TR-Q: '<' exists only on KEY_102ND, so that key it is.
+		assert_eq!(build_char_table(tr_q)[&'<'].code, 86);
+	}
+
+	#[test]
+	fn scratch_slots_reuse_mapped_chars_and_evict_the_oldest() {
+		let mut s = ScratchSlots::new([200, 201, 202]);
+		assert_eq!(s.assign('ş'), Some((200, false)));
+		assert_eq!(s.assign('ğ'), Some((201, false)));
+		assert_eq!(s.assign('ş'), Some((200, true)));
+		assert_eq!(s.assign('ı'), Some((202, false)));
+		// Full: 'ğ' (201) is the least recently used, 'ş' was used after it.
+		assert_eq!(s.assign('ö'), Some((201, false)));
+		assert_eq!(s.assign('ş'), Some((200, true)));
+		s.forget(202);
+		assert_eq!(s.assign('ü'), Some((202, false)));
+		let mut m: Vec<u8> = s.mapped().collect();
+		m.sort();
+		assert_eq!(m, vec![200, 201, 202]);
+		assert_eq!(ScratchSlots::new([]).assign('x'), None);
+	}
+
+	#[test]
+	fn dead_keys_type_their_spacing_characters() {
+		// de: '^' = dead_circumflex on KEY_GRAVE, '´' / '`' = dead_acute / dead_grave on KEY_EQUAL.
+		let t = build_dead_table(|code, shift, altgr| match (code, shift, altgr) {
+			(41, false, false) => Some(DeadKey::Circumflex),
+			(13, false, false) => Some(DeadKey::Acute),
+			(13, true, false) => Some(DeadKey::Grave),
+			_ => None,
+		});
+		let circ = KeyChord { code: 41, shift: false, altgr: false };
+		let acute = KeyChord { code: 13, shift: false, altgr: false };
+		let grave = KeyChord { code: 13, shift: true, altgr: false };
+		assert_eq!(t[&'^'], vec![circ, SPACE_CHORD]);
+		assert_eq!(t[&'`'], vec![grave, SPACE_CHORD]);
+		assert_eq!(t[&'´'], vec![acute, acute]);
+		assert_eq!(t[&'\''], vec![acute, SPACE_CHORD]);
+		assert!(!t.contains_key(&'~'));
+		assert_eq!(DeadKey::from_keysym(0xfe57), Some(DeadKey::Diaeresis));
+		assert_eq!(DeadKey::from_keysym(0x5e), None);
 	}
 
 	#[test]

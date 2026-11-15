@@ -220,6 +220,10 @@ impl WindowInput {
 		let Some((bit, down_msg, up_msg, x)) = button_msgs(button) else {
 			return; // unknown button id: ignored, never a left click
 		};
+		let was_held = self.btn_mask & bit != 0;
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
+		}
 		if down {
 			self.btn_mask |= bit;
 		} else {

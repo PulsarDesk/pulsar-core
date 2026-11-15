@@ -534,10 +534,9 @@ impl DesktopInput {
 		let Some((data, flag)) = button_input(button, down) else {
 			return;
 		};
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
 		}
 		send_mouse(0, 0, data, flag);
 	}

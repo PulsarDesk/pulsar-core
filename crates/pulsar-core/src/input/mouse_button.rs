@@ -28,6 +28,17 @@ pub const fn is_side(button: u8) -> bool {
 	matches!(button, BACK | FORWARD)
 }
 
+/// Whether a host injector drops this edge: the release of a side button it never pressed.
+/// Clients release every button whenever they let go of control (blur, Ctrl+Alt+Z, free-cursor
+/// hover-out), and a stray side-button release is not inert: Windows' DefWindowProc turns
+/// WM_XBUTTONUP into WM_APPCOMMAND BROWSER_BACKWARD / FORWARD and macOS apps navigate on the
+/// other-mouse-up, so the app under the host cursor would go back and forward. Left / right /
+/// middle releases still pass (inert when unpaired, and a press may have come in through
+/// another path such as the secure-desktop helper).
+pub const fn drop_unpaired_release(button: u8, down: bool, was_held: bool) -> bool {
+	!down && !was_held && is_side(button)
+}
+
 /// Linux evdev `BTN_*` code of a button (what a uinput mouse emits).
 pub const fn to_evdev(button: u8) -> Option<u16> {
 	Some(match button {
@@ -118,6 +129,15 @@ mod tests {
 		assert_eq!(from_evdev(0x115), Some(FORWARD)); // BTN_FORWARD
 		assert_eq!(from_evdev(0x117), None); // BTN_TASK
 		assert!(is_evdev_button(0x110) && !is_evdev_button(30));
+	}
+
+	#[test]
+	fn only_unpaired_side_releases_are_dropped() {
+		assert!(drop_unpaired_release(BACK, false, false));
+		assert!(drop_unpaired_release(FORWARD, false, false));
+		assert!(!drop_unpaired_release(BACK, false, true));
+		assert!(!drop_unpaired_release(BACK, true, false));
+		assert!(!drop_unpaired_release(LEFT, false, false));
 	}
 
 	#[test]

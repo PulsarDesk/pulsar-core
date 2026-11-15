@@ -298,10 +298,9 @@ impl WindowInput {
 		let Some((b, ty, number)) = button_events(button, down) else {
 			return;
 		};
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
 		}
 		self.refresh_bounds();
 		let pt = self.global();

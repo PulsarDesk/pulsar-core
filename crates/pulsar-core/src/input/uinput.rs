@@ -155,23 +155,16 @@ pub struct DesktopInput {
 	pinch_tx: Option<std::sync::mpsc::Sender<PinchCmd>>,
 	/// Lazily started pen / touch worker (uinput tablet + touchscreen, see `pen_touch`).
 	pen_touch: Option<super::pen_touch::PenTouch<Option<crate::capture::PointerRegion>>>,
-	/// The host layout's character → key table for `type_char`, read on the first `Char`
-	/// (see `host_keymap_linux`).
-	keymap: Option<super::host_keymap_linux::HostKeymap>,
 	/// X11 only: the scratch-keycode remap for characters the layout lacks. `None` = not
 	/// tried yet, `Some(None)` = unavailable (Wayland / no X display).
 	x11_scratch: Option<Option<super::host_keymap_linux::X11Scratch>>,
 	/// Caps Lock as toggled by the keys this injector pressed (the host's own keyboard can
-	/// toggle it too, unseen): letters typed by `type_char` take the other level while on.
+	/// toggle it too, unseen), counted only where KEY_CAPSLOCK locks Caps on the host layout:
+	/// `type_char` then types from the layout's Caps table.
 	caps_on: bool,
 	/// A character neither the layout nor a fallback could type was already logged.
 	untypable_logged: bool,
 }
-
-/// A `Char` the host layout lacks re-reads the layout at most this often (the user may
-/// have switched layouts mid-session); the table is also refreshed when it is this old.
-const KEYMAP_MISS_RELOAD: std::time::Duration = std::time::Duration::from_secs(5);
-const KEYMAP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Commands for the touchpad-pinch worker thread.
 enum PinchCmd {
@@ -444,6 +437,8 @@ impl DesktopInput {
 			.name("Pulsar Virtual Keyboard")
 			.with_keys(&keys)?
 			.build()?;
+		// Read the host layout off the input path, ready by the first typed character.
+		super::host_keymap_linux::start();
 		Ok(Self {
 			pointer,
 			mouse,
@@ -455,7 +450,6 @@ impl DesktopInput {
 			held_keys: std::collections::HashSet::new(),
 			pinch_tx: None,
 			pen_touch: None,
-			keymap: None,
 			x11_scratch: None,
 			caps_on: false,
 			untypable_logged: false,
@@ -589,7 +583,10 @@ impl DesktopInput {
 		}
 		let code = code as u16;
 		if down {
-			if code == KeyCode::KEY_CAPSLOCK.code() && !self.held_keys.contains(&code) {
+			if code == KeyCode::KEY_CAPSLOCK.code()
+				&& !self.held_keys.contains(&code)
+				&& super::host_keymap_linux::current().caps_locks
+			{
 				self.caps_on = !self.caps_on;
 			}
 			self.held_keys.insert(code);
@@ -607,57 +604,50 @@ impl DesktopInput {
 	/// them, so the character is typed with the key and level the host layout uses for it
 	/// (`host_keymap_linux`: TR-Q `ş` = KEY_SEMICOLON, `@` = AltGr+Q). The client's held
 	/// Shift / AltGr are lifted or reused as the level needs (`keytables::chord_edges`).
-	/// A character the layout lacks: X11 maps it onto a borrowed keycode (as `xdotool type`
-	/// does); under GNOME / IBus it goes in as the Unicode entry Ctrl+Shift+U, hex, Space;
-	/// elsewhere (KDE without IBus, wlroots) it is dropped and logged once.
+	/// A character the layout has only as a dead key (de `^`, fr `¨`) is the dead key + Space
+	/// (or the dead key twice). One the layout lacks: X11 maps it onto a borrowed keycode (as
+	/// `xdotool type` does); under GNOME / IBus it goes in as the Unicode entry Ctrl+Shift+U,
+	/// hex, Space; elsewhere (KDE without IBus, wlroots) it is dropped and logged once.
+	/// Never blocks on reading the layout (a worker thread does that).
 	pub fn type_char(&mut self, c: char) {
-		use super::keytables::{caps_adjust, chord_edges, control_char_key, unicode_entry_edges, KeyChord};
+		use super::keytables::{chord_edges, control_char_key, unicode_entry_edges, KeyChord};
 		if let Some(code) = control_char_key(c) {
 			let edges = chord_edges(KeyChord { code, shift: false, altgr: false }, |k| self.held_keys.contains(&k));
 			self.emit_edges(&edges);
 			return;
 		}
-		let chord = self.layout_chord(c);
-		let edges = if let Some(chord) = chord {
-			Some(chord_edges(caps_adjust(c, chord, self.caps_on), |k| self.held_keys.contains(&k)))
-		} else if let Some(code) = self.x11_scratch_code(c) {
-			Some(chord_edges(KeyChord { code, shift: false, altgr: false }, |k| self.held_keys.contains(&k)))
-		} else if super::keytables::unicode_entry_supported(|k| std::env::var(k).ok()) {
-			let table = self.keymap.as_ref().map(|k| &k.table);
-			table.and_then(|t| unicode_entry_edges(c, t, |k| self.held_keys.contains(&k)))
+		let km = super::host_keymap_linux::current();
+		let table = if self.caps_on && km.caps_locks { &km.table_caps } else { &km.table };
+		let edges = if let Some(&chord) = table.get(&c) {
+			Some(chord_edges(chord, |k| self.held_keys.contains(&k)))
 		} else {
-			None
+			// Missing: the user may have switched layouts — let the worker re-read it.
+			super::host_keymap_linux::nudge();
+			if let Some(chords) = km.dead.get(&c) {
+				Some(chords.iter().flat_map(|&ch| chord_edges(ch, |k| self.held_keys.contains(&k))).collect())
+			} else if let Some(code) = self.x11_scratch_code(c) {
+				Some(chord_edges(KeyChord { code, shift: false, altgr: false }, |k| self.held_keys.contains(&k)))
+			} else if super::keytables::unicode_entry_supported(|k| std::env::var(k).ok()) {
+				unicode_entry_edges(c, table, |k| self.held_keys.contains(&k))
+			} else {
+				None
+			}
 		};
 		match edges {
 			Some(edges) => self.emit_edges(&edges),
 			None if !self.untypable_logged => {
 				self.untypable_logged = true;
+				// Never the character itself: remote typing can be a password, and users attach
+				// this log to bug reports.
 				tracing::warn!(
-					?c,
-					source = self.keymap.as_ref().map(|k| k.source),
-					"host layout cannot type this character (no X11 remap, no GTK/IBus Unicode entry)"
+					source = km.source,
+					utf8_len = c.len_utf8(),
+					alphabetic = c.is_alphabetic(),
+					"host layout cannot type a received character (no X11 remap, no GTK/IBus Unicode entry)"
 				);
 			}
 			None => {}
 		}
-	}
-
-	/// The host layout's key for `c`, reading the layout on first use, when it is old, or
-	/// (rate-limited) when `c` is missing — the user may have switched layouts.
-	fn layout_chord(&mut self, c: char) -> Option<super::keytables::KeyChord> {
-		let stale = self.keymap.as_ref().map_or(true, |k| k.built.elapsed() > KEYMAP_MAX_AGE);
-		if stale {
-			self.keymap = Some(super::host_keymap_linux::HostKeymap::load());
-		}
-		let km = self.keymap.as_ref()?;
-		if let Some(&chord) = km.table.get(&c) {
-			return Some(chord);
-		}
-		if km.built.elapsed() > KEYMAP_MISS_RELOAD {
-			self.keymap = Some(super::host_keymap_linux::HostKeymap::load());
-			return self.keymap.as_ref()?.table.get(&c).copied();
-		}
-		None
 	}
 
 	/// X11 fallback: the evdev code of a borrowed keycode now mapped to `c`.

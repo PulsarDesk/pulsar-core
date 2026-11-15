@@ -310,10 +310,9 @@ impl DesktopInput {
 			return;
 		};
 		// Update held set FIRST so the event posts at the live cursor location.
-		if down {
-			self.held_buttons.insert(button);
-		} else {
-			self.held_buttons.remove(&button);
+		let was_held = if down { !self.held_buttons.insert(button) } else { self.held_buttons.remove(&button) };
+		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
+			return;
 		}
 		let point = self.current_location();
 		if let Some(ev) =
