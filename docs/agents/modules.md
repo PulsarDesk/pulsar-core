@@ -60,11 +60,16 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   impossible; Linux/macOS untested on hardware; `is_alive`/`in_front`/size/X11 child
   under the pointer are cached 200 ms — the host asks per input event),
   hi-res scroll (`wheel.rs`: wire `Scroll` = browser px, 100 per notch, fractions kept →
-  Windows `mouseData` in 1/120 notch, Linux `REL_WHEEL_HI_RES` + legacy notch per 120,
-  macOS LINE for whole notches / continuous PIXEL for finer deltas; X11 per-window stays
-  whole notches — core events have no finer unit), client motion batching (`coalesce.rs`:
-  ≤ 1 packet per 0.8 ms per motion kind, the burst's first event unheld, edges flush first;
-  used by the desktop session loop),
+  Windows desktop session `mouseData` in 1/120 notch, but WHOLE notches (×120) in a game
+  session / while the client pointer is relative (`DesktopInput::set_whole_notch_wheel`,
+  set by the host app) and always on the per-window injector — games do `delta / 120` as
+  an integer; Linux `REL_WHEEL_HI_RES` + legacy notch at the halfway point like the
+  kernel's hid scroll counter; macOS one scale: LINE events, finer deltas with fractional
+  lines in the fixed-point fields (+ points at 10/line, unmeasured on hardware); X11
+  per-window stays whole notches — core events have no finer unit), client motion
+  batching (`coalesce.rs`: token bucket per motion kind, 2 deep, one per 0.8 ms — a 1 kHz
+  mouse with jitter is never held; `push_backlog` merges a channel backlog but sends it at
+  once; edges flush first; used by the desktop session loop),
   DS4/DS5 touchpad-as-mouse (`touchpad_mouse.rs` = the shared,
   unit-tested gesture machine — pointer / two-finger scroll / click / two-finger right
   click — used by the Linux evdev reader `touchpad_linux.rs` and by the desktop app's

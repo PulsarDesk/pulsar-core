@@ -81,8 +81,8 @@ pub struct WindowInput {
 	/// Held VK set — released on Drop / flush so a client that drops mid-press
 	/// doesn't leave a key latched down in the target window.
 	held_keys: std::collections::HashSet<u16>,
-	/// Hi-res wheel conversion with the sub-unit carry, as DesktopInput (see
-	/// [`super::wheel`]).
+	/// Wheel conversion with the sub-unit carry + notch counter (see [`super::wheel`]);
+	/// this injector posts whole notches only.
 	scroll: super::wheel::HiResScroll,
 }
 
@@ -226,10 +226,13 @@ impl WindowInput {
 	/// word and — unusually — the cursor position in **screen** coordinates in lParam,
 	/// so we map the cached client point through `ClientToScreen`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Hi-res units (1/120 notch) like DesktopInput: the message's delta takes any
-		// value, precision touchpads post sub-120 deltas the same way.
+		// Whole notches only (× WHEEL_DELTA), like same-host co-op's raw-input path: this
+		// injector targets a launched GAME's window, and games often read
+		// `delta / WHEEL_DELTA` as an integer (a 15-unit hi-res step would be 0). The notch
+		// fires at the halfway point of a fine scroll (see `wheel::HiResScroll`).
 		let o = self.scroll.push(dx, dy);
-		let (v, h) = (o.v.clamp(i16::MIN as i32, i16::MAX as i32), o.h.clamp(i16::MIN as i32, i16::MAX as i32));
+		let notch = |n: i32| n.saturating_mul(super::wheel::HI_RES_PER_NOTCH).clamp(i16::MIN as i32, i16::MAX as i32);
+		let (v, h) = (notch(o.v_notches), notch(o.h_notches));
 		let mut pt = POINT {
 			x: self.last_x,
 			y: self.last_y,

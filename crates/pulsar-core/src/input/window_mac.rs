@@ -314,13 +314,11 @@ impl WindowInput {
 		}
 	}
 
-	/// Scroll by a browser-wheel delta at the cached point: whole notches as lines, finer
-	/// deltas as continuous pixels, like [`super::macos::DesktopInput::scroll`].
+	/// Scroll by a browser-wheel delta (100 px per line) at the cached point: whole notches
+	/// as plain lines, finer deltas as fractional lines on the same scale, like
+	/// [`super::macos::DesktopInput::scroll`].
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		let out = self.scroll.push_now(dx, dy);
-		if out == super::wheel::MacScrollOut::None {
-			return;
-		}
+		let Some(out) = self.scroll.push(dx, dy) else { return };
 		let pt = self.global();
 		if let Some(ev) = Self::source().and_then(|s| super::macos::mac_scroll_event(s, out)) {
 			ev.set_location(pt);

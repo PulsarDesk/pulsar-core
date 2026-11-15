@@ -28,6 +28,8 @@ pub struct MonitorRect {
 	pub virt_height: i32,
 }
 
+const WHEEL_DELTA: i32 = super::wheel::HI_RES_PER_NOTCH;
+
 fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
 	let input = INPUT {
 		r#type: INPUT_MOUSE,
@@ -226,6 +228,9 @@ pub struct DesktopInput {
 	held_keys: std::collections::HashSet<u16>,
 	/// Hi-res wheel conversion with the sub-unit carry (see [`super::wheel`]).
 	scroll: super::wheel::HiResScroll,
+	/// Inject whole `WHEEL_DELTA` notches instead of hi-res units (see
+	/// [`set_whole_notch_wheel`](Self::set_whole_notch_wheel)).
+	whole_notches: bool,
 	/// Geometry of the streamed monitor within the virtual desktop. `None` ⇒ the primary
 	/// display (single-monitor host / unknown geometry) — keeps the legacy primary-only
 	/// absolute mapping. `Some` ⇒ map the normalized coords onto that monitor's rect across
@@ -353,6 +358,7 @@ impl DesktopInput {
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
 			scroll: Default::default(),
+			whole_notches: false,
 			monitor: None,
 			pinch_tx: None,
 			pen_touch: None,
@@ -487,17 +493,33 @@ impl DesktopInput {
 		send_mouse(0, 0, 0, flag);
 	}
 
+	/// Whole-notch wheel output (`true`) for a game session or while the client's pointer is
+	/// relative / locked: many games read the wheel from Raw Input or `WM_MOUSEWHEEL` and do
+	/// `delta / WHEEL_DELTA` as an integer (a 15-unit hi-res step = 0, a dead wheel) or step
+	/// once per event (8 weapon switches per notch) — the reason Windows mouse drivers keep
+	/// hi-res scrolling off by default. `false` (default) = hi-res units for desktop use.
+	pub fn set_whole_notch_wheel(&mut self, on: bool) {
+		self.whole_notches = on;
+	}
+
 	/// Scroll by a delta (browser wheel pixels → hi-res wheel units, 1/120 notch). Windows
 	/// takes sub-`WHEEL_DELTA` `mouseData` (precision touchpads send it all the time), so a
 	/// smooth client scroll stays smooth instead of being rounded to whole notches; the
-	/// sub-unit remainder carries to the next call (see [`super::wheel`]).
+	/// sub-unit remainder carries to the next call (see [`super::wheel`]). In whole-notch
+	/// mode ([`set_whole_notch_wheel`](Self::set_whole_notch_wheel)) only the completed
+	/// notches go out, × `WHEEL_DELTA`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
 		let o = self.scroll.push(dx, dy);
-		if o.v != 0 {
-			send_mouse(0, 0, o.v, MOUSEEVENTF_WHEEL);
+		let (v, h) = if self.whole_notches {
+			(o.v_notches.saturating_mul(WHEEL_DELTA), o.h_notches.saturating_mul(WHEEL_DELTA))
+		} else {
+			(o.v, o.h)
+		};
+		if v != 0 {
+			send_mouse(0, 0, v, MOUSEEVENTF_WHEEL);
 		}
-		if o.h != 0 {
-			send_mouse(0, 0, o.h, MOUSEEVENTF_HWHEEL);
+		if h != 0 {
+			send_mouse(0, 0, h, MOUSEEVENTF_HWHEEL);
 		}
 	}
 
