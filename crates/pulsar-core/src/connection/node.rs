@@ -312,9 +312,21 @@ impl Node {
 	}
 
 	/// Our relay-path handshake blob for `hs` (see `handshake_blob`), carrying our LAN
-	/// candidates (`parse_lan_candidates` is the counterpart).
+	/// candidates (`parse_lan_candidates` is the counterpart). The REQUESTER side: it sends
+	/// every candidate to the host it chose to connect to.
 	pub(super) fn handshake_blob(&self, hs: &LocalHs) -> Vec<u8> {
 		handshake_blob(self.identity.public_bytes(), hs, &self.lan_candidates())
+	}
+
+	/// The RESPONDER's handshake blob (the relay `Accept` answer). It goes to any requester
+	/// that knows our id, before the session's password / approval, and the relay sees it in
+	/// plaintext — so beyond the default-route candidate (always sent, as before) it carries
+	/// only the NICs that share a subnet with one of the requester's own candidates
+	/// (`peer_cands`): the only extras a same-LAN punch can use anyway. A second office or
+	/// lab subnet is never told to a stranger.
+	pub(super) fn answer_blob(&self, hs: &LocalHs, peer_cands: &[SocketAddr]) -> Vec<u8> {
+		let lans = answer_lans(self.lan_candidates(), &local_lan_ifaces(), peer_cands);
+		handshake_blob(self.identity.public_bytes(), hs, &lans)
 	}
 
 	pub fn public_key(&self) -> [u8; 32] {
@@ -888,6 +900,33 @@ pub(super) fn usable_peer_lans(cands: Vec<SocketAddr>, local: &[(std::net::Ipv4A
 			m != 0 && (u32::from(*a) & m) == (ip & m)
 		});
 		if on_subnet && !own && !out.contains(&c) {
+			out.push(c);
+		}
+	}
+	out
+}
+
+/// The LAN candidates a responder offers (see [`Node::answer_blob`]): the first (default-route)
+/// one always, each other one only when its own NIC's subnet (`local`: address, netmask) holds
+/// one of the requester's candidates.
+pub(super) fn answer_lans(
+	ours: Vec<SocketAddr>,
+	local: &[(std::net::Ipv4Addr, std::net::Ipv4Addr)],
+	peer_cands: &[SocketAddr],
+) -> Vec<SocketAddr> {
+	let mut it = ours.into_iter();
+	let mut out: Vec<SocketAddr> = it.next().into_iter().collect();
+	for c in it {
+		let SocketAddr::V4(c4) = c else { continue };
+		let shared = local.iter().filter(|(a, _)| a == c4.ip()).any(|(a, m)| {
+			let m = u32::from(*m);
+			m != 0
+				&& peer_cands.iter().any(|p| match p {
+					SocketAddr::V4(p4) => (u32::from(*p4.ip()) & m) == (u32::from(*a) & m),
+					SocketAddr::V6(_) => false,
+				})
+		});
+		if shared {
 			out.push(c);
 		}
 	}

@@ -206,8 +206,8 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   without a platform name has an empty `name` + `builtin` flag (the app localizes the label).
   `DataMsg::StreamedDisplay(idx)` (service/wire.rs) tells the client which monitor the Wayland
   portal pick really streams. Pure helpers unit-tested; untested on macOS / Wayland hardware.
-- `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC. The beacon name is a label the user chose (never the OS
-  user's real name), and apps leave the id out while unattended access is on.
+- `discovery.rs` — LAN UDP multicast beacon (239.255.71.21), multi-NIC. The beacon name is a label the user chose or the
+  hostname (never the OS user's real name), and apps keep the beacon silent (`set_paused`) while unattended access is on.
 - `netpath.rs` — shared path facts: `classify` (Lan / Wan / Relay; overlay VPNs = Wan via
   interface name, the routed adapter's type and a 12 ms RTT fallback), the overlay /
   virtual interface name lists, and the UDP socket-buffer tuning + report (`SO_RCVBUFFORCE`

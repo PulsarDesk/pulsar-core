@@ -64,11 +64,12 @@ pub fn os_display_name() -> String {
 struct Announce {
 	magic: u32,
 	version: u16,
-	/// Relay-assigned id, if registered; `None` when running relay-less (or when the app
-	/// withholds it — an unattended host must not broadcast the one thing a stranger needs).
+	/// Relay-assigned id, if registered; `None` when running relay-less. (An unattended host
+	/// does not announce at all: the beacon's address + port alone let anyone on the network
+	/// connect to a host that asks for no password — the apps pause it, see `set_paused`.)
 	id: Option<u32>,
-	/// A label the user chose for the device, or empty (receivers show a generic label).
-	/// Never the OS user's real name (see [`os_display_name`]).
+	/// A label the user chose for the device, else the hostname; empty only without one
+	/// (receivers show a generic label). Never the OS user's real name (see [`os_display_name`]).
 	name: String,
 	/// The node's main UDP port (where a future relay-less direct LAN link goes).
 	node_port: u16,
@@ -206,7 +207,9 @@ impl Discovery {
 	}
 
 	/// Pause/resume ANNOUNCING (broadcasting) this device on the LAN. Paused while in gaming
-	/// mode (a pure client must not advertise itself as connectable). Receiving is unaffected.
+	/// mode (a pure client must not advertise itself as connectable) and while unattended
+	/// access is on (no password, no approval: the beacon must not invite strangers on a
+	/// shared network). Receiving is unaffected.
 	pub fn set_paused(&self, paused: bool) {
 		self.paused
 			.store(paused, std::sync::atomic::Ordering::Relaxed);
@@ -594,6 +597,9 @@ mod overlay_tests {
 			assert!(!is_overlay_iface_name(n), "{n}");
 		}
 		assert!(is_overlay_vpn_addr("100.101.102.103".parse().unwrap()), "Tailscale CGNAT range");
-		assert!(!is_overlay_vpn_addr("192.0.2.10".parse().unwrap()), "not on any local overlay");
+		// Only the machine-independent part: any other address also asks the OS route, and a
+		// dev / CI box whose default route is a tunnel (full-tunnel WireGuard, a Tailscale exit
+		// node, a corporate VPN) rightly reports an outside address as overlay-routed.
+		assert!(!is_overlay_vpn_addr("127.0.0.1".parse().unwrap()), "loopback is never an overlay");
 	}
 }

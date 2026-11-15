@@ -137,9 +137,10 @@ const LOSS_DECAY: f32 = 0.7;
 const DOWN_AFTER: u32 = 2;
 /// Smallest upward change applied (smaller ones are noise).
 const UP_STEP: f32 = 0.02;
-/// Rough RTP payload of a full video packet (the packetizer's MTU minus headers) — only the
-/// fallback packet-count estimate uses it.
-const EST_PKT_BYTES: f32 = 1200.0;
+/// Rough RTP payload of a full video packet: the packetizers' cap
+/// (`service::media::RTP_MAX_PACKET`) minus the 12-byte RTP header — only the fallback
+/// packet-count estimate uses it.
+const EST_PKT_BYTES: f32 = (crate::service::media::RTP_MAX_PACKET - 12) as f32;
 /// Most a loss-driven raise adds to the ratio in one window (15 → 50 % takes four windows of
 /// persisting loss instead of one).
 pub const MAX_UP_STEP: f32 = 0.10;

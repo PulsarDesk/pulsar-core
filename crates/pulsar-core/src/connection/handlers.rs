@@ -423,7 +423,8 @@ impl Node {
 			tracing::warn!(session, "incoming hello blob too short");
 			return;
 		};
-		let peer_lan = super::node::usable_peer_lans(parse_lan_candidates(&hello), &super::node::local_lan_ifaces());
+		let peer_cands = parse_lan_candidates(&hello);
+		let peer_lan = super::node::usable_peer_lans(peer_cands.clone(), &super::node::local_lan_ifaces());
 		// Retransmit guard: a duplicated requester Connect (UDP can duplicate) makes the
 		// relay emit a 2nd Incoming. If this session already exists, re-send Accept with
 		// the SAME salt we already committed — minting a fresh salt would derive a
@@ -432,7 +433,7 @@ impl Node {
 		{
 			let g = self.inner.lock().await;
 			if let Some(s) = g.sessions.get(&session) {
-				let answer = self.handshake_blob(&s.our_hs);
+				let answer = self.answer_blob(&s.our_hs, &peer_cands);
 				let (id, token) = (g.self_id, g.token);
 				drop(g);
 				if let (Some(id), Some(token)) = (id, token) {
@@ -457,7 +458,7 @@ impl Node {
 		let crypto = self
 			.identity
 			.session_hs(key, Role::Responder, session, &our_hs, &peer_hs);
-		let answer = self.handshake_blob(&our_hs);
+		let answer = self.answer_blob(&our_hs, &peer_cands);
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 
 		// Read self_id + token BEFORE inserting the session so we never leak a
@@ -1510,6 +1511,25 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(1100)).await;
 		node2.handle_relay(relay_data(3, vec![0u8; 40])).await;
 		assert_eq!(sess2.live_transport().await, Transport::Direct);
+	}
+
+	/// A responder tells a requester about a second NIC only when the requester sits on its
+	/// subnet; the default-route candidate goes out as before.
+	#[test]
+	fn responder_offers_only_extras_on_a_shared_subnet() {
+		let a = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+		let ip = |s: &str| -> std::net::Ipv4Addr { s.parse().unwrap() };
+		let m24 = ip("255.255.255.0");
+		let ours = vec![a("192.168.1.5:5000"), a("10.20.0.7:5000"), a("172.16.9.2:5000")];
+		let local = [(ip("192.168.1.5"), m24), (ip("10.20.0.7"), m24), (ip("172.16.9.2"), m24)];
+		// The requester sits on 10.20.0.x: the default-route candidate + that one NIC.
+		let got = super::super::node::answer_lans(ours.clone(), &local, &[a("10.20.0.99:6000")]);
+		assert_eq!(got, vec![ours[0], ours[1]]);
+		// A requester on none of our subnets learns only the default-route candidate.
+		let got = super::super::node::answer_lans(ours.clone(), &local, &[a("192.168.50.3:6000")]);
+		assert_eq!(got, vec![ours[0]]);
+		assert_eq!(super::super::node::answer_lans(ours.clone(), &local, &[]), vec![ours[0]]);
+		assert!(super::super::node::answer_lans(Vec::new(), &local, &[]).is_empty());
 	}
 
 	/// Extra LAN candidates ride a tail old peers never read: the LAN slot and the v1
