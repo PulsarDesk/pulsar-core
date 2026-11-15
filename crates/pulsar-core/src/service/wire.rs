@@ -281,9 +281,18 @@ pub struct StreamReq {
 	/// — only honored when the chosen encoder+codec actually validates for it.
 	#[serde(default)]
 	pub hdr: bool,
-	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop).
+	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop). Honored only
+	/// for a codec the client lists in [`decode_yuv444`](Self::decode_yuv444) — see
+	/// [`StreamReq::wants_yuv444`].
 	#[serde(default)]
 	pub yuv444: bool,
+	/// Codecs this CLIENT decodes AND presents in 4:4:4 (its startup probe really decoded a
+	/// 4:4:4 keyframe of each, e.g. `["h265"]` on a Windows GPU whose DXVA has HEVC RExt). The
+	/// host encodes 4:4:4 only for a listed codec, so a client that cannot show 4:4:4 never
+	/// gets it (the Windows NV12-only decode was a black screen). `#[serde(default)]` (empty):
+	/// an old client — and every client that cannot decode 4:4:4 — gets 4:2:0.
+	#[serde(default)]
+	pub decode_yuv444: Vec<String>,
 	/// Codecs this CLIENT can decode (startup-probe result, best-first), already
 	/// PRUNED of any codec whose decoder is incompatible with an encoder family the
 	/// host actually has (e.g. rkmpp-HEVC × native-NVENC). The host clamps its codec
@@ -442,6 +451,24 @@ impl ClientStats {
 	/// Serialize for the wire (`DataMsg::Stats`).
 	pub fn to_json(&self) -> String {
 		serde_json::to_string(self).expect("ClientStats serializes")
+	}
+}
+
+impl StreamReq {
+	/// Should the host encode `codec` (`h264` / `h265` / `av1`; `hevc` is taken for `h265`)
+	/// in 4:4:4? Only when the client asked for it AND said it decodes 4:4:4 for that codec —
+	/// the codec the host finally streams, which can differ from the one asked for.
+	pub fn wants_yuv444(&self, codec: &str) -> bool {
+		fn norm(c: &str) -> String {
+			let c = c.trim().to_ascii_lowercase();
+			if c == "hevc" {
+				"h265".into()
+			} else {
+				c
+			}
+		}
+		let codec = norm(codec);
+		self.yuv444 && self.decode_yuv444.iter().any(|c| norm(c) == codec)
 	}
 }
 
@@ -997,6 +1024,7 @@ mod tests {
 			req.decode_codecs.is_empty(),
 			"missing decode_codecs defaults to empty (= unknown → host doesn't clamp)"
 		);
+		assert!(req.decode_yuv444.is_empty(), "missing decode_yuv444 → empty (4:2:0 only)");
 		assert!(
 			!req.media_over_session,
 			"missing media_over_session defaults to false (legacy direct flows)"
@@ -1011,6 +1039,27 @@ mod tests {
 			ChannelLayout::Stereo,
 			"missing audio_layout defaults to Stereo (the universally-decodable layout)"
 		);
+	}
+
+	#[test]
+	fn yuv444_only_for_a_codec_the_client_decodes_in_444() {
+		let mut req: StreamReq = serde_json::from_str(
+			r#"{"port":5000,"codec":"h265","encoder":"auto","width":0,"height":0,"yuv444":true}"#,
+		)
+		.unwrap();
+		// An old client (or one whose probe decoded no 4:4:4) lists nothing: 4:2:0.
+		assert!(!req.wants_yuv444("h265"));
+		req.decode_yuv444 = vec!["h265".into()];
+		assert!(req.wants_yuv444("h265"));
+		assert!(req.wants_yuv444("HEVC"), "hevc is h265");
+		// The host fell back to a codec the client cannot show in 4:4:4: 4:2:0.
+		assert!(!req.wants_yuv444("h264"));
+		assert!(!req.wants_yuv444("av1"));
+		// Not asked for: never, whatever the client can decode.
+		req.yuv444 = false;
+		assert!(!req.wants_yuv444("h265"));
+		let back: StreamReq = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+		assert_eq!(back.decode_yuv444, vec!["h265".to_string()]);
 	}
 
 	#[test]
