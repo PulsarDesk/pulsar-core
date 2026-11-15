@@ -2575,9 +2575,14 @@ impl Controller {
 	/// empty decision when the decoder keeps up, the point is pinned, or nothing lighter exists.
 	/// (Seen 2026-11-08: a laptop's synchronous HEVC decoder held 1200p60 but not 90/120 — the
 	/// backlog overflowed and the picture froze until the next keyframe.)
+	///
+	/// Also with the ladder off (`Config::ladder = false`, the mobile client's bitrate-only
+	/// session): the decoder is a hard limit no bitrate fixes, so the point still steps down
+	/// for it — and, the point being fixed otherwise, stays there for the session. A point the
+	/// user pinned with the ladder on (`set_manual_point(true)`) is left alone.
 	pub fn client_decode_bound(&mut self, decode_ms: f32) -> Decision {
 		let mut out = Decision::default();
-		if self.manual_point || self.points.len() < 2 || !(decode_ms > 0.0) {
+		if (self.manual_point && self.cfg.ladder) || self.points.len() < 2 || !(decode_ms > 0.0) {
 			return out;
 		}
 		let cur = self.points[self.point_idx];
@@ -2865,6 +2870,36 @@ mod tests {
 			ctl.tick(&win(2000, 0, 20.0));
 		}
 		assert!(ctl.point().fps <= p.fps, "{:?}", ctl.point());
+	}
+
+	/// The mobile client runs the ladder off (bitrate only): a decoder that sheds frames still
+	/// steps the fps down, and the point then stays put while the rate adapts.
+	#[test]
+	fn a_ladder_off_session_steps_down_for_the_decoder_only() {
+		let mut c = at_cap(VCodec::H265, 20_000);
+		c.native = (2400, 1080, 60);
+		let mut ctl = Controller::new(c);
+		let top = ctl.point();
+		assert_eq!((top.width, top.height, top.fps), (2400, 1080, 60));
+		// Bandwidth alone never moves the point with the ladder off.
+		for _ in 0..6 {
+			ctl.tick(&win(600, 400, 20.0));
+		}
+		assert_eq!(ctl.point(), top, "a lossy link cuts the rate, not the point");
+		assert!(ctl.client_decode_bound(8.0).point.is_none(), "8 ms keeps up at 60 fps");
+		let p = ctl.client_decode_bound(25.0).point.expect("stepped down for the decoder");
+		assert!(p.fps < 60, "{p:?}");
+		assert_eq!(ctl.point(), p);
+		for _ in 0..20 {
+			ctl.tick(&win(2000, 0, 20.0));
+		}
+		assert_eq!(ctl.point(), p, "a fixed point stays where the decoder put it");
+		// With the ladder on, a point the user pinned is left alone.
+		let mut l = cfg(15_000, false);
+		l.native = (1920, 1080, 60);
+		let mut pinned = Controller::new(l);
+		pinned.set_manual_point(true);
+		assert!(pinned.client_decode_bound(25.0).point.is_none());
 	}
 
 	/// A real standing queue lifts EVERY sample — the floor-based check must still cut.

@@ -6,13 +6,21 @@
 //! * [`delay`] — the one-way delay-gradient estimator (trendline + over-use detector).
 //! * [`fec_policy`] — how many packets one XOR parity covers for a measured loss.
 //! * [`probe`] — the session-start bandwidth probe (packet trains → the start rate).
+//! * [`repair`] — the client's video repair loop (seq gaps → reorder / FEC waits → NACK,
+//!   re-NACK, write-off; window counters incl. goodput; FEC share; keyframe pacing).
+//! * [`caps`] — the automatic ceiling (`auto_cap_kbps`) and the live path's cap.
+//! * [`memory`] — the per-peer, per-path-class memory of the last clean rate.
 //!
-//! No I/O anywhere in here: the apps measure, call, and actuate (`StreamReq`).
+//! No I/O anywhere in here (except `memory`'s best-effort JSON file at a path the app gives):
+//! the apps measure, call, and actuate (`StreamReq`).
 
+pub mod caps;
 pub mod delay;
 pub mod fec_policy;
 pub mod ladder;
+pub mod memory;
 pub mod probe;
+pub mod repair;
 
 mod controller;
 
