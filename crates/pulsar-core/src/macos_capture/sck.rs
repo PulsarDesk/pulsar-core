@@ -1,6 +1,14 @@
 //! ScreenCaptureKit capture: one `SCStream` per call of [`ScStream::start`], on one display,
 //! delivering NV12 frames (cursor composited by the window server) and/or the system audio mix
-//! without Pulsar's own process.
+//! without Pulsar's own process — or, through [`ScStream::start_window`], on ONE application
+//! window (`SCContentFilter initWithDesktopIndependentWindow:`: its own content only, it keeps
+//! streaming while covered).
+//!
+//! Colour: every video stream asks for sRGB (`colorSpaceName`) with the BT.709 matrix
+//! (`colorMatrix`), video range, explicitly. Left to SCK the buffers may carry the display's
+//! own colour space (Display P3 on Apple panels) while every client decodes BT.709 / sRGB:
+//! washed-out reds and greens. VideoToolbox copies these buffer attachments into the stream's
+//! VUI (its colour properties are left unset on purpose, so it never converts).
 //!
 //! Everything is resolved at run time (see the `ffi` module): an older macOS gets
 //! [`ScError::Unavailable`] and the caller keeps its ffmpeg path.
@@ -45,6 +53,8 @@ pub enum ScError {
 	PermissionDenied,
 	/// No active display with this `CGDirectDisplayID`.
 	NoDisplay(u32),
+	/// No capture-able window with this `CGWindowID` (closed, or not shareable).
+	NoWindow(u32),
 	/// Anything else SCK reported.
 	Failed(String),
 }
@@ -55,6 +65,7 @@ impl std::fmt::Display for ScError {
 			Self::Unavailable(what) => write!(f, "ScreenCaptureKit unavailable: {what}"),
 			Self::PermissionDenied => write!(f, "screen recording permission denied"),
 			Self::NoDisplay(id) => write!(f, "no active display {id}"),
+			Self::NoWindow(id) => write!(f, "no window {id}"),
 			Self::Failed(e) => write!(f, "ScreenCaptureKit: {e}"),
 		}
 	}
@@ -525,6 +536,49 @@ unsafe fn find_display(content: &AnyObject, id: u32) -> Result<Retained<AnyObjec
 	Err(ScError::NoDisplay(want))
 }
 
+/// The `SCWindow` with this `CGWindowID` in `content` (every shareable window, on screen or
+/// not: a covered or minimized window is still listed).
+unsafe fn find_window(content: &AnyObject, id: u32) -> Result<Retained<AnyObject>, ScError> {
+	let list: Option<Retained<AnyObject>> = msg_send![content, windows];
+	let Some(list) = list else { return Err(ScError::NoWindow(id)) };
+	let n: usize = msg_send![&*list, count];
+	for i in 0..n {
+		let w: Option<Retained<AnyObject>> = msg_send![&*list, objectAtIndex: i];
+		if let Some(w) = w {
+			let wid: u32 = msg_send![&*w, windowID];
+			if wid == id {
+				return Ok(w);
+			}
+		}
+	}
+	Err(ScError::NoWindow(id))
+}
+
+/// Ask SCK for sRGB pixels with the BT.709 matrix (what the encoder signals and every client
+/// decodes as). A key this macOS lacks is skipped (SCK then keeps its default).
+pub(crate) unsafe fn request_bt709(cfg: &AnyObject) {
+	if responds(cfg, sel!(setColorSpaceName:)) {
+		if let Some(srgb) = ffi::cf_string_const(c"kCGColorSpaceSRGB") {
+			// A CFStringRef is toll-free bridged to the NSString the setter takes.
+			let _: () = msg_send![cfg, setColorSpaceName: srgb as *const AnyObject];
+		}
+	}
+	if responds(cfg, sel!(setColorMatrix:)) {
+		if let Some(m) = ffi::cf_string_const(c"kCGDisplayStreamYCbCrMatrix_ITU_R_709_2") {
+			let _: () = msg_send![cfg, setColorMatrix: m as *const AnyObject];
+		}
+	}
+}
+
+/// What one stream captures.
+#[derive(Clone, Copy, Debug)]
+enum Source {
+	/// A display (`CGDirectDisplayID`, 0 = main), stretched into the configured size.
+	Display(u32),
+	/// One window (`CGWindowID`), its aspect kept inside the configured size.
+	Window(u32),
+}
+
 unsafe fn responds(obj: &AnyObject, sel: Sel) -> bool {
 	let r: Bool = msg_send![obj, respondsToSelector: sel];
 	r.as_bool()
@@ -565,6 +619,32 @@ impl ScStream {
 		on_audio: Option<AudioCallback>,
 		on_stop: Option<StopCallback>,
 	) -> Result<Self, ScError> {
+		Self::start_source(Source::Display(spec.display_id), spec.video, spec.audio, on_video, on_audio, on_stop)
+	}
+
+	/// Build and start a video stream of ONE window (`CGWindowID`): only that window's own
+	/// content (other windows on top of it never show), cursor per `video.cursor`. The window
+	/// is scaled into `video.width × video.height` keeping its aspect (macOS 14+ scales a
+	/// smaller window up too; 12.3/13 only scale down), so the caller sizes the frame to the
+	/// window's aspect. [`ScError::NoWindow`] when the window is gone. Blocking like
+	/// [`Self::start`].
+	pub fn start_window(
+		window_id: u32,
+		video: VideoSpec,
+		on_video: Option<VideoCallback>,
+		on_stop: Option<StopCallback>,
+	) -> Result<Self, ScError> {
+		Self::start_source(Source::Window(window_id), Some(video), None, on_video, None, on_stop)
+	}
+
+	fn start_source(
+		source: Source,
+		video: Option<VideoSpec>,
+		audio: Option<AudioSpec>,
+		on_video: Option<VideoCallback>,
+		on_audio: Option<AudioCallback>,
+		on_stop: Option<StopCallback>,
+	) -> Result<Self, ScError> {
 		if !sck_available() {
 			return Err(ScError::Unavailable("macOS 12.3 or newer is needed"));
 		}
@@ -575,15 +655,23 @@ impl ScStream {
 		// SAFETY: every message below is sent to the SCK object type that declares it; the
 		// argument types match the declared encodings (checked by objc2 in debug builds).
 		unsafe {
-			let display = find_display(&content, spec.display_id)?;
-			let empty: Retained<AnyObject> = msg_send![class(c"NSArray")?, array];
-			let filter_alloc: Allocated<AnyObject> = msg_send![class(c"SCContentFilter")?, alloc];
-			let filter: Option<Retained<AnyObject>> =
-				msg_send![filter_alloc, initWithDisplay: &*display, excludingWindows: &*empty];
+			let filter: Option<Retained<AnyObject>> = match source {
+				Source::Display(id) => {
+					let display = find_display(&content, id)?;
+					let empty: Retained<AnyObject> = msg_send![class(c"NSArray")?, array];
+					let filter_alloc: Allocated<AnyObject> = msg_send![class(c"SCContentFilter")?, alloc];
+					msg_send![filter_alloc, initWithDisplay: &*display, excludingWindows: &*empty]
+				}
+				Source::Window(id) => {
+					let window = find_window(&content, id)?;
+					let filter_alloc: Allocated<AnyObject> = msg_send![class(c"SCContentFilter")?, alloc];
+					msg_send![filter_alloc, initWithDesktopIndependentWindow: &*window]
+				}
+			};
 			let filter = filter.ok_or_else(|| ScError::Failed("content filter".into()))?;
 
 			let cfg: Retained<AnyObject> = msg_send![class(c"SCStreamConfiguration")?, new];
-			let (w, h, fps, cursor) = match spec.video {
+			let (w, h, fps, cursor) = match video {
 				Some(v) => (v.width.max(2), v.height.max(2), v.fps.max(1), v.cursor),
 				// Audio only: SCK still renders the display; keep that as small as it goes.
 				None => (16, 16, 1, false),
@@ -594,15 +682,27 @@ impl ScStream {
 			// width × height. The output size is clamped per axis (policy::output_size), and the
 			// pointer maps normalized positions onto the whole display, so stretch instead (what
 			// the ffmpeg avfoundation path does). Older macOS always stretches.
+			//
+			// A window is the other way round: the caller sizes its frame to the window's aspect,
+			// so keep the aspect (no distortion while a resize is in flight) and, on macOS 14+,
+			// also scale a window SMALLER than the frame up (12.3/13 place it top-left at 1:1) —
+			// the same settings as the ffmpeg window source (`window_capture::WindowStream`).
+			let window = matches!(source, Source::Window(_));
 			if responds(&cfg, sel!(setPreservesAspectRatio:)) {
-				let _: () = msg_send![&*cfg, setPreservesAspectRatio: Bool::NO];
+				let _: () = msg_send![&*cfg, setPreservesAspectRatio: Bool::new(window)];
+			}
+			if window && responds(&cfg, sel!(setScalesToFit:)) {
+				let _: () = msg_send![&*cfg, setScalesToFit: Bool::YES];
+			}
+			if video.is_some() {
+				request_bt709(&cfg);
 			}
 			let _: () = msg_send![&*cfg, setMinimumFrameInterval: ffi::CMTime::new(1, fps as i32)];
 			let _: () = msg_send![&*cfg, setPixelFormat: ffi::PIXEL_FORMAT_NV12_VIDEO];
 			let _: () = msg_send![&*cfg, setShowsCursor: Bool::new(cursor)];
 			// A few frames of slack so the encoder thread holding one never stalls SCK.
 			let _: () = msg_send![&*cfg, setQueueDepth: 5isize];
-			if let Some(a) = spec.audio {
+			if let Some(a) = audio {
 				if !responds(&cfg, sel!(setCapturesAudio:)) || !responds(&cfg, sel!(setExcludesCurrentProcessAudio:)) {
 					return Err(ScError::Unavailable("system audio capture needs macOS 13 or newer"));
 				}
@@ -614,7 +714,7 @@ impl ScStream {
 
 			let output = ScOutput::new(OutputIvars {
 				video: on_video,
-				audio: if spec.audio.is_some() { on_audio } else { None },
+				audio: if audio.is_some() { on_audio } else { None },
 				on_stop,
 				status_key: ffi::cf_string_const(c"SCStreamFrameInfoStatus").unwrap_or(std::ptr::null()),
 				scratch: Mutex::new((Vec::new(), Vec::new())),
@@ -639,7 +739,7 @@ impl ScStream {
 			// The screen output is always added: an audio-only stream without one makes SCK log
 			// a "stream output NOT found" line for every (tiny) frame it renders anyway.
 			let mut kinds = vec![OUTPUT_SCREEN];
-			if spec.audio.is_some() {
+			if audio.is_some() {
 				kinds.push(OUTPUT_AUDIO);
 			}
 			for kind in kinds {
@@ -660,7 +760,7 @@ impl ScStream {
 				let _: () = msg_send![stream_ref, startCaptureWithCompletionHandler: b];
 			})?;
 			me.running = true;
-			tracing::info!(display = spec.display_id, w, h, fps, audio = spec.audio.is_some(), "ScreenCaptureKit stream started");
+			tracing::info!(?source, w, h, fps, audio = audio.is_some(), "ScreenCaptureKit stream started");
 			Ok(me)
 		}
 	}

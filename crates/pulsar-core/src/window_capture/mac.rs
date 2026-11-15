@@ -579,6 +579,8 @@ impl WindowStream {
 			if config.respondsToSelector(sel!(setPreservesAspectRatio:)) {
 				let _: () = unsafe { msg_send![&config, setPreservesAspectRatio: true] };
 			}
+			// sRGB + BT.709 matrix, as the screen capture (not the display's own P3 space).
+			unsafe { crate::macos_capture::sck::request_bt709(&config) };
 
 			let mut black = vec![16u8; w * h * 3 / 2];
 			black[w * h..].fill(128);

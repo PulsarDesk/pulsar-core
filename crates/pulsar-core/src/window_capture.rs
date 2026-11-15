@@ -6,7 +6,7 @@
 //! | --- | --- | --- | --- |
 //! | Linux X11 | EWMH `_NET_CLIENT_LIST` + titles (`x11.rs`, pure-Rust `x11rb`) | X window id | ffmpeg `x11grab -window_id` / libav / gst `ximagesrc xid=` (arg builders in `pipeline`) |
 //! | Linux Wayland | none possible (see [`WindowInfo::PORTAL_PICK`]) | `PORTAL_PICK` | ScreenCast portal, source type WINDOW (`crate::capture::start_with`) |
-//! | macOS | ScreenCaptureKit `SCShareableContent` (`mac.rs`) | `CGWindowID` | ScreenCaptureKit desktop-independent window → NV12 over loopback TCP → ffmpeg ([`WindowStream`]) |
+//! | macOS | ScreenCaptureKit `SCShareableContent` (`mac.rs`) | `CGWindowID` | the desktop app's native path (`macos_capture::ScStream::start_window` → VideoToolbox), else ScreenCaptureKit desktop-independent window → NV12 over loopback TCP → ffmpeg ([`WindowStream`]) |
 //!
 //! Everything here is a no-op (empty / `None`) on other targets, so callers need no `cfg`.
 //!
