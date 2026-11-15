@@ -26,11 +26,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `play.rs` / `adapt_memory.rs`, desktop behaviour unchanged): `repair` = the video repair loop
   (`RepairTracker`: seq gaps → reorder wait / FEC wait → NACK, one re-NACK ~1 RTT later,
   write-off after the RTT-derived window; window counters incl. goodput; FEC share learned per
-  window and released when parity stops; `RttWindow`, `KeyframePacer`, `FrameClock`,
+  window and released when parity stops; `RttWindow`, `KeyframePacer` (`with_max`: a client
+  that freezes until the keyframe caps the gap at `KF_GAP_MAX_FROZEN`), `FrameClock`,
   `decoder_overloaded` / `decoder_sheds`); `pong` = the uneven Ping cadence + `PongMatcher`; `caps` = `auto_cap_kbps` (15-150 Mbit, mobile
   ≤ 50 Mbit) + `path_cap_kbps` (relay cap while relayed); `memory` = per-peer × `PathClass`
-  (lan / wan / relay) last-clean-rate file. `Controller::client_decode_bound` also acts with the
-  ladder off (mobile: the decoder steps the fps down, the point otherwise stays fixed).
+  (lan / wan / relay) last-clean-rate file. With the ladder off (mobile) the decoder limit is
+  `Controller::client_decoder_sheds` (one fps rung down at the same size, the rung it left
+  retried after `POINT_RETRY_WINDOWS`, doubling); `client_decode_bound` (decode time) stays the
+  ladder-on path. `RepairTracker::reset_stream` = a client re-request rebuilt the encoder.
 - `connection/` — `Node`: register → relay-assigned stable 9-digit ID → P2P
   hole-punch → relay fallback; encrypted `Session`. Punching: opening burst + retransmits for
   `PUNCH_TIMEOUT`, then the session starts on the relay while BOTH ends keep punching for

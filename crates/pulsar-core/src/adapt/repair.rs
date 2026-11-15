@@ -91,12 +91,23 @@ pub fn kf_allowed(since_last: Duration, gap: Duration, rtt_ms: f32) -> bool {
 }
 
 pub fn kf_next_gap(since_last: Duration, gap: Duration) -> Duration {
+	kf_next_gap_max(since_last, gap, KF_GAP_MAX)
+}
+
+/// `kf_next_gap` with its own upper bound (see `KeyframePacer::with_max`).
+pub fn kf_next_gap_max(since_last: Duration, gap: Duration, max: Duration) -> Duration {
 	if since_last < Duration::from_secs(5) {
-		(gap * 2).min(KF_GAP_MAX)
+		(gap * 2).min(max.max(KF_GAP_MIN))
 	} else {
 		KF_GAP_MIN
 	}
 }
+
+/// The gap bound for a client that FREEZES while it waits for a keyframe (the mobile
+/// depacketizer drops every access unit until a clean one; no RFI / intra refresh there):
+/// `KF_GAP_MAX` would leave it frozen up to 4 s per loss on a lossy link — the old mobile
+/// re-asked every 400 ms. One request a second still keeps the keyframe storm away.
+pub const KF_GAP_MAX_FROZEN: Duration = Duration::from_secs(1);
 
 /// Median of the recent RTT samples (`fallback` while there are none).
 pub fn median_ms(v: &VecDeque<f32>, fallback: f32) -> f32 {
@@ -124,16 +135,26 @@ pub fn decoder_overloaded(decode_ms: f32, decoded: f32, fps: u32) -> bool {
 }
 
 /// A decoder that sheds what it is fed, measured over one window: `fed` access units went in,
-/// `decoded` pictures came out, `dropped` AUs were thrown away by its input backlog guard. Behind
-/// = it dropped any, or it put out under 85 % of what it was fed (a few AUs of pipeline depth
-/// are noise over a 2 s window). For decoders that report no decode time (Android MediaCodec):
-/// what they DO show is the backlog. Too few AUs fed (< 10, a static screen) says nothing.
-pub fn decoder_sheds(fed: u64, decoded: u64, dropped: u64) -> bool {
-	if fed < 10 {
+/// `decoded` pictures came out, `stalled` AUs found no free decoder input buffer in time (the
+/// decoder still held every one: it is behind). Behind = it put out under 85 % of what it was
+/// fed (beyond a few AUs of pipeline depth), or `stalled` reached 5 % of `fed`. For decoders
+/// that report no decode time (Android MediaCodec).
+///
+/// AUs the input backlog guard threw away are NOT a verdict by themselves: the guard also
+/// fires when the NETWORK delivers a burst — the reorder buffer releasing every frame held
+/// behind a repaired hole at once (~30 at 120 fps), a Wi-Fi power-save stall delivered in one
+/// batch — on a decoder with room to spare. They lower `decoded`, so a backlog that overflows
+/// for good still shows here; the caller leaves out windows with such a burst. Too few AUs fed
+/// (< 30, a static screen) says nothing.
+pub fn decoder_sheds(fed: u64, decoded: u64, stalled: u64) -> bool {
+	if fed < 30 {
 		return false;
 	}
-	dropped > 0 || (decoded as f64) < fed as f64 * 0.85
+	((decoded + DECODER_PIPELINE_AUS) as f64) < fed as f64 * 0.85 || stalled * 20 >= fed
 }
+
+/// AUs a decoder may legitimately hold in flight at a window edge (see `decoder_sheds`).
+pub const DECODER_PIPELINE_AUS: u64 = 4;
 
 /// The repair window in ms (see `REPAIR_MIN_MS`): a NACK retransmit lands ~1 RTT after the
 /// NACK, so wait the median RTT plus twice its jitter (the mean absolute deviation of the
@@ -350,12 +371,20 @@ impl RttWindow {
 pub struct KeyframePacer {
 	last: Instant,
 	gap: Duration,
+	max: Duration,
 }
 
 impl KeyframePacer {
-	/// `now` counts as the last request: the stream starts with a keyframe anyway.
+	/// `now` counts as the last request: the stream starts with a keyframe anyway. The gap
+	/// grows up to `KF_GAP_MAX` (the desktop: it decodes through a loss and has RFI).
 	pub fn new(now: Instant) -> Self {
-		Self { last: now, gap: KF_GAP_MIN }
+		Self::with_max(now, KF_GAP_MAX)
+	}
+
+	/// As `new`, with the gap growing only up to `max` (at least `KF_GAP_MIN`): a client that
+	/// freezes until the keyframe uses `KF_GAP_MAX_FROZEN`.
+	pub fn with_max(now: Instant, max: Duration) -> Self {
+		Self { last: now, gap: KF_GAP_MIN, max: max.max(KF_GAP_MIN) }
 	}
 
 	/// Whether a keyframe may be asked for now (the gap, at least `floor`, and ~2 RTT since the
@@ -365,7 +394,7 @@ impl KeyframePacer {
 		if !kf_allowed(since, self.gap.max(floor), rtt_ms) {
 			return false;
 		}
-		self.gap = kf_next_gap(since, self.gap);
+		self.gap = kf_next_gap_max(since, self.gap, self.max);
 		self.last = now;
 		true
 	}
@@ -904,6 +933,33 @@ mod tests {
 		assert!(r.try_request(t0 + ms(900), Duration::ZERO, 400.0));
 	}
 
+	/// A client frozen until the keyframe: the gap stops growing at 1 s, so a loss streak asks
+	/// once a second instead of backing off to 4 s.
+	#[test]
+	fn a_capped_pacer_asks_at_least_once_a_second() {
+		let t0 = Instant::now();
+		let mut p = KeyframePacer::with_max(t0, KF_GAP_MAX_FROZEN);
+		let mut t = t0 + ms(500);
+		assert!(p.try_request(t, Duration::ZERO, 10.0));
+		for _ in 0..6 {
+			assert!(p.gap() <= KF_GAP_MAX_FROZEN, "{:?}", p.gap());
+			assert!(!p.try_request(t + ms(900), Duration::ZERO, 10.0));
+			t += ms(1000);
+			assert!(p.try_request(t, Duration::ZERO, 10.0), "a request every second in a streak");
+		}
+		assert_eq!(p.gap(), KF_GAP_MAX_FROZEN);
+		// The default pacer keeps backing off to KF_GAP_MAX.
+		let mut d = KeyframePacer::new(t0);
+		let mut t = t0 + ms(500);
+		for _ in 0..5 {
+			assert!(d.try_request(t, Duration::ZERO, 10.0));
+			t += d.gap();
+		}
+		assert_eq!(d.gap(), KF_GAP_MAX);
+		// A cap under the minimum is the minimum.
+		assert_eq!(KeyframePacer::with_max(t0, ms(100)).max, KF_GAP_MIN);
+	}
+
 	#[test]
 	fn a_pipelined_decoder_is_not_overloaded() {
 		// The 2026-11-14 laptop: decode time ≈ the frame interval, every AU decoded.
@@ -919,11 +975,13 @@ mod tests {
 	}
 
 	#[test]
-	fn a_decoder_that_drops_or_falls_behind_sheds() {
+	fn a_decoder_that_falls_behind_sheds() {
 		assert!(!decoder_sheds(120, 118, 0), "pipeline depth is noise");
+		assert!(!decoder_sheds(120, 100, 0), "a burst's backlog drops are not a verdict");
 		assert!(decoder_sheds(120, 90, 0), "a quarter not decoded");
-		assert!(decoder_sheds(120, 119, 3), "the backlog guard dropped AUs");
-		assert!(!decoder_sheds(4, 0, 0), "a static screen says nothing");
+		assert!(!decoder_sheds(120, 119, 3), "a lone input-buffer timeout is noise");
+		assert!(decoder_sheds(120, 119, 6), "5 % found no input buffer: behind");
+		assert!(!decoder_sheds(20, 0, 0), "a static screen says nothing");
 	}
 
 	#[test]
