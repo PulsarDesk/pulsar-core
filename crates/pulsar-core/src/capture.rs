@@ -27,6 +27,7 @@
 
 mod frames;
 pub use frames::{FrameEncoder, FrameEncoderFactory, RawFrame};
+use crate::pipeline::gst::WaylandConvert;
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -368,9 +369,19 @@ pub async fn start_full(
 	if window {
 		tracing::info!(?cast_size, ?size, "wayland window cast");
 	}
-	let desc = |fd: i32| {
-		crate::pipeline::gst::wayland_pipeline_sized(fd, node_id, encoder_fragment, ip, port, size)
+	let desc = |fd: i32, convert: WaylandConvert| {
+		crate::pipeline::gst::wayland_pipeline_conv(fd, node_id, encoder_fragment, ip, port, size, convert)
 	};
+	// GPU colour conversion for the `va` encoders (hidden-gaps 1.10), in-process only: the
+	// first frame has to reach the encoder within `GPU_CONVERT_VERIFY` or the CPU convert
+	// takes over on the same portal session (a `vapostproc` that is missing, too old for
+	// `add-borders`, or can't negotiate with this PipeWire then costs one short start per
+	// process, not the stream: `VA_CONVERT_BROKEN` remembers it). `PULSAR_WAYLAND_CPU_CONVERT=1`
+	// skips it.
+	let gpu_convert = in_process
+		&& crate::pipeline::gst::wayland_convert_for(encoder_fragment) == WaylandConvert::Va
+		&& std::env::var("PULSAR_WAYLAND_CPU_CONVERT").as_deref() != Ok("1")
+		&& gst::ElementFactory::find("vapostproc").is_some();
 	// A window cast has no place in the output layout (the pointer can't be confined to
 	// it through uinput), so no pointer region.
 	let stream_rect = if window { None } else { stream_rect };
@@ -410,47 +421,74 @@ pub async fn start_full(
 	}
 
 	// The PipeWire node can lag the portal reply by a moment: retry the pipeline start a
-	// few times before giving up (each attempt tears its pipeline down cleanly).
+	// few times before giving up (each attempt tears its pipeline down cleanly). A GPU
+	// conversion, when there is one, goes first in EVERY slot: a "not PLAYING" failure is
+	// usually that start race, not the GPU path, so the next slot tries it again (with the CPU
+	// convert right after it in the same slot, in case it was the GPU path after all). Only a
+	// failure that says the GPU path itself is broken (bad description, or no frame after
+	// PLAYING) drops it, for the rest of this process (`VA_CONVERT_BROKEN`): a re-stream or
+	// reconnect doesn't pay the verify wait again.
+	let mut va = gpu_convert && !VA_CONVERT_BROKEN.load(Ordering::Relaxed);
+	if gpu_convert && !va {
+		tracing::info!("wayland GPU colour conversion failed earlier in this process, using the CPU convert");
+	}
 	let mut last_err: Option<anyhow::Error> = None;
-	for attempt in 0u32..3 {
+	for attempt in 0..3u32 {
 		if attempt > 0 {
 			tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
 		}
-		let started = if in_process {
-			run_pipeline(&desc(pw_fd.as_raw_fd()))
-				.await
-				.map(|(pipeline, venc)| Backend::InProcess { pipeline, venc })
-		} else {
-			run_child(&desc(pw_fd.as_raw_fd()))
-				.await
-				.map(|child| Backend::Child(std::sync::Mutex::new(child)))
-		};
-		match started {
-			Ok(backend) => {
-				let session = guard.0.take().expect("session present on success");
-				let dead = Arc::new(AtomicBool::new(false));
-				let short_gop = Arc::new(AtomicBool::new(false));
-				let stopped = Arc::new(AtomicBool::new(false));
-				if let Backend::InProcess { pipeline, venc } = &backend {
-					spawn_watchers(pipeline, venc.clone(), dead.clone(), short_gop.clone(), stopped.clone());
+		let slot: &[WaylandConvert] = if va { &[WaylandConvert::Va, WaylandConvert::Cpu] } else { &[WaylandConvert::Cpu] };
+		for &convert in slot {
+			let started = if in_process {
+				let verify = (convert == WaylandConvert::Va).then_some(GPU_CONVERT_VERIFY);
+				run_pipeline(&desc(pw_fd.as_raw_fd(), convert), verify)
+					.await
+					.map(|(pipeline, venc)| Backend::InProcess { pipeline, venc })
+			} else {
+				run_child(&desc(pw_fd.as_raw_fd(), convert))
+					.await
+					.map(|child| Backend::Child(std::sync::Mutex::new(child)))
+					.map_err(StartError::not_playing)
+			};
+			match started {
+				Ok(backend) => {
+					tracing::info!(?convert, in_process, attempt, "wayland capture colour conversion");
+					let session = guard.0.take().expect("session present on success");
+					let dead = Arc::new(AtomicBool::new(false));
+					let short_gop = Arc::new(AtomicBool::new(false));
+					let stopped = Arc::new(AtomicBool::new(false));
+					if let Backend::InProcess { pipeline, venc } = &backend {
+						spawn_watchers(pipeline, venc.clone(), dead.clone(), short_gop.clone(), stopped.clone());
+					}
+					return Ok((
+						WaylandCapture {
+							backend,
+							session: Some(session),
+							_pw_fd: pw_fd,
+							dead,
+							short_gop,
+							stopped,
+							pointer_region,
+							stream_rect: stream_rect.map(|r| (r.x, r.y, r.w, r.h)),
+						},
+						token,
+					));
 				}
-				return Ok((
-					WaylandCapture {
-						backend,
-						session: Some(session),
-						_pw_fd: pw_fd,
-						dead,
-						short_gop,
-						stopped,
-						pointer_region,
-						stream_rect: stream_rect.map(|r| (r.x, r.y, r.w, r.h)),
-					},
-					token,
-				));
-			}
-			Err(e) => {
-				tracing::warn!(attempt, in_process, "gst pipeline start failed, retrying: {e}");
-				last_err = Some(e);
+				Err(e) if convert == WaylandConvert::Va && e.gpu_path_broken => {
+					tracing::warn!(
+						"wayland GPU colour conversion (vapostproc) unusable, CPU convert for this process: {}",
+						e.err
+					);
+					VA_CONVERT_BROKEN.store(true, Ordering::Relaxed);
+					va = false;
+				}
+				Err(e) if convert == WaylandConvert::Va => {
+					tracing::warn!(attempt, "wayland GPU colour conversion did not start, trying the CPU convert: {}", e.err);
+				}
+				Err(e) => {
+					tracing::warn!(attempt, in_process, "gst pipeline start failed, retrying: {}", e.err);
+					last_err = Some(e.err);
+				}
 			}
 		}
 	}
@@ -808,39 +846,126 @@ mod tests {
 	}
 }
 
+/// How long a GPU-conversion pipeline gets to deliver its first frame to the encoder before
+/// the CPU convert takes over. PipeWire sends the cast's first frame on connect and
+/// `keepalive-time=1000` repeats the last one every second, so a working pipeline is far
+/// inside this.
+const GPU_CONVERT_VERIFY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Set once the GPU colour conversion failed in a way that is not the PipeWire start race:
+/// later starts in this process (re-streams, reconnects) go straight to the CPU convert.
+static VA_CONVERT_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// A failed pipeline start. `gpu_path_broken`: the description itself failed (parse) or the
+/// failure came after PLAYING (no frame reached the encoder), so not the PipeWire node
+/// lagging the portal reply (that fails the state change and is worth a retry).
+struct StartError {
+	err: anyhow::Error,
+	gpu_path_broken: bool,
+}
+
+impl StartError {
+	fn not_playing(err: anyhow::Error) -> Self {
+		Self { err, gpu_path_broken: false }
+	}
+	fn broken(err: anyhow::Error) -> Self {
+		Self { err, gpu_path_broken: true }
+	}
+}
+
+/// Sets a pipeline that is still being started to NULL when it goes out of scope. The start
+/// future can be dropped at its await point (the caller cancels during the verify wait), and
+/// a PLAYING pipeline dropped without this keeps its streaming threads, VA contexts and
+/// PipeWire stream alive for the life of the process.
+struct NullOnDrop(Option<gst::Pipeline>);
+
+impl NullOnDrop {
+	fn get(&self) -> &gst::Pipeline {
+		self.0.as_ref().expect("pipeline present until disarmed")
+	}
+	fn disarm(mut self) -> gst::Pipeline {
+		self.0.take().expect("pipeline present until disarmed")
+	}
+}
+
+impl Drop for NullOnDrop {
+	fn drop(&mut self) {
+		if let Some(p) = self.0.take() {
+			let _ = p.set_state(gst::State::Null);
+		}
+	}
+}
+
+fn bus_error(pipeline: &gst::Pipeline) -> Option<String> {
+	pipeline
+		.bus()
+		.and_then(|b| b.pop_filtered(&[gst::MessageType::Error]))
+		.and_then(|m| match m.view() {
+			gst::MessageView::Error(e) => Some(format!("{}", e.error())),
+			_ => None,
+		})
+}
+
 /// Build the pipeline from the same description string the `gst-launch` path used, set it
 /// PLAYING and confirm it really got there (a PipeWire node that isn't ready fails the
 /// state change instead of streaming). Returns the pipeline + the encoder element.
-async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
-	let element = gst::parse::launch(desc)
-		.map_err(|e| anyhow::anyhow!("gst pipeline parse failed (gstreamer plugins kurulu mu?): {e}"))?;
+/// `verify`: also wait (bounded) until a buffer reaches the encoder's sink pad. Caps
+/// negotiation only happens once data flows, so a live source reaches PLAYING even when the
+/// elements behind it can never agree on a format.
+///
+/// Cancel-safe: dropping the future at its await point sets the pipeline to NULL.
+async fn run_pipeline(
+	desc: &str,
+	verify: Option<std::time::Duration>,
+) -> Result<(gst::Pipeline, Option<gst::Element>), StartError> {
+	let element = gst::parse::launch(desc).map_err(|e| {
+		StartError::broken(anyhow::anyhow!("gst pipeline parse failed (gstreamer plugins kurulu mu?): {e}"))
+	})?;
 	let pipeline = element
 		.downcast::<gst::Pipeline>()
-		.map_err(|_| anyhow::anyhow!("gst pipeline description did not build a pipeline"))?;
+		.map_err(|_| StartError::broken(anyhow::anyhow!("gst pipeline description did not build a pipeline")))?;
 	let venc = pipeline.by_name(ENCODER_NAME);
 	if venc.is_none() {
 		tracing::warn!("wayland pipeline has no `{ENCODER_NAME}` element — live bitrate/keyframe controls disabled");
 	}
-	pipeline
-		.set_state(gst::State::Playing)
-		.map_err(|e| anyhow::anyhow!("gst pipeline could not start: {e}"))?;
-	// The state change is async (PipeWire has to link the node): wait for PLAYING, bounded.
-	let (res, cur, _pending) = pipeline.state(gst::ClockTime::from_seconds(3));
-	if res.is_err() || cur != gst::State::Playing {
-		let msg = pipeline
-			.bus()
-			.and_then(|b| b.pop_filtered(&[gst::MessageType::Error]))
-			.and_then(|m| match m.view() {
-				gst::MessageView::Error(e) => Some(format!("{}", e.error())),
-				_ => None,
-			})
-			.unwrap_or_else(|| format!("state {cur:?}"));
-		let _ = pipeline.set_state(gst::State::Null);
-		return Err(anyhow::anyhow!(
-			"gst pipeline failed to reach PLAYING (pipewire/portal node not ready?): {msg}"
-		));
+	let first_buffer = Arc::new(AtomicBool::new(false));
+	if verify.is_some() {
+		let Some(pad) = venc.as_ref().and_then(|e| e.static_pad("sink")) else {
+			return Err(StartError::broken(anyhow::anyhow!("no encoder sink pad to verify the pipeline on")));
+		};
+		let seen = first_buffer.clone();
+		let _ = pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+			seen.store(true, Ordering::SeqCst);
+			gst::PadProbeReturn::Remove
+		});
 	}
-	Ok((pipeline, venc))
+	let pipeline = NullOnDrop(Some(pipeline));
+	pipeline
+		.get()
+		.set_state(gst::State::Playing)
+		.map_err(|e| StartError::not_playing(anyhow::anyhow!("gst pipeline could not start: {e}")))?;
+	// The state change is async (PipeWire has to link the node): wait for PLAYING, bounded.
+	let (res, cur, _pending) = pipeline.get().state(gst::ClockTime::from_seconds(3));
+	if res.is_err() || cur != gst::State::Playing {
+		let msg = bus_error(pipeline.get()).unwrap_or_else(|| format!("state {cur:?}"));
+		return Err(StartError::not_playing(anyhow::anyhow!(
+			"gst pipeline failed to reach PLAYING (pipewire/portal node not ready?): {msg}"
+		)));
+	}
+	if let Some(limit) = verify {
+		let deadline = std::time::Instant::now() + limit;
+		while !first_buffer.load(Ordering::SeqCst) {
+			let err = bus_error(pipeline.get());
+			if err.is_some() || std::time::Instant::now() >= deadline {
+				return Err(StartError::broken(anyhow::anyhow!(
+					"no frame reached the encoder: {}",
+					err.unwrap_or_else(|| format!("timed out after {limit:?}"))
+				)));
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		}
+	}
+	Ok((pipeline.disarm(), venc))
 }
 
 /// The short-GOP timer of a raw-frame capture: a keyframe request to the app's encoder every

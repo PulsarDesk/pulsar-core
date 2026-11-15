@@ -778,8 +778,38 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 	assert_eq!(screen, gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, None));
 	let win = gst::wayland_pipeline_sized(7, 42, "x264enc name=venc", "10.0.0.5", 9000, Some((1281, 719)));
 	assert!(
-		win.contains("format=NV12 ! videoscale add-borders=true ! video/x-raw,width=1280,height=718,pixel-aspect-ratio=1/1 ! x264enc name=venc"),
+		win.contains("format=NV12 ! videoscale n-threads=0 add-borders=true ! video/x-raw,width=1280,height=718,pixel-aspect-ratio=1/1 ! x264enc name=venc"),
 		"{win}"
 	);
 	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
+}
+
+#[test]
+fn gst_wayland_convert_uses_every_core_or_the_gpu() {
+	// CPU path (every encoder by default): the convert is sliced over all cores.
+	let cpu = gst::wayland_pipeline(7, 42, "x264enc name=venc", "10.0.0.5", 9000);
+	assert!(cpu.contains("! videoconvert n-threads=0 ! video/x-raw,format=NV12 ! x264enc name=venc"), "{cpu}");
+	// Only the `va` plugin's encoders get the GPU conversion.
+	let va = gst::encoder_fragment(gst::GstEncoder::Va, VCodec::H264, 8000, 60).unwrap();
+	assert_eq!(gst::wayland_convert_for(&va), gst::WaylandConvert::Va);
+	for enc in [gst::GstEncoder::Vaapi, gst::GstEncoder::Nv, gst::GstEncoder::X264, gst::GstEncoder::Mpp] {
+		let f = gst::encoder_fragment(enc, VCodec::H264, 8000, 60).unwrap();
+		assert_eq!(gst::wayland_convert_for(&f), gst::WaylandConvert::Cpu, "{f}");
+	}
+	let gpu = gst::wayland_pipeline_conv(7, 42, &va, "10.0.0.5", 9000, None, gst::WaylandConvert::Va);
+	assert!(gpu.contains("! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! vah264enc name=venc"), "{gpu}");
+	assert!(!gpu.contains("videoconvert"), "{gpu}");
+	// The caps in front of vapostproc stay open: DMA-BUF or SHM, whatever PipeWire offers.
+	assert!(!gpu.contains("memory:DMABuf"), "{gpu}");
+	// A window cast scales on the GPU too, into the same fixed even box.
+	let win = gst::wayland_pipeline_conv(7, 42, &va, "10.0.0.5", 9000, Some((1281, 719)), gst::WaylandConvert::Va);
+	assert!(
+		win.contains("vapostproc add-borders=true ! video/x-raw(memory:VAMemory),format=NV12,width=1280,height=718,pixel-aspect-ratio=1/1 ! vah264enc"),
+		"{win}"
+	);
+	// The X11 converts are threaded too.
+	let x = gst::x11_pipeline(":0", 60, "x264enc name=venc", "10.0.0.2", 9000, false, None);
+	assert!(x.contains("videoconvert n-threads=0"), "{x}");
+	let xw = gst::x11_window_pipeline(":0", 5, 60, (1280, 720), "x264enc name=venc", "10.0.0.2", 9000);
+	assert!(xw.contains("videoconvert n-threads=0 ! videoscale n-threads=0"), "{xw}");
 }
