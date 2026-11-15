@@ -33,7 +33,7 @@
 mod frames;
 mod live;
 pub use frames::{FrameEncoder, FrameEncoderFactory, RawFrame};
-pub use live::{start_pipeline, EncodeMsFn};
+pub use live::{start_pipeline, EncodeMsFn, StartError};
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
