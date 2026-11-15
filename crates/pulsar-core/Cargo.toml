@@ -103,6 +103,8 @@ windows-sys = { version = "0.61", features = [
 	"Win32_Storage_FileSystem",
 	"Win32_System_Com",
 	"Win32_UI_Shell",
+	# input/permission.rs: the input desktop's name (UAC prompt / lock screen = Winlogon).
+	"Win32_System_StationsAndDesktops",
 ] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).

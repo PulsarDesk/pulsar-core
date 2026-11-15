@@ -1277,6 +1277,14 @@ mod tests {
 		assert_eq!(QualityPref::default(), QualityPref::Balanced);
 	}
 
+	#[test]
+	fn input_unavailable_decodes_without_reason_and_wire_shape_is_stable() {
+		let m: DataMsg = serde_json::from_str(r#"{"InputUnavailable":{}}"#).unwrap();
+		assert_eq!(m, DataMsg::InputUnavailable { reason: String::new() });
+		let json = serde_json::to_string(&DataMsg::InputUnavailable { reason: "win_elevated".into() }).unwrap();
+		assert_eq!(json, r#"{"InputUnavailable":{"reason":"win_elevated"}}"#);
+	}
+
 	/// Guard against the DataMsgWire shadow-enum drift trap (bug C21).
 	///
 	/// Every `DataMsg` variant must survive a serialize→deserialize roundtrip
@@ -1288,14 +1296,6 @@ mod tests {
 	///
 	/// When you add a new `DataMsg` variant you MUST add a corresponding entry to
 	/// this test (and mirror the variant in `DataMsgWire` + its `From` impl).
-	#[test]
-	fn input_unavailable_decodes_without_reason_and_wire_shape_is_stable() {
-		let m: DataMsg = serde_json::from_str(r#"{"InputUnavailable":{}}"#).unwrap();
-		assert_eq!(m, DataMsg::InputUnavailable { reason: String::new() });
-		let json = serde_json::to_string(&DataMsg::InputUnavailable { reason: "win_elevated".into() }).unwrap();
-		assert_eq!(json, r#"{"InputUnavailable":{"reason":"win_elevated"}}"#);
-	}
-
 	#[test]
 	fn data_msg_all_variants_roundtrip() {
 		let cases: &[DataMsg] = &[
