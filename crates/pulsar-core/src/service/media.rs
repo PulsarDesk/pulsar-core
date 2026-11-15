@@ -441,9 +441,11 @@ pub const FEAT_RFI: &str = "rfi";
 pub const FEAT_IR: &str = "ir";
 /// Feature id: the host streams real HDR10 (10-bit, BT.2020 primaries, SMPTE ST 2084 PQ, HEVC
 /// Main10 / AV1 10-bit, with mastering-display metadata where the encoder can carry it) when
-/// the client asks with [`StreamReq::hdr`](crate::service::StreamReq::hdr) and the streamed
-/// monitor is in HDR mode ([`DisplayInfo::hdr`](crate::service::DisplayInfo::hdr)). A host
-/// without it never sends HDR: a client must not expect a 10-bit picture from it.
+/// the client asks with [`StreamReq::hdr10`](crate::service::StreamReq::hdr10) (never on the
+/// legacy `hdr` bit) and the streamed monitor is in HDR mode
+/// ([`DisplayInfo::hdr`](crate::service::DisplayInfo::hdr)); it then also sends
+/// [`DataMsg::HdrMeta`](crate::service::DataMsg::HdrMeta). A host without it never sends HDR:
+/// a client must not expect a 10-bit picture from it.
 pub const FEAT_HDR: &str = "hdr";
 /// Tag byte: a bandwidth-probe packet follows (`adapt::probe::Hdr` + padding). Only sent in
 /// answer to a client's [`DataMsg::ProbeReq`](crate::service::DataMsg::ProbeReq), so a client
