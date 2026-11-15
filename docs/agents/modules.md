@@ -27,7 +27,7 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (`RepairTracker`: seq gaps → reorder wait / FEC wait → NACK, one re-NACK ~1 RTT later,
   write-off after the RTT-derived window; window counters incl. goodput; FEC share learned per
   window and released when parity stops; `RttWindow`, `KeyframePacer`, `FrameClock`,
-  `decoder_overloaded` / `decoder_sheds`); `caps` = `auto_cap_kbps` (15-150 Mbit, mobile
+  `decoder_overloaded` / `decoder_sheds`); `pong` = the uneven Ping cadence + `PongMatcher`; `caps` = `auto_cap_kbps` (15-150 Mbit, mobile
   ≤ 50 Mbit) + `path_cap_kbps` (relay cap while relayed); `memory` = per-peer × `PathClass`
   (lan / wan / relay) last-clean-rate file. `Controller::client_decode_bound` also acts with the
   ladder off (mobile: the decoder steps the fps down, the point otherwise stays fixed).

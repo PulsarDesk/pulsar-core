@@ -840,7 +840,7 @@ mod tests {
 		Duration::from_millis(v)
 	}
 
-	fn rtts(v: &[f32]) -> VecDeque<f32> {
+	fn rtts(v: &[f32]) -> std::collections::VecDeque<f32> {
 		v.iter().copied().collect()
 	}
 
@@ -856,16 +856,19 @@ mod tests {
 
 	#[test]
 	fn keyframe_requests_back_off_during_a_loss_streak() {
+		let ms = Duration::from_millis;
+		// A lone loss is answered fast...
 		assert!(kf_allowed(ms(600), KF_GAP_MIN, 20.0));
-		// Never sooner than ~2 RTT.
+		// ...but not before ~2 RTT (the requested keyframe can't be here yet).
 		assert!(!kf_allowed(ms(600), KF_GAP_MIN, 300.0));
+		// Requests in a streak double the gap up to the cap.
 		let mut gap = KF_GAP_MIN;
-		for _ in 0..5 {
+		for want in [1000, 2000, 4000, 4000] {
 			gap = kf_next_gap(ms(600), gap);
+			assert_eq!(gap, ms(want));
 		}
-		assert_eq!(gap, KF_GAP_MAX);
 		assert!(!kf_allowed(ms(3000), gap, 20.0));
-		// A quiet 5 s resets it.
+		// A quiet spell resets it.
 		assert_eq!(kf_next_gap(Duration::from_secs(6), gap), KF_GAP_MIN);
 	}
 
@@ -890,14 +893,16 @@ mod tests {
 
 	#[test]
 	fn a_pipelined_decoder_is_not_overloaded() {
-		// ~one frame interval at any fps but every AU decoded: pipelined, not behind.
-		assert!(!decoder_overloaded(11.0, 120.0, 120));
-		assert!(!decoder_overloaded(17.0, 60.0, 60));
-		// Behind: most of the budget AND shedding AUs.
-		assert!(decoder_overloaded(12.0, 80.0, 120));
-		// Unknown decoded rate / time: no verdict.
-		assert!(!decoder_overloaded(12.0, 0.0, 120));
+		// The 2026-11-14 laptop: decode time ≈ the frame interval, every AU decoded.
+		assert!(!decoder_overloaded(11.3, 119.0, 120));
+		assert!(!decoder_overloaded(17.4, 60.0, 60));
+		// Behind for real: most of the frame time AND AUs shed.
+		assert!(decoder_overloaded(11.3, 80.0, 120));
+		// Not reported (an older renderer, other platforms) or no stats yet: never.
+		assert!(!decoder_overloaded(11.3, 0.0, 120));
 		assert!(!decoder_overloaded(0.0, 80.0, 120));
+		// Fast decoding with few AUs is a thin stream, not a slow decoder.
+		assert!(!decoder_overloaded(2.0, 30.0, 120));
 	}
 
 	#[test]
@@ -910,106 +915,142 @@ mod tests {
 
 	#[test]
 	fn repair_window_follows_median_rtt_and_jitter() {
-		// No samples: the upper bound.
+		// No samples yet: the upper bound; the renderer then waits the full 250 ms.
 		assert_eq!(repair_window_ms(&rtts(&[]), 0.0), REPAIR_MAX_MS);
-		// A steady LAN: the floor.
-		assert_eq!(repair_window_ms(&rtts(&[2.0, 2.0, 3.0]), 0.0), REPAIR_MIN_MS);
-		// A steady 60 ms WAN: RTT + slack.
-		let w = repair_window_ms(&rtts(&[60.0, 60.0, 60.0]), 0.0);
-		assert!((w - 80.0).abs() < 0.01, "{w}");
-		// Jitter widens it; FEC hold adds to it.
-		assert!(repair_window_ms(&rtts(&[40.0, 80.0, 60.0, 100.0]), 0.0) > 80.0);
-		assert!(repair_window_ms(&rtts(&[60.0]), 30.0) > repair_window_ms(&rtts(&[60.0]), 0.0));
-		// A slow path never past the cap.
-		assert_eq!(repair_window_ms(&rtts(&[400.0, 450.0]), 0.0), REPAIR_MAX_MS);
-		assert!((rtt_jitter_ms(&rtts(&[4.0, 4.0, 5.0])) - 1.0 / 3.0).abs() < 0.01);
+		assert_eq!(REPAIR_MAX_MS + REPAIR_SWEEP_MS as f32, 250.0);
+		// A steady 78 ms mobile path: median + slack, no jitter term.
+		assert_eq!(repair_window_ms(&rtts(&[78.0; 8]), 0.0), 78.0 + REPAIR_SLACK_MS);
+		// Jitter widens it: median 80, mean |dev| 8 → 80 + 2 × 8 + slack.
+		let w = repair_window_ms(&rtts(&[70.0, 90.0, 70.0, 90.0, 80.0]), 0.0);
+		assert!((w - (80.0 + 2.0 * 8.0 + REPAIR_SLACK_MS)).abs() < 0.01, "{w}");
+		// The field link (avg 78, spikes to 248) no longer reaches ~600 ms: capped.
+		let field = repair_window_ms(&rtts(&[60.0, 248.0, 75.0, 230.0, 90.0, 210.0, 70.0, 240.0]), 0.0);
+		assert_eq!(field, REPAIR_MAX_MS);
+		// A LAN: the lower bound (a retransmit still has room to land).
+		assert_eq!(repair_window_ms(&rtts(&[2.0, 3.0, 2.0]), 0.0), REPAIR_MIN_MS);
+		// NACKs held for FEC add their wait.
+		assert_eq!(repair_window_ms(&rtts(&[50.0; 4]), 25.0), 50.0 + REPAIR_SLACK_MS + 25.0);
 	}
 
+	/// Game mode on a high-RTT path with RFI / intra refresh: holes are dropped fast (with
+	/// hysteresis); remote desktop, a keyframe-only recovery, or a LAN keep the repair wait.
 	#[test]
 	fn fast_drop_only_in_game_mode_on_a_high_rtt_path_with_keyframe_free_recovery() {
-		assert!(fast_drop_on(false, true, true, 40.0));
-		assert!(!fast_drop_on(false, false, true, 40.0), "remote desktop keeps the repair wait");
-		assert!(!fast_drop_on(false, true, false, 40.0), "a keyframe recovery needs the repair");
-		assert!(!fast_drop_on(false, true, true, 30.0), "under the on threshold");
-		assert!(fast_drop_on(true, true, true, 30.0), "hysteresis keeps it on");
+		assert!(fast_drop_on(false, true, true, 45.0));
+		assert!(!fast_drop_on(false, true, true, 4.0), "LAN");
+		assert!(!fast_drop_on(false, false, true, 45.0), "remote desktop keeps the repair wait");
+		assert!(!fast_drop_on(false, true, false, 45.0), "a keyframe recovery would re-flood the link");
+		// Hysteresis: on at 35, off under 25.
+		assert!(!fast_drop_on(false, true, true, 30.0));
+		assert!(fast_drop_on(true, true, true, 30.0));
 		assert!(!fast_drop_on(true, true, true, 20.0));
+		assert!(!fast_drop_on(true, true, true, 0.0), "no RTT yet");
 	}
 
 	#[test]
 	fn fast_drop_wait_covers_reordering_and_fec_but_never_an_rtt() {
-		assert_eq!(fast_drop_wait_ms(3.0, 120), FAST_DROP_MIN_MS);
-		let w = fast_drop_wait_ms(41.0, 60);
-		assert!(w > 60.0 && w <= FAST_DROP_MAX_MS, "{w}");
-		assert_eq!(fast_drop_wait_ms(200.0, 30), FAST_DROP_MAX_MS);
+		// Reorder wait 3 ms at 60 fps: a frame plus slack, at least the floor.
+		assert_eq!(fast_drop_wait_ms(3.0, 60), 30.0);
+		// The ~20 % reordering of a phone tether (25 ms wait) under FEC's go (two frames + 8 ms at
+		// 60 fps = 41 ms) + a frame + slack: ~68 ms.
+		let w = fast_drop_wait_ms(fec_wait_ms(60).max(reorder_wait_ms(40.0)), 60);
+		assert!((60.0..=75.0).contains(&w), "{w}");
+		// Never more than the cap, whatever the waits.
+		assert_eq!(fast_drop_wait_ms(500.0, 30), FAST_DROP_MAX_MS);
+		// Far under the normal repair window on a 45 ms path.
+		assert!(fast_drop_wait_ms(25.0, 120) < repair_window_ms(&rtts(&[45.0, 46.0, 44.0]), 0.0) + REPAIR_SWEEP_MS as f32);
 	}
 
 	#[test]
 	fn fec_wait_is_two_frames_bounded() {
-		assert!((fec_wait_ms(60) - (2000.0 / 60.0 + 8.0)).abs() < 0.01);
-		assert!((fec_wait_ms(240) - (2000.0 / 240.0 + 8.0)).abs() < 0.01);
-		assert_eq!(fec_wait_ms(10), 50.0);
-		assert_eq!(fec_wait_ms(0), fec_wait_ms(60));
-		assert!(fec_active(Some(ms(200))));
-		assert!(!fec_active(Some(Duration::from_secs(2))));
+		assert!((fec_wait_ms(120) - (2000.0 / 120.0 + 8.0)).abs() < 0.01);
+		assert!((fec_wait_ms(0) - (2000.0 / 60.0 + 8.0)).abs() < 0.01, "host default = 60 fps");
+		assert_eq!(fec_wait_ms(30), 50.0);
+		assert_eq!(fec_wait_ms(1000), 15.0);
+		// FEC counts as on while parity arrived within the last second.
 		assert!(!fec_active(None));
+		assert!(fec_active(Some(Duration::from_millis(300))));
+		assert!(!fec_active(Some(Duration::from_secs(2))));
 	}
 
 	#[test]
 	fn the_nack_waits_for_reordering_and_for_fec() {
 		assert_eq!(nack_wait_ms(false, 60, 0.0), REORDER_WAIT_MIN_MS);
-		assert_eq!(nack_wait_ms(false, 60, 100.0), REORDER_WAIT_MAX_MS);
-		assert!((nack_wait_ms(true, 60, 0.0) - fec_wait_ms(60)).abs() < 0.01);
+		assert_eq!(nack_wait_ms(false, 60, 8.0), 10.0);
+		assert_eq!(nack_wait_ms(false, 60, 400.0), REORDER_WAIT_MAX_MS);
+		// FEC's go is longer than a small reorder wait.
+		assert_eq!(nack_wait_ms(true, 120, 2.0), fec_wait_ms(120));
 	}
 
 	#[test]
 	fn a_late_original_is_reordering_not_a_repair() {
-		let t = Instant::now();
-		assert!(!arrival_is_repair(None, t, 20.0));
-		assert!(!arrival_is_repair(Some(t), t + ms(5), 20.0));
-		assert!(arrival_is_repair(Some(t), t + ms(15), 20.0));
+		let t0 = std::time::Instant::now();
+		let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+		// Never NACKed: it filled the gap by itself.
+		assert!(!arrival_is_repair(None, ms(10), 8.0));
+		// NACKed 2 ms ago on an 8 ms path: the retransmit can't be back yet — the original.
+		assert!(!arrival_is_repair(Some(ms(0)), ms(2), 8.0));
+		// NACKed a full RTT ago: the retransmit.
+		assert!(arrival_is_repair(Some(ms(0)), ms(9), 8.0));
 	}
 
 	#[test]
 	fn goodput_from_window_bytes() {
 		assert_eq!(goodput_kbps(250_000, 2000), 1000);
-		assert_eq!(goodput_kbps(1, 0), 0);
+		assert_eq!(goodput_kbps(250_000, 0), 0);
 	}
 
 	#[test]
 	fn nack_waits_for_fec_until_it_gave_up() {
-		assert!(!fec_block_gave_up(1, 2, 0));
-		assert!(fec_block_gave_up(3, 2, 0), "more missing than parity");
-		assert!(fec_block_gave_up(1, 2, 1), "the last shard is here");
-		let t0 = Instant::now();
-		let miss = |n: Option<Instant>| Miss { t0, nacked: n, renacked: false };
-		let mut missing = HashMap::new();
+		// A block of 10 packets with 2 parity shards.
+		assert!(!fec_block_gave_up(1, 2, 0), "first shard, more to come: wait");
+		assert!(fec_block_gave_up(1, 2, 1), "last shard here, still missing: FEC is done");
+		assert!(fec_block_gave_up(3, 2, 0), "3 missing > 2 parity: never repairable");
+		assert!(!fec_block_gave_up(2, 2, 0));
+
+		let t0 = std::time::Instant::now();
+		let miss = |nacked: Option<std::time::Instant>| Miss { t0, nacked, renacked: false };
+		let mut missing = std::collections::HashMap::new();
+		// 101 and 103 held for FEC, 200 already NACKed (FEC was off when it went missing).
 		missing.insert(101u16, miss(None));
 		missing.insert(103u16, miss(None));
 		missing.insert(200u16, miss(Some(t0)));
-		assert_eq!(missing_in(&missing, 100, 4), 2);
-		let mut got = take_block_nacks(&mut missing, 100, 4, t0);
-		got.sort();
-		assert_eq!(got, vec![101, 103]);
-		assert!(take_block_nacks(&mut missing, 100, 4, t0).is_empty(), "NACKed once");
-		let mut pending: VecDeque<(u16, Instant)> = VecDeque::new();
+		assert_eq!(missing_in(&missing, 100, 10), 2);
+		let mut pending: std::collections::VecDeque<(u16, std::time::Instant)> =
+			[(101u16, t0), (103u16, t0)].into_iter().collect();
+		let wait = Duration::from_millis(25);
+		// Within the wait nothing is NACKed.
+		assert!(take_due_fec_nacks(&mut pending, &mut missing, wait, t0 + Duration::from_millis(10)).is_empty());
+		assert_eq!(pending.len(), 2);
+		// The block's parity gave up on 103's block (100..105): only its held seqs go, once.
+		let now = t0 + Duration::from_millis(12);
+		assert_eq!(take_block_nacks(&mut missing, 100, 5, now), vec![101, 103]);
+		assert!(take_block_nacks(&mut missing, 100, 5, now).is_empty(), "never twice");
+		assert_eq!(missing[&103].nacked, Some(now));
+		// A held seq FEC rebuilt meanwhile (gone from `missing`) is never NACKed; a due one is.
+		let t1 = t0 + Duration::from_millis(30);
 		missing.insert(300u16, miss(None));
 		missing.insert(301u16, miss(None));
 		missing.remove(&300);
-		pending.push_back((300, t0));
-		pending.push_back((301, t0));
-		assert!(take_due_fec_nacks(&mut pending, &mut missing, ms(30), t0 + ms(10)).is_empty());
-		assert_eq!(take_due_fec_nacks(&mut pending, &mut missing, ms(30), t0 + ms(40)), vec![301]);
+		pending.clear();
+		pending.extend([(300u16, t0), (301u16, t0)]);
+		assert_eq!(take_due_fec_nacks(&mut pending, &mut missing, wait, t1), vec![301]);
 		assert!(pending.is_empty());
+		// FEC off (zero wait): every held NACK goes at once.
+		missing.insert(400u16, miss(None));
+		pending.push_back((400, t1));
+		assert_eq!(take_due_fec_nacks(&mut pending, &mut missing, Duration::ZERO, t1), vec![400]);
 	}
 
 	#[test]
 	fn rebuilt_seqs_are_remembered_bounded() {
-		let mut r = VecDeque::new();
+		let mut r = std::collections::VecDeque::new();
 		for s in 0..(FEC_REBUILT_KEEP as u16 + 10) {
 			note_rebuilt(&mut r, s);
 		}
 		assert_eq!(r.len(), FEC_REBUILT_KEEP);
-		assert_eq!(r.front(), Some(&10));
+		assert!(!r.contains(&0));
+		assert!(r.contains(&(FEC_REBUILT_KEEP as u16 + 9)));
 	}
 
 	#[test]

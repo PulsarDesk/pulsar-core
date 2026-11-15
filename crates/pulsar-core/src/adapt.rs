@@ -10,6 +10,7 @@
 //!   re-NACK, write-off; window counters incl. goodput; FEC share; keyframe pacing).
 //! * [`caps`] — the automatic ceiling (`auto_cap_kbps`) and the live path's cap.
 //! * [`memory`] — the per-peer, per-path-class memory of the last clean rate.
+//! * [`pong`] — keepalive RTT: the uneven Ping cadence and the Pong matcher.
 //!
 //! No I/O anywhere in here (except `memory`'s best-effort JSON file at a path the app gives):
 //! the apps measure, call, and actuate (`StreamReq`).
@@ -19,6 +20,7 @@ pub mod delay;
 pub mod fec_policy;
 pub mod ladder;
 pub mod memory;
+pub mod pong;
 pub mod probe;
 pub mod repair;
 
