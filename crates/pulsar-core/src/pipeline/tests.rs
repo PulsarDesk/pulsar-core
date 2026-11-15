@@ -399,6 +399,10 @@ fn probe_command_is_one_frame_to_null() {
 	assert!(j.contains("hwupload"));
 	// Unsupported combo → None.
 	assert!(probe_command(HwEncoder::VideoToolbox, VCodec::Av1, "").is_none());
+	// Media Foundation: NV12 input + the hardware MFT, like the stream itself.
+	let (_, mf) = probe_command(HwEncoder::MediaFoundation, VCodec::H265, "").unwrap();
+	let j = mf.join(" ");
+	assert!(j.contains("-vf format=nv12 -c:v hevc_mf -hw_encoding 1"), "{j}");
 }
 
 #[test]
