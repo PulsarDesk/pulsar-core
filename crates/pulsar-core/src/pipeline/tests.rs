@@ -76,7 +76,7 @@ fn ddagrab_filter_format_matches_command_pixfmt_for_all_encoders() {
 		(HwEncoder::Nvenc, false, true, true),
 		(HwEncoder::Nvenc, true, true, true),
 		(HwEncoder::Nvenc, false, false, true),
-		// NVENC hybrid: no trailing format= in filter (direct D3D11→NVENC), no -pix_fmt.
+		// NVENC hybrid: BGRA readback → scale_cuda format=nv12 (SDR 4:2:0), no -pix_fmt.
 		(HwEncoder::Nvenc, true, false, false),
 		(HwEncoder::Nvenc, false, true, false),
 		(HwEncoder::Nvenc, true, true, false),
@@ -515,27 +515,25 @@ fn ddagrab_is_fully_gpu_per_encoder() {
 		"zero-copy must not round-trip to CPU"
 	);
 
-	// NVENC hybrid (display on iGPU, CUDA map unavailable): feed ddagrab's D3D11 frame
-	// STRAIGHT into NVENC — no CPU round-trip at all (the hwdownload/hwupload path capped
-	// ~51 fps on a 3080 laptop). NVENC does the cross-GPU copy itself.
+	// NVENC hybrid (display on iGPU, CUDA map unavailable): NVENC cannot open a session on
+	// the iGPU's D3D11 device ("no encode device", measured 2026-11-15), so the frame is read
+	// back once as BGRA and scaled + converted on the NVIDIA GPU — never a CPU swscale (the
+	// old swscale round trip capped ~51 fps on a 3080 laptop).
 	p.gpu_zerocopy = false;
 	let f = encode_command(&p).1.join(" ");
 	assert!(
-		!f.contains("hwdownload"),
-		"hybrid NVENC must not round-trip to CPU"
+		f.contains("hwdownload,format=bgra,hwupload_cuda,scale_cuda=1920:1080:format=nv12,fps=60"),
+		"hybrid NVENC goes through CUDA: {f}"
 	);
-	assert!(
-		!f.contains("scale_cuda"),
-		"no on-GPU scaler without the CUDA map; native res"
-	);
+	assert!(!f.contains(",scale=") && !f.contains("-pix_fmt"), "no CPU scaler / pix_fmt: {f}");
 
-	// Hybrid, capture size known and EQUAL to the request: still the direct D3D11 feed.
+	// Hybrid, capture size EQUAL to the request: the capture's own size (scale_cuda only
+	// converts to NV12).
 	p.capture_size = Some((1920, 1080));
 	let f = encode_command(&p).1.join(" ");
-	assert!(!f.contains("hwdownload") && !f.contains("scale_cuda"), "{f}");
+	assert!(f.contains("scale_cuda=1920:1080:format=nv12"), "{f}");
 
-	// Hybrid asked for another size than the capture's: honoured, scaled on the NVIDIA GPU
-	// (BGRA readback → CUDA → scale_cuda to NV12) — never ignored, never a CPU swscale.
+	// Hybrid asked for a SMALLER size than the capture's: honoured, scaled on the NVIDIA GPU.
 	p.capture_size = Some((2560, 1600));
 	let f = encode_command(&p).1.join(" ");
 	assert!(
@@ -543,6 +541,25 @@ fn ddagrab_is_fully_gpu_per_encoder() {
 		"hybrid must scale to the requested size: {f}"
 	);
 	assert!(!f.contains(",scale=") && !f.contains("-pix_fmt"), "no CPU scaler / pix_fmt: {f}");
+
+	// Hybrid asked for a LARGER size than the capture (a 1440p client, a 1080p panel): never
+	// upscaled — clamped to the capture per axis, as the native DXGI path does.
+	p.capture_size = Some((1920, 1080));
+	p.width = 2560;
+	p.height = 1440;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080:format=nv12") && !f.contains("2560"), "{f}");
+	// One axis larger, one smaller: each axis clamped on its own (and evened).
+	p.capture_size = Some((1366, 768));
+	p.width = 1280;
+	p.height = 1080;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1280:768:format=nv12"), "{f}");
+	p.capture_size = Some((1365, 767));
+	p.width = 1920;
+	p.height = 1080;
+	let f = encode_command(&p).1.join(" ");
+	assert!(f.contains("scale_cuda=1364:766:format=nv12"), "odd capture is evened: {f}");
 	p.capture_size = None;
 
 	// AMD AMF: NV12, no yuv420p swscale.
@@ -817,11 +834,11 @@ fn odd_sizes_are_evened_on_the_ffmpeg_paths() {
 	z.gpu_zerocopy = true;
 	let f = encode_command(&z).1.join(" ");
 	assert!(f.contains("scale_cuda=1920:1080") && !f.contains("1921"), "{f}");
-	// Hybrid NVENC: the evened request equals the capture → the direct feed, no scaler.
+	// Hybrid NVENC: the evened request equals the capture → the capture's own size.
 	let mut h = odd(HwEncoder::Nvenc, CaptureMethod::Ddagrab);
 	h.capture_size = Some((1920, 1080));
 	let f = encode_command(&h).1.join(" ");
-	assert!(!f.contains("scale_cuda") && !f.contains("hwdownload"), "{f}");
+	assert!(f.contains("scale_cuda=1920:1080:") && !f.contains("1921"), "{f}");
 	let f = encode_command(&odd(HwEncoder::Software, CaptureMethod::Gdigrab)).1.join(" ");
 	assert!(f.contains("scale=1920:1080") && !f.contains("1921"), "{f}");
 	// Linux x11grab region.

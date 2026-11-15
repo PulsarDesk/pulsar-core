@@ -133,8 +133,21 @@ impl CaptureMethod {
 			// the frame stays on the GPU wherever possible — the old "hwdownload → CPU
 			// scale → yuv420p → re-upload" round trip pinned a CPU core + both GPUs.
 			Self::Ddagrab => {
-				let (fps, w, h) = (plan.fps, plan.width, plan.height);
+				let (fps, mut w, mut h) = (plan.fps, plan.width, plan.height);
 				let oi = plan.output_idx;
+				// Hybrid NVENC (no CUDA map): never UPSCALE the capture. On Windows the request
+				// is the client's raw size (not clamped to the screen), and a duplication has
+				// no more detail than its own size — upscaling only costs encoder pixels and
+				// bits per real pixel. Clamp each axis to the capture (evened), as the native
+				// DXGI path does (`pulsar-capture` `target_size`), so a request at or above
+				// the capture streams the capture's own size and only a smaller one is
+				// scaled. Unknown capture size (`None`): the request as is.
+				if plan.encoder == HwEncoder::Nvenc && !plan.gpu_zerocopy {
+					if let Some((cw, ch)) = plan.capture_size {
+						w = (w.min(cw).max(2)) & !1;
+						h = (h.min(ch).max(2)) & !1;
+					}
+				}
 				// CPU-bounce target format honors HDR (10-bit) / YUV444 — the encoder's
 				// `-pix_fmt` (set in encode_command) must match what the filter produces.
 				// NOTE: uses plan.effective_hdr() / plan.effective_yuv444() (not the raw
@@ -158,33 +171,30 @@ impl CaptureMethod {
 					),
 					// NVENC where the zero-copy CUDA map isn't available (hybrid laptop: the
 					// display is on the iGPU, so ffmpeg's `hwmap=derive_device=cuda` fails with
-					// -40). Feed ddagrab's D3D11 frame STRAIGHT into h264_nvenc — NVENC ingests the
-					// D3D11 texture and does the cross-GPU copy itself on the GPU. This is what
-					// Sunshine/Parsec do; it avoids the old hwdownload→CPU-convert→hwupload round
-					// trip (which pinned ~3 CPU cores and capped ~51 fps). There is no on-GPU
-					// scaler on that path, so it only runs when the requested size IS the
-					// capture's own size (or that size is unknown: `capture_size: None` keeps the
-					// old behaviour).
-					// HDR/YUV444 degraded to SDR 4:2:0 for the same reason as zero-copy above.
-					HwEncoder::Nvenc if plan.capture_size.is_none_or(|s| s == (w, h)) => {
-						// `fps={fps}` forces CONSTANT-frame-rate output (even-interval timestamps).
-						// ddagrab/DXGI only delivers a frame when the screen CHANGES, so on a desktop
-						// it emits ~65 fps IRREGULARLY → the client receives jittery frame intervals →
-						// cursor/typing feel hitchy even though input is instant. The fps filter
-						// duplicates the last frame to pace delivery to a steady {fps} (Sunshine does
-						// the same), so the client presents smoothly.
-						format!("ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,fps={fps}")
-					}
-					// Hybrid NVENC asked for ANOTHER size than the capture's (a smaller client
-					// window, a host desktop bigger than the request): the size must be honoured
-					// (bitrate per pixel, the client's layout), so scale on the NVIDIA GPU. The
-					// frame comes down once as raw BGRA (a readback, no CPU colour conversion or
-					// scaling — that swscale step is what made the old round trip expensive),
-					// goes up to CUDA, and `scale_cuda` scales + converts to NV12 there.
+					// -40). ddagrab's frame lives on the iGPU's D3D11 device, and NVENC cannot open
+					// a session on that device: feeding it straight in fails with
+					// "OpenEncodeSessionEx failed: no encode device" (measured 2026-11-15, RTX 3080
+					// Laptop + Vega panel, h264_nvenc and hevc_nvenc, bundled BtbN build) — so the
+					// "direct D3D11 feed" this branch used to have never opened on a hybrid box.
+					// The frame comes down once as raw BGRA (a readback, no CPU colour conversion
+					// or scaling — the swscale step is what made the old round trip pin ~3 cores
+					// and cap ~51 fps), goes up to CUDA, and `scale_cuda` scales + converts to NV12
+					// on the NVIDIA GPU. The size is clamped to the capture above, so this only
+					// ever keeps or DOWNscales. Measured 2026-11-15 on that box with a real
+					// ddagrab of the 1920x1200@120 panel: 960/960 frames in 8 s at 120 fps for
+					// 1920x1200, 1600x1000 and 1280x800, ~0.3-0.4 CPU core. The synthetic per-step
+					// cost at 1920x1200 is ~3 ms readback + ~2-4 ms CUDA upload/scale per frame:
+					// a few ms of latency the zero-copy branch does not pay, which is why the
+					// native capture paths (DXGI/WGC + NVENC SDK) stay first on Windows.
 					// `scale_d3d11` (scale on the capture GPU) is not an option: measured
 					// 2026-11-15 on the bundled BtbN build it fails to create its output texture
-					// (E_INVALIDARG) on both the RTX 3080 Laptop and the AMD iGPU. `fps` goes
-					// last so its duplicated frames are references, not extra readbacks.
+					// (E_INVALIDARG) on both the RTX 3080 Laptop and the AMD iGPU.
+					// `fps={fps}` forces CONSTANT-frame-rate output (even-interval timestamps):
+					// ddagrab/DXGI only delivers a frame when the screen CHANGES, so on a desktop
+					// it emits ~65 fps IRREGULARLY → jittery frame intervals at the client. The fps
+					// filter duplicates the last frame to a steady {fps} (Sunshine does the same);
+					// it goes last so its duplicates are references, not extra readbacks.
+					// HDR/YUV444 degraded to SDR 4:2:0 for the same reason as zero-copy above.
 					HwEncoder::Nvenc => format!(
 						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,hwupload_cuda,scale_cuda={w}:{h}:format=nv12,fps={fps}"
 					),
