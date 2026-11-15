@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::service::media::RsFecDecoder;
+use crate::service::media::{parse_rs_parity, RsFecDecoder, FEC_MAX_PACKET};
 
 /// What the decoder gets, in play order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,16 +44,21 @@ pub struct RepairStats {
 const JUMP: u16 = 64;
 /// Most packets waiting behind one hole; past this the hole is given up at once.
 const MAX_HELD: usize = 32;
+/// Largest parity block shape accepted (`audio_fec_shape`: Opus 2+1, L16 4+2). Anything else is
+/// not audio parity and is dropped before the decoder stores its shards.
+const MAX_PARITY_K: u8 = 4;
+const MAX_PARITY_M: u8 = 2;
 
 /// See the module docs.
 #[derive(Debug)]
 pub struct AudioRepair {
 	fec: RsFecDecoder,
 	next: Option<u16>,
-	/// Packets ahead of `next`, sorted by sequence distance from it.
-	held: VecDeque<(u16, Vec<u8>)>,
-	/// When the current hole was first seen.
-	hole_since: Option<Instant>,
+	/// Packets ahead of `next`, sorted by sequence distance from it, with their arrival time.
+	/// The hole in front of them falls due `hold` after the EARLIEST of those arrivals, so no
+	/// packet waits longer than `hold` (and a second hole gets its own time once the first
+	/// one fills, from the packets behind it).
+	held: VecDeque<(u16, Vec<u8>, Instant)>,
 	out: VecDeque<Repaired>,
 	stats: RepairStats,
 }
@@ -70,7 +75,6 @@ impl AudioRepair {
 			fec: RsFecDecoder::new(64),
 			next: None,
 			held: VecDeque::new(),
-			hole_since: None,
 			out: VecDeque::new(),
 			stats: RepairStats::default(),
 		}
@@ -87,8 +91,14 @@ impl AudioRepair {
 		self.place(seq, rtp, now, false);
 	}
 
-	/// An audio parity datagram arrived (the body after `TAG_AUDIO_FEC`).
+	/// An audio parity datagram arrived (the body after `TAG_AUDIO_FEC`). Only audio block
+	/// shapes are taken: the decoder keeps shards per block, so an arbitrary (k, m, length)
+	/// from whoever can reach the port would otherwise cost memory.
 	pub fn push_parity(&mut self, body: &[u8], now: Instant) {
+		let Some(h) = parse_rs_parity(body) else { return };
+		if h.k > MAX_PARITY_K || h.m > MAX_PARITY_M || h.shard_len as usize > FEC_MAX_PACKET + 2 {
+			return;
+		}
 		for (seq, pkt) in self.fec.on_parity(body) {
 			self.place(seq, pkt, now, true);
 		}
@@ -106,13 +116,18 @@ impl AudioRepair {
 	/// When the open hole falls due (`None`: no hole), so a caller blocked on its input can
 	/// wake up for it.
 	pub fn deadline(&self, hold: Duration) -> Option<Instant> {
-		self.hole_since.map(|t| t + hold)
+		self.hole_since().map(|t| t + hold)
+	}
+
+	/// When the open hole started to delay a packet: the earliest arrival behind it.
+	fn hole_since(&self) -> Option<Instant> {
+		self.held.iter().map(|(_, _, t)| *t).min()
 	}
 
 	fn place(&mut self, seq: u16, pkt: Vec<u8>, now: Instant, rebuilt: bool) {
 		let Some(next) = self.next else {
 			self.next = Some(seq);
-			self.insert(0, seq, pkt, rebuilt);
+			self.insert(0, seq, pkt, now, rebuilt);
 			self.drain_in_order(now);
 			return;
 		};
@@ -132,25 +147,24 @@ impl AudioRepair {
 			self.restart(seq, pkt, now, rebuilt);
 			return;
 		}
-		self.insert(ahead, seq, pkt, rebuilt);
+		self.insert(ahead, seq, pkt, now, rebuilt);
 		self.drain_in_order(now);
 	}
 
 	fn restart(&mut self, seq: u16, pkt: Vec<u8>, now: Instant, rebuilt: bool) {
 		// Whatever waited behind a hole of the old stream still plays first, in order.
-		while let Some((_, p)) = self.held.pop_front() {
+		while let Some((_, p, _)) = self.held.pop_front() {
 			self.out.push_back(Repaired::Packet(p));
 		}
-		self.hole_since = None;
 		self.out.push_back(Repaired::Restart);
 		self.next = Some(seq);
-		self.insert(0, seq, pkt, rebuilt);
+		self.insert(0, seq, pkt, now, rebuilt);
 		self.drain_in_order(now);
 	}
 
-	fn insert(&mut self, ahead: u16, seq: u16, pkt: Vec<u8>, rebuilt: bool) {
+	fn insert(&mut self, ahead: u16, seq: u16, pkt: Vec<u8>, now: Instant, rebuilt: bool) {
 		let next = self.next.unwrap_or(seq);
-		let pos = self.held.iter().position(|(s, _)| s.wrapping_sub(next) >= ahead);
+		let pos = self.held.iter().position(|(s, _, _)| s.wrapping_sub(next) >= ahead);
 		match pos {
 			Some(i) if self.held[i].0 == seq => {
 				if !rebuilt {
@@ -158,13 +172,13 @@ impl AudioRepair {
 				}
 			}
 			Some(i) => {
-				self.held.insert(i, (seq, pkt));
+				self.held.insert(i, (seq, pkt, now));
 				if rebuilt {
 					self.stats.recovered += 1;
 				}
 			}
 			None => {
-				self.held.push_back((seq, pkt));
+				self.held.push_back((seq, pkt, now));
 				if rebuilt {
 					self.stats.recovered += 1;
 				}
@@ -174,18 +188,13 @@ impl AudioRepair {
 
 	/// Move every packet that is next in line to the output.
 	fn drain_in_order(&mut self, now: Instant) {
-		while let (Some(next), Some((s, _))) = (self.next, self.held.front()) {
+		while let (Some(next), Some((s, _, _))) = (self.next, self.held.front()) {
 			if *s != next {
 				break;
 			}
-			let (_, p) = self.held.pop_front().expect("front exists");
+			let (_, p, _) = self.held.pop_front().expect("front exists");
 			self.out.push_back(Repaired::Packet(p));
 			self.next = Some(next.wrapping_add(1));
-		}
-		if self.held.is_empty() {
-			self.hole_since = None;
-		} else if self.hole_since.is_none() {
-			self.hole_since = Some(now);
 		}
 		if self.held.len() > MAX_HELD {
 			self.give_up(now);
@@ -193,21 +202,20 @@ impl AudioRepair {
 	}
 
 	fn release(&mut self, now: Instant, hold: Duration) {
-		if self.hole_since.is_some_and(|t| now.duration_since(t) >= hold) {
+		if self.hole_since().is_some_and(|t| now.saturating_duration_since(t) >= hold) {
 			self.give_up(now);
 		}
 	}
 
 	/// Report the hole in front of the first waiting packet as lost and play on from it.
 	fn give_up(&mut self, now: Instant) {
-		let (Some(next), Some((s, _))) = (self.next, self.held.front()) else { return };
+		let (Some(next), Some((s, _, _))) = (self.next, self.held.front()) else { return };
 		let lost = s.wrapping_sub(next);
 		if lost > 0 {
 			self.stats.lost += lost as u32;
 			self.out.push_back(Repaired::Lost(lost));
 		}
 		self.next = Some(*s);
-		self.hole_since = None;
 		self.drain_in_order(now);
 	}
 }
@@ -301,6 +309,55 @@ mod tests {
 		);
 		assert_eq!(r.stats().recovered, 1);
 		assert_eq!(r.stats().lost, 0);
+	}
+
+	#[test]
+	fn a_second_hole_gets_its_own_hold() {
+		// Holes at 11 and 13: 12 waits from t, 14 from t + 10 ms. 11 fills at t + 18 ms; hole
+		// 13 is then timed from 14's arrival (due t + 30 ms), not from 12's.
+		let mut r = AudioRepair::new();
+		let t = Instant::now();
+		let ms = |n: u64| t + Duration::from_millis(n);
+		r.push(pkt(10), t);
+		r.push(pkt(12), t);
+		r.push(pkt(14), ms(10));
+		let _ = all(&mut r, ms(10), HOLD);
+		r.push(pkt(11), ms(18));
+		assert_eq!(all(&mut r, ms(18), HOLD), vec![Repaired::Packet(pkt(11)), Repaired::Packet(pkt(12))]);
+		assert_eq!(r.deadline(HOLD), Some(ms(30)));
+		r.push(pkt(13), ms(25));
+		assert_eq!(all(&mut r, ms(25), HOLD), vec![Repaired::Packet(pkt(13)), Repaired::Packet(pkt(14))]);
+		assert_eq!(r.stats(), RepairStats::default());
+	}
+
+	#[test]
+	fn no_packet_waits_longer_than_the_hold() {
+		// 13 arrives first, then 12: the hole at 11 is due `hold` after 13, the earliest.
+		let mut r = AudioRepair::new();
+		let t = Instant::now();
+		r.push(pkt(10), t);
+		r.push(pkt(13), t);
+		r.push(pkt(12), t + Duration::from_millis(15));
+		let _ = all(&mut r, t, HOLD);
+		assert_eq!(r.deadline(HOLD), Some(t + HOLD));
+		assert_eq!(
+			all(&mut r, t + HOLD, HOLD),
+			vec![Repaired::Lost(1), Repaired::Packet(pkt(12)), Repaired::Packet(pkt(13))]
+		);
+	}
+
+	#[test]
+	fn parity_that_is_not_an_audio_shape_is_dropped() {
+		let mut r = AudioRepair::new();
+		let t = Instant::now();
+		// k = 200, m = 50, 60 000-byte shard: never stored.
+		let mut body = vec![0u8, 1, 200, 50, 0];
+		body.extend(60_000u16.to_be_bytes());
+		body.extend(vec![0u8; 60_000]);
+		r.push_parity(&body, t);
+		assert_eq!(r.fec.last_ratio(), 0.0, "the decoder never saw a non-audio shape");
+		r.push(pkt(1), t);
+		assert_eq!(all(&mut r, t, HOLD), vec![Repaired::Packet(pkt(1))]);
 	}
 
 	#[test]

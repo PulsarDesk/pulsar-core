@@ -148,6 +148,11 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   with a `vah26Xenc` fragment the in-process pipeline first tries `vapostproc` → VAMemory NV12
   (GPU, zero-copy where PipeWire negotiates DMA-BUF), verified by a frame reaching the encoder
   within 3 s, else the CPU convert (`gst::WaylandConvert`, `PULSAR_WAYLAND_CPU_CONVERT=1`).
+  The GPU attempt goes first in each of the 3 start slots (a "not PLAYING" failure is usually
+  the PipeWire node lagging the portal reply), with the CPU convert right after it in the same
+  slot; a parse failure or no frame after PLAYING marks it broken for the process
+  (`VA_CONVERT_BROKEN`). `run_pipeline` is cancel-safe (`NullOnDrop`: a start future dropped
+  during the verify wait sets its pipeline to NULL).
   `start_with_frames(.., Some(factory))` (`capture/frames.rs`, 2026-11-14, untested on
   hardware): the pipeline ends in NV12 frames (`fakesink` handoff) for an app-supplied
   `FrameEncoder` (the desktop's NVENC SDK encoder — reference-frame invalidation via
@@ -203,7 +208,10 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   (`-fragment_size 1920 -fflags nobuffer`). Client side: `audio::AudioRepair` (`repair.rs`,
   used by desktop `native_audio` and the mobile feeder) puts audio RTP back in order, rebuilds
   losses from `TAG_AUDIO_FEC` parity and holds a hole for a caller-chosen time before it
-  reports it lost (2026-11-15, untested in a real session).
+  reports it lost, counted from the earliest arrival behind the hole (no packet waits longer
+  than the hold; a second hole gets its own time once the first fills). Parity is taken only
+  in audio shapes (k ≤ 4, m ≤ 2, shard ≤ `FEC_MAX_PACKET` + 2), so stray datagrams can't make
+  the decoder store big blocks (2026-11-15, untested in a real session).
 - `displays.rs` (+ `displays/{macos,linux}.rs`) — the host's monitors for the platforms the app
   can't enumerate itself: macOS (`CGGetActiveDisplayList` order = avfoundation `Capture screen N`,
   `NSScreen.localizedName` names, `CGDirectDisplayID` as `Monitor::id`) and Linux Wayland
