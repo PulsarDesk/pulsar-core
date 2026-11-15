@@ -15,6 +15,7 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		low_latency: true,
 		gpu_zerocopy: false,
 		output_idx: 0,
+		capture_size: None,
 		hdr: false,
 		yuv444: false,
 		loss_recovery: crate::service::LossRecovery::Normal,
@@ -528,6 +529,22 @@ fn ddagrab_is_fully_gpu_per_encoder() {
 		"no on-GPU scaler without the CUDA map; native res"
 	);
 
+	// Hybrid, capture size known and EQUAL to the request: still the direct D3D11 feed.
+	p.capture_size = Some((1920, 1080));
+	let f = encode_command(&p).1.join(" ");
+	assert!(!f.contains("hwdownload") && !f.contains("scale_cuda"), "{f}");
+
+	// Hybrid asked for another size than the capture's: honoured, scaled on the NVIDIA GPU
+	// (BGRA readback → CUDA → scale_cuda to NV12) — never ignored, never a CPU swscale.
+	p.capture_size = Some((2560, 1600));
+	let f = encode_command(&p).1.join(" ");
+	assert!(
+		f.contains("hwdownload,format=bgra,hwupload_cuda,scale_cuda=1920:1080:format=nv12,fps=60"),
+		"hybrid must scale to the requested size: {f}"
+	);
+	assert!(!f.contains(",scale=") && !f.contains("-pix_fmt"), "no CPU scaler / pix_fmt: {f}");
+	p.capture_size = None;
+
 	// AMD AMF: NV12, no yuv420p swscale.
 	let mut a = plan(HwEncoder::Amf);
 	a.capture = CaptureMethod::Ddagrab;
@@ -777,4 +794,50 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 		"{win}"
 	);
 	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
+}
+
+/// An odd requested size (screen adaptation, a client window of any size) is evened on every
+/// ffmpeg capture path, as the native paths do — an odd 4:2:0 frame kills the encoder.
+#[test]
+fn odd_sizes_are_evened_on_the_ffmpeg_paths() {
+	let odd = |enc: HwEncoder, cap: CaptureMethod| StreamPlan {
+		width: 1921,
+		height: 1081,
+		capture: cap,
+		..plan(enc)
+	};
+	// Windows full screen: ddagrab CPU-bounce / MF / AMF / QSV / NVENC zero-copy, and gdigrab.
+	for enc in [HwEncoder::Software, HwEncoder::Amf, HwEncoder::MediaFoundation] {
+		let f = encode_command(&odd(enc, CaptureMethod::Ddagrab)).1.join(" ");
+		assert!(f.contains("scale=1920:1080,") && !f.contains("1921"), "[{enc:?}] {f}");
+	}
+	let f = encode_command(&odd(HwEncoder::Qsv, CaptureMethod::Ddagrab)).1.join(" ");
+	assert!(f.contains("scale_qsv=w=1920:h=1080") && !f.contains("1921"), "{f}");
+	let mut z = odd(HwEncoder::Nvenc, CaptureMethod::Ddagrab);
+	z.gpu_zerocopy = true;
+	let f = encode_command(&z).1.join(" ");
+	assert!(f.contains("scale_cuda=1920:1080") && !f.contains("1921"), "{f}");
+	// Hybrid NVENC: the evened request equals the capture → the direct feed, no scaler.
+	let mut h = odd(HwEncoder::Nvenc, CaptureMethod::Ddagrab);
+	h.capture_size = Some((1920, 1080));
+	let f = encode_command(&h).1.join(" ");
+	assert!(!f.contains("scale_cuda") && !f.contains("hwdownload"), "{f}");
+	let f = encode_command(&odd(HwEncoder::Software, CaptureMethod::Gdigrab)).1.join(" ");
+	assert!(f.contains("scale=1920:1080") && !f.contains("1921"), "{f}");
+	// Linux x11grab region.
+	let f = encode_command(&odd(HwEncoder::Software, CaptureMethod::X11grab)).1.join(" ");
+	assert!(f.contains("1920x1080") && !f.contains("1921"), "{f}");
+	// A 1-pixel request floors at 2×2.
+	let tiny = StreamPlan { width: 1, height: 1, ..plan(HwEncoder::Software) };
+	assert!(encode_command(&tiny).1.join(" ").contains("2x2"));
+	// Even sizes pass unchanged.
+	assert!(encode_command(&plan(HwEncoder::Software)).1.join(" ").contains("1920x1080"));
+	// Raw NV12 window frames are produced at exactly the plan size: never resized here.
+	let raw = StreamPlan {
+		width: 1281,
+		height: 721,
+		window: Some(WindowInput::RawNv12 { url: "tcp://127.0.0.1:1".into() }),
+		..plan(HwEncoder::Software)
+	};
+	assert!(encode_command(&raw).1.join(" ").contains("1281x721"));
 }

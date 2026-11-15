@@ -1,6 +1,6 @@
 //! ffmpeg/ffplay command builders for the host encode + client decode paths.
 
-use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec};
+use super::{CaptureMethod, HwEncoder, StreamPlan, VCodec, WindowInput};
 use crate::service::LossRecovery;
 
 /// Refresh period (frames) of the loss-recovery modes: after a loss the picture is whole
@@ -90,10 +90,34 @@ fn recovery_args(plan: &StreamPlan) -> (u32, Vec<String>) {
 	}
 }
 
+/// The plan's size rounded down to even (at least 2×2), or `None` when it already is even
+/// or the frames come pre-made at exactly that size (`WindowInput::RawNv12`).
+fn evened_size(plan: &StreamPlan) -> Option<(u32, u32)> {
+	if matches!(plan.window, Some(WindowInput::RawNv12 { .. })) {
+		return None;
+	}
+	let even = |v: u32| v.max(2) & !1;
+	let size = (even(plan.width), even(plan.height));
+	(size != (plan.width, plan.height)).then_some(size)
+}
+
 /// Build the host capture+encode command: `(program, args)`. Program is always
 /// `ffmpeg` (the bundled binary is substituted by the caller); the encoder is
 /// selected via ffmpeg's `-c:v` flag, no external wrapper.
 pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
+	// Every encoder wants even 4:2:0 dimensions, and the requested size can be odd (screen
+	// adaptation / a client window of any size): even it here, as the native capture paths
+	// do (`& !1`), so `scale=`/`scale_cuda=`/`-video_size` never ask for an odd frame — the
+	// encoder would refuse it and the stream would die. Raw NV12 window frames are made at
+	// exactly the plan size by their producer (already even, `fit_within`): left alone.
+	let evened;
+	let plan = match evened_size(plan) {
+		Some((width, height)) => {
+			evened = StreamPlan { width, height, ..plan.clone() };
+			&evened
+		}
+		None => plan,
+	};
 	let enc = plan.encoder.ffmpeg_name(plan.codec).unwrap_or("libx264");
 	let s = |x: &str| x.to_string();
 	let mut a: Vec<String> = vec![s("-hide_banner"), s("-loglevel"), s("error")];
@@ -463,6 +487,7 @@ mod tests {
 			low_latency,
 			gpu_zerocopy: false,
 			output_idx: 0,
+			capture_size: None,
 			hdr: false,
 			yuv444: false,
 			loss_recovery: LossRecovery::Normal,
