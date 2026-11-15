@@ -304,6 +304,39 @@ memory → loss from window 1 → blind halving to the floor, no way back. Chang
 - Tests: controller units + `adapt_scenarios` (a)–(f) tethered/random-loss/policer/LAN/floor/
   escape; real sessions: none yet.
 
+### 2026-11-15 stability pass (LOCAL, NOT pushed, untested on the field link)
+
+Evidence: client log of a game session over a phone USB tether — RTT base 40–60 ms with
+handover stalls to 0.8–1.8 s for a few seconds, jitter up to 600 ms, ~17–20 % of video packets
+reordered (0 % on LAN), 5 % loss bursts, ~14 Mbit goodput when clean. Each stall read as
+congestion ("rtt bloat severe → halve", repeated fast ×0.85 cuts, each lowering the ceiling, one
+"host can't keep up → lighter point"): 14 → 0.33 Mbit (720p30) in a minute. Every unrepaired
+hole the host's RFI could not reach became a keyframe (5–10× a frame) on the weak link.
+
+- **Stall vs congestion** (`controller.rs`, module doc "Stall vs congestion"): RTT mean/floor
+  ≥ 4× base and ≥ 200 ms over it, or nothing arriving, at a rate the path proved lately
+  (`STALL_SAFE_PCT` of proven / last good) and not just raised or already cut on its own queue →
+  hold, ceiling kept (an onset fast cut stays the one bounded cut; its ceiling punishment is
+  undone), fast reflex off (also on a far `on_rtt` sample or a long frame gap); continue at the
+  pre-stall rate when the RTT floor is back; the drain window is not cut on. Congestion is still
+  followed: a standing, not-draining queue that delivers ~our rate or overflows (2 standing
+  windows) → 0.85 × delivered, ceiling follows; still draining after 10 s → ×0.7, ceiling kept.
+- **Mobile start** (`Config::mobile`, desktop route detection `mobile_link.rs`): start ≤ 6 Mbit,
+  ×1.25 climbs, probe steps ≤ 40 %. Log: `adaptive controller seeded … path=wan/mobile link=…`.
+- **Intra refresh on bad links**: `media::FEAT_IR` (hosts whose encoder really refreshes — NVENC
+  SDK on Windows / Linux CUDA); a Windows game session over WAN / mobile / RTT ≥ 30 ms starts in
+  `LossRecovery::IntraRefresh` (`Config::initial_recovery`) — no keyframe bursts. LAN keeps RFI.
+- **Automatic adjustment off** (`set_adaptive(false)`, desktop "Otomatik ayar"): no rate / point
+  decisions, still measures and flips recovery; `fixed_rate_kbps()` for an automatic bitrate.
+- Desktop: game mode on a high-RTT path (median ≥ 35 ms, off < 25) with RFI / IR drops a hole
+  after the reorder / FEC wait + a frame (30–80 ms) instead of the RTT-based repair window, and
+  sends no NACK (Moonlight-like). See pulsar-desktop `docs/agents/client-video.md`.
+- Tests: controller units (stall holds rate / ceiling, onset fast cut, unproven-rate queue still
+  cut, real bottleneck still cut, adaptive off, mobile start, initial IR) and
+  `adapt_scenarios::a_tethered_link_with_handover_stalls_keeps_its_rate` (frame-level replay:
+  14 Mbit, 45 ms ± 20 ms, six 1.5–5 s stalls, 5 % bursts; ≥ 35 % of 14 Mbit after the first
+  settle, ≥ 60 % at the end; `ADAPT_TRACE=1 … -- --nocapture` prints the decisions).
+
 ### Phase 1 — the operating-point ladder (the heart of "cam gibi minimum")
 
 | # | Task |
