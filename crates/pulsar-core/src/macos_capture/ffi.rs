@@ -73,6 +73,20 @@ unsafe impl Encode for CMTime {
 	);
 }
 
+/// A `CFStringRef` as a message argument. Properties declared `CFStringRef` (not `NSString *`),
+/// such as `SCStreamConfiguration.colorSpaceName` / `.colorMatrix`, have the runtime type
+/// `^{__CFString=}`; objc2 checks argument encodings in debug builds, so passing the pointer as
+/// an object (`@`) panics there ("invalid message send"). Release builds skip the check.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct CfStr(pub CFStringRef);
+
+// SAFETY: a single pointer to an (opaque) `struct __CFString`, which is what `^{__CFString=}`
+// describes.
+unsafe impl Encode for CfStr {
+	const ENCODING: objc2::Encoding = objc2::Encoding::Pointer(&objc2::Encoding::Struct("__CFString", &[]));
+}
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
