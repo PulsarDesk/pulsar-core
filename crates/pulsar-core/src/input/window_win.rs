@@ -37,8 +37,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::windows::evdev_to_vk;
 
-const WHEEL_DELTA: i32 = 120;
-
 // `WM_MOUSEMOVE`/button-message wParam "which buttons are down" mask bits. These live
 // in `Win32::System::SystemServices` in windows-sys; defined locally (they're stable
 // Win32 ABI values) to avoid pulling in that whole feature module for three constants.
@@ -83,10 +81,9 @@ pub struct WindowInput {
 	/// Held VK set — released on Drop / flush so a client that drops mid-press
 	/// doesn't leave a key latched down in the target window.
 	held_keys: std::collections::HashSet<u16>,
-	/// Carried-over fractional wheel notches (matches DesktopInput's behavior so
-	/// fine/precision scroll isn't lost to rounding).
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Hi-res wheel conversion with the sub-unit carry, as DesktopInput (see
+	/// [`super::wheel`]).
+	scroll: super::wheel::HiResScroll,
 }
 
 // HWND is a raw pointer (`*mut c_void`) → not auto-Send. The on_input closure runs
@@ -115,8 +112,7 @@ impl WindowInput {
 			last_y: 0,
 			btn_mask: 0,
 			held_keys: std::collections::HashSet::new(),
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 		})
 	}
 
@@ -230,14 +226,10 @@ impl WindowInput {
 	/// word and — unusually — the cursor position in **screen** coordinates in lParam,
 	/// so we map the cached client point through `ClientToScreen`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Same fractional-notch accumulation as DesktopInput. browser down(+) → wheel
-		// down (negative), so negate dy.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
+		// Hi-res units (1/120 notch) like DesktopInput: the message's delta takes any
+		// value, precision touchpads post sub-120 deltas the same way.
+		let o = self.scroll.push(dx, dy);
+		let (v, h) = (o.v.clamp(i16::MIN as i32, i16::MAX as i32), o.h.clamp(i16::MIN as i32, i16::MAX as i32));
 		let mut pt = POINT {
 			x: self.last_x,
 			y: self.last_y,
@@ -249,7 +241,7 @@ impl WindowInput {
 		if v != 0 {
 			self.post(
 				WM_MOUSEWHEEL,
-				make_wparam(state_low, (v * WHEEL_DELTA) as i16),
+				make_wparam(state_low, v as i16),
 				make_lparam(pt.x, pt.y),
 			);
 		}
@@ -259,7 +251,7 @@ impl WindowInput {
 			const WM_MOUSEHWHEEL: u32 = 0x020E;
 			self.post(
 				WM_MOUSEHWHEEL,
-				make_wparam(state_low, (h * WHEEL_DELTA) as i16),
+				make_wparam(state_low, h as i16),
 				make_lparam(pt.x, pt.y),
 			);
 		}

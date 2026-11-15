@@ -28,8 +28,6 @@ pub struct MonitorRect {
 	pub virt_height: i32,
 }
 
-const WHEEL_DELTA: i32 = 120;
-
 fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
 	let input = INPUT {
 		r#type: INPUT_MOUSE,
@@ -226,11 +224,8 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 pub struct DesktopInput {
 	held_buttons: std::collections::HashSet<u8>,
 	held_keys: std::collections::HashSet<u16>,
-	/// Carried-over fractional scroll (in wheel notches). Fine/precision wheel deltas
-	/// (< one notch) used to `round()` to 0 and do nothing; we accumulate the remainder
-	/// so successive small scrolls eventually move (and big deltas behave as before).
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Hi-res wheel conversion with the sub-unit carry (see [`super::wheel`]).
+	scroll: super::wheel::HiResScroll,
 	/// Geometry of the streamed monitor within the virtual desktop. `None` ⇒ the primary
 	/// display (single-monitor host / unknown geometry) — keeps the legacy primary-only
 	/// absolute mapping. `Some` ⇒ map the normalized coords onto that monitor's rect across
@@ -357,8 +352,7 @@ impl DesktopInput {
 		Ok(Self {
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 			monitor: None,
 			pinch_tx: None,
 			pen_touch: None,
@@ -493,22 +487,17 @@ impl DesktopInput {
 		send_mouse(0, 0, 0, flag);
 	}
 
-	/// Scroll by a delta (browser wheel pixels → wheel notches).
+	/// Scroll by a delta (browser wheel pixels → hi-res wheel units, 1/120 notch). Windows
+	/// takes sub-`WHEEL_DELTA` `mouseData` (precision touchpads send it all the time), so a
+	/// smooth client scroll stays smooth instead of being rounded to whole notches; the
+	/// sub-unit remainder carries to the next call (see [`super::wheel`]).
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Accumulate fractional notches so fine/precision scroll (< 100px) isn't lost to
-		// rounding; carry the sub-notch remainder to the next call (trunc toward zero
-		// preserves direction). browser down(+) → wheel down (negative), so negate dy.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
-		if v != 0 {
-			send_mouse(0, 0, v * WHEEL_DELTA, MOUSEEVENTF_WHEEL);
+		let o = self.scroll.push(dx, dy);
+		if o.v != 0 {
+			send_mouse(0, 0, o.v, MOUSEEVENTF_WHEEL);
 		}
-		if h != 0 {
-			send_mouse(0, 0, h * WHEEL_DELTA, MOUSEEVENTF_HWHEEL);
+		if o.h != 0 {
+			send_mouse(0, 0, o.h, MOUSEEVENTF_HWHEEL);
 		}
 	}
 

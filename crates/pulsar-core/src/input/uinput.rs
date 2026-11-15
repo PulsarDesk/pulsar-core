@@ -138,11 +138,9 @@ pub struct DesktopInput {
 	/// across both devices, so abs-position-then-click still lands correctly.
 	mouse: VirtualDevice,
 	keyboard: VirtualDevice,
-	/// Carried-over fractional scroll (in wheel notches). A single small/precision
-	/// wheel delta (< one notch) used to `round()` to 0 and silently do nothing; we
-	/// instead accumulate the remainder so successive fine scrolls eventually move.
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Hi-res wheel conversion with the sub-unit carry + legacy-notch counter (see
+	/// [`super::wheel`]).
+	scroll: super::wheel::HiResScroll,
 	/// The streamed monitor within the output layout (see `set_region`); `None` = the
 	/// whole layout.
 	region: Option<crate::capture::PointerRegion>,
@@ -411,6 +409,11 @@ impl DesktopInput {
 		rels.insert(RelativeAxisCode::REL_Y);
 		rels.insert(RelativeAxisCode::REL_WHEEL);
 		rels.insert(RelativeAxisCode::REL_HWHEEL);
+		// High-resolution wheel (120 per notch, kernel 5.0+): libinput / Wayland
+		// compositors read these for smooth scrolling and ignore the legacy axes on a
+		// device that has them; X11 / older stacks still read REL_WHEEL / REL_HWHEEL.
+		rels.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+		rels.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
 		let mouse = VirtualDevice::builder()?
 			.name("Pulsar Virtual Mouse")
 			.with_keys(&btns)?
@@ -429,8 +432,7 @@ impl DesktopInput {
 			pointer,
 			mouse,
 			keyboard,
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 			region: None,
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
@@ -528,32 +530,28 @@ impl DesktopInput {
 			.emit(&[InputEvent::new(EventType::KEY.0, key.code(), down as i32)]);
 	}
 
-	/// Scroll by a delta (browser wheel pixels → wheel clicks).
+	/// Scroll by a delta (browser wheel pixels → hi-res wheel units + legacy notches).
+	///
+	/// Emits `REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES` (1/120 notch) for every delta, so a
+	/// smooth client scroll stays smooth, plus the legacy `REL_WHEEL` / `REL_HWHEEL` notch
+	/// each time 120 hi-res units built up in one direction — in the same frame, exactly
+	/// like the kernel's hid driver for a real hi-res mouse. Signs: evdev wheel up is +,
+	/// browser down is + (handled in [`super::wheel::HiResScroll`]).
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Accumulate fractional notches so fine/precision scroll (< 100px) isn't lost to
-		// rounding. We keep the leftover sub-notch remainder for the next call; the sign
-		// of the truncation matters, so use trunc() (toward zero) and carry the rest.
-		// evdev wheel up is +, browser down is +, so negate the vertical delta.
-		self.scroll_acc_v += -dy / 100.0;
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
-		let mut ev = Vec::new();
-		if v != 0 {
-			ev.push(InputEvent::new(
-				EventType::RELATIVE.0,
-				RelativeAxisCode::REL_WHEEL.0,
-				v,
-			));
+		let o = self.scroll.push(dx, dy);
+		let rel = |code: RelativeAxisCode, v: i32| InputEvent::new(EventType::RELATIVE.0, code.0, v);
+		let mut ev = Vec::with_capacity(4);
+		if o.v != 0 {
+			ev.push(rel(RelativeAxisCode::REL_WHEEL_HI_RES, o.v));
 		}
-		if h != 0 {
-			ev.push(InputEvent::new(
-				EventType::RELATIVE.0,
-				RelativeAxisCode::REL_HWHEEL.0,
-				h,
-			));
+		if o.v_notches != 0 {
+			ev.push(rel(RelativeAxisCode::REL_WHEEL, o.v_notches));
+		}
+		if o.h != 0 {
+			ev.push(rel(RelativeAxisCode::REL_HWHEEL_HI_RES, o.h));
+		}
+		if o.h_notches != 0 {
+			ev.push(rel(RelativeAxisCode::REL_HWHEEL, o.h_notches));
 		}
 		if !ev.is_empty() {
 			let _ = self.mouse.emit(&ev);

@@ -37,7 +37,6 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use core_graphics::event::{
 	CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
-	ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::display::CGDisplay;
@@ -52,7 +51,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use super::macos::{evdev_modifier_flag, evdev_to_vk};
-use super::window_common::{clamp_to_area, norm_to_area, ScrollAcc};
+use super::window_common::{clamp_to_area, norm_to_area};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -176,7 +175,7 @@ pub struct WindowInput {
 	held_keys: HashSet<u16>,
 	flags: CGEventFlags,
 	caps_lock: bool,
-	scroll: ScrollAcc,
+	scroll: super::wheel::MacScroll,
 }
 
 impl WindowInput {
@@ -200,7 +199,7 @@ impl WindowInput {
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
 			caps_lock: false,
-			scroll: ScrollAcc::default(),
+			scroll: Default::default(),
 		})
 	}
 
@@ -315,16 +314,15 @@ impl WindowInput {
 		}
 	}
 
-	/// Scroll by a browser-wheel delta (100 px per line), at the cached point.
+	/// Scroll by a browser-wheel delta at the cached point: whole notches as lines, finer
+	/// deltas as continuous pixels, like [`super::macos::DesktopInput::scroll`].
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		let (v, h) = self.scroll.push(dx, dy);
-		if v == 0 && h == 0 {
+		let out = self.scroll.push_now(dx, dy);
+		if out == super::wheel::MacScrollOut::None {
 			return;
 		}
 		let pt = self.global();
-		if let Some(ev) = Self::source()
-			.and_then(|s| CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, -v, -h, 0).ok())
-		{
+		if let Some(ev) = Self::source().and_then(|s| super::macos::mac_scroll_event(s, out)) {
 			ev.set_location(pt);
 			self.post(&ev, true);
 		}
