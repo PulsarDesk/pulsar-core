@@ -381,6 +381,12 @@ pub struct StreamReq {
 	/// and an old host ignores the field.
 	#[serde(default)]
 	pub audio_quality: AudioQuality,
+	/// The client rebuilds lost audio from Reed-Solomon parity
+	/// ([`TAG_AUDIO_FEC`](crate::service::media::TAG_AUDIO_FEC), media-over-session only): the
+	/// host sends it next to the audio. `#[serde(default)]` (false): an old client never gets
+	/// a parity datagram, and an old host ignores the field.
+	#[serde(default)]
+	pub audio_fec: bool,
 }
 
 /// Client → host feedback the adaptive controller sends every window as
