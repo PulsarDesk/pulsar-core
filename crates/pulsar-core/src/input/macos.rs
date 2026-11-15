@@ -59,6 +59,21 @@ fn host_keyboard_is_iso() -> bool {
 /// injected input from the person at the host. ASCII "PULS".
 pub(crate) const INJECTED_TAG: i64 = 0x5055_4C53;
 
+/// The CGEvent for one [`MacScrollOut`](super::wheel::MacScrollOut): a LINE-unit wheel event
+/// with the whole (carried) lines; a fractional delta also gets its exact line count in the
+/// fixed-point fields and its carried points in the point-delta fields (see
+/// [`super::wheel::MacScroll`]). Quartz: positive = content toward the top / toward the left.
+pub(super) fn mac_scroll_event(s: CGEventSource, out: super::wheel::MacScrollOut) -> Option<CGEvent> {
+	let ev = CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, out.lines_v, out.lines_h, 0).ok()?;
+	if !out.plain {
+		ev.set_double_value_field(EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1, out.fixed_v);
+		ev.set_double_value_field(EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2, out.fixed_h);
+		ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, out.pt_v as i64);
+		ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, out.pt_h as i64);
+	}
+	Some(ev)
+}
+
 /// Post one synthetic event at the HID tap, tagged as Pulsar's own ([`INJECTED_TAG`]).
 fn post(ev: &CGEvent) {
 	ev.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_TAG);
@@ -100,11 +115,8 @@ pub struct DesktopInput {
 	/// `CGEventFlagAlphaShift` flag in the mask. We latch this on each Caps Lock
 	/// key-DOWN and keep it in `flags` so subsequent events stay caps-locked.
 	caps_lock: bool,
-	/// Carried-over fractional scroll (in lines). Fine/precision wheel deltas (< one
-	/// line) used to `round()` to 0 and do nothing; we accumulate the remainder so
-	/// successive small scrolls eventually move (big deltas behave as before).
-	scroll_acc_v: f64,
-	scroll_acc_h: f64,
+	/// Wheel lines with the fractional-line / point carry (see [`super::wheel::MacScroll`]).
+	scroll: super::wheel::MacScroll,
 	/// Last pointer location we successfully read back from CoreGraphics. A transient
 	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
 	/// (the menu-bar corner); we fall back to this last-known position instead.
@@ -159,8 +171,7 @@ impl DesktopInput {
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
 			caps_lock: false,
-			scroll_acc_v: 0.0,
-			scroll_acc_h: 0.0,
+			scroll: Default::default(),
 			last_point: CGPoint::new(0.0, 0.0),
 			pinch_prev: None,
 			window: None,
@@ -324,25 +335,13 @@ impl DesktopInput {
 		}
 	}
 
-	/// Scroll by a delta (browser wheel pixels → wheel lines).
+	/// Scroll by a delta (browser wheel pixels, 100 per line). Whole notches post the plain
+	/// LINE event of a notched mouse; finer deltas (precision touchpad, hi-res wheel, Mac
+	/// trackpad) post the same LINE event with fractional lines, so they scroll smoothly on
+	/// the SAME scale instead of waiting for 100 px to build a whole line.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		// Accumulate fractional lines so fine/precision scroll (< 100px) isn't lost to
-		// rounding; carry the sub-line remainder to the next call (trunc toward zero
-		// preserves direction).
-		self.scroll_acc_v += dy / 100.0; // browser down(+); negated below for CG's axis
-		self.scroll_acc_h += dx / 100.0;
-		let v = self.scroll_acc_v.trunc() as i32;
-		let h = self.scroll_acc_h.trunc() as i32;
-		self.scroll_acc_v -= v as f64;
-		self.scroll_acc_h -= h as f64;
-		if v == 0 && h == 0 {
-			return;
-		}
-		// CGEvent scroll: positive Y scrolls content up (toward the top), so negate
-		// the browser delta (browser positive = scroll down).
-		if let Some(ev) = Self::source()
-			.and_then(|s| CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, -v, -h, 0).ok())
-		{
+		let Some(out) = self.scroll.push(dx, dy) else { return };
+		if let Some(ev) = Self::source().and_then(|s| mac_scroll_event(s, out)) {
 			post(&ev);
 		}
 	}

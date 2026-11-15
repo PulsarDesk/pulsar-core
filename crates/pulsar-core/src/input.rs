@@ -25,6 +25,14 @@ pub mod pen_touch;
 /// user configured for the gesture — Windows registry, macOS trackpad prefs, GNOME / KDE).
 pub mod gesture;
 
+/// High-resolution scroll: wire browser pixels → each host OS's fine wheel unit
+/// (Windows WHEEL_DELTA fractions, Linux REL_WHEEL_HI_RES, macOS pixel scroll).
+pub mod wheel;
+
+/// Client-side batching of high-rate pointer motion / scroll (≤ one packet per ~1 ms per
+/// kind, no delay for the event that starts a burst, edges keep their order).
+pub mod coalesce;
+
 /// macOS host: the display behind an avfoundation capture device (pointer / pen geometry).
 pub mod avf_screens;
 

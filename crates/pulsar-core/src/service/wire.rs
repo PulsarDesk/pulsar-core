@@ -63,7 +63,11 @@ pub enum InputEvent {
 	/// ([`crate::input::mouse_button`]). 3 / 4 go only to hosts that advertise
 	/// [`crate::service::media::FEAT_MOUSE_X`]; hosts ignore ids they do not know.
 	PointerButton { button: u8, down: bool },
-	/// Smooth scroll delta.
+	/// Scroll delta in BROWSER wheel pixels: 100 = one wheel notch, +dy = down, +dx = right.
+	/// Fractions are meaningful and must survive end to end: a precision touchpad, a hi-res
+	/// wheel (1/120 notch = 0.833 px) or a Mac trackpad sends many small deltas. Hosts
+	/// inject them in their OS's fine unit ([`crate::input::wheel`]) instead of rounding to
+	/// notches; a host that still accumulates to whole notches stays correct, only coarser.
 	Scroll { dx: f64, dy: f64 },
 	/// Keyboard evdev keycode pressed/released.
 	Key { code: u32, down: bool },
