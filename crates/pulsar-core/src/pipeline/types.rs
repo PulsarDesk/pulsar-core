@@ -429,8 +429,11 @@ pub struct StreamPlan {
 	/// Passed directly to `ddagrab=output_idx=N` in the ffmpeg filter graph so the
 	/// ffmpeg fallback path captures the same monitor the client selected.
 	pub output_idx: u32,
-	/// Encode 10-bit **HDR** (P010 + BT2020 primaries / SMPTE2084 PQ transfer). Requires an
-	/// HDR-capable encoder+codec (HEVC main10 / AV1 main / H.264 high10); SDR otherwise.
+	/// The client asked for 10-bit **HDR** (P010 + BT2020 primaries / SMPTE2084 PQ transfer).
+	/// Only honoured when the CAPTURE delivers HDR pixels (see
+	/// [`StreamPlan::effective_hdr_yuv444`]): none of the ffmpeg capture inputs this crate
+	/// builds does, so an ffmpeg plan always streams SDR. Tagging an 8-bit SDR capture as PQ
+	/// made the client decode sRGB pixels as PQ (washed-out / far too bright colours).
 	pub hdr: bool,
 	/// Encode **4:4:4** chroma (no subsampling — sharper text/lines for remote desktop).
 	/// Only a few encoders support it (NVENC, QSV, software); ignored elsewhere.
@@ -465,29 +468,48 @@ pub fn fit_window_size(win_w: u32, win_h: u32, max_w: u32, max_h: u32) -> (u32, 
 
 impl StreamPlan {
 	/// Returns the `(hdr, yuv444)` values that are **actually achievable** for the
-	/// current encoder + capture combination, after clamping paths that cannot produce
-	/// 10-bit or 4:4:4 frames in the GPU filter.
+	/// current encoder + capture combination.
 	///
-	/// NVENC (both zero-copy and hybrid) and QSV with `Ddagrab` use GPU-side filters
+	/// **HDR is never achievable through these ffmpeg plans.** Every capture input here
+	/// delivers 8-bit SDR pixels: `ddagrab` runs with its default `output_fmt=bgra` (an HDR
+	/// desktop is handed over already mapped to SDR), `gdigrab` / `x11grab` / `kmsgrab` /
+	/// `avfoundation` produce 8-bit RGB / YUV. Re-quantising those to P010 and writing
+	/// BT.2020 + PQ into the VUI does not make them HDR: the client then interprets sRGB code
+	/// values as PQ and shows wrong colours. An 8-bit source is SDR, so `hdr` is dropped here
+	/// and the stream is plain BT.709 8-bit. Real HDR is the Windows native NVENC path
+	/// (pulsar-desktop `pulsar-capture`, FP16 Desktop Duplication / WGC → P010 → Main10);
+	/// this is the one place to flip when an ffmpeg capture with a 10-bit HDR output is added.
+	///
+	/// `yuv444`: NVENC (both zero-copy and hybrid) and QSV with `Ddagrab` use GPU-side filters
 	/// (`scale_cuda` / `scale_qsv`) that only reliably output `nv12` (8-bit 4:2:0) on
-	/// current ffmpeg builds.  Allowing `hdr` or `yuv444` for those paths would cause
-	/// the filter to emit `nv12` while `-pix_fmt` requests `p010le`/`yuv444p…` →
-	/// ffmpeg errors or silently encodes SDR while signaling HDR.  We degrade both
-	/// flags to `false` for those paths so the filter format and `-pix_fmt` always
-	/// agree.  All other encoders (AMF, Software, VAAPI, catch-all) use a CPU-bounce
-	/// path whose `format=` step can produce any pixel format, so they respect the
-	/// user's request.
+	/// current ffmpeg builds, and Media Foundation MFTs take NV12 only, so 4:4:4 is dropped
+	/// for those paths (the filter format and `-pix_fmt` must agree). All other encoders
+	/// (AMF, Software, VAAPI, catch-all) use a CPU-bounce path whose `format=` step can
+	/// produce any pixel format, so they respect the request.
 	///
 	/// **Both `CaptureMethod::input_args` (filter) and `encode_command` (-pix_fmt /
 	/// -profile:v) call this method**, so the two can never disagree.
 	pub fn effective_hdr_yuv444(&self) -> (bool, bool) {
-		// NVENC/QSV Ddagrab GPU paths, and Media Foundation (NV12-only MFTs): clamp to SDR 4:2:0.
+		let hdr = self.hdr && self.capture_delivers_hdr();
+		// NVENC/QSV Ddagrab GPU paths, and Media Foundation (NV12-only MFTs): clamp to 4:2:0.
 		let is_gpu_ddagrab = self.capture == CaptureMethod::Ddagrab
 			&& matches!(self.encoder, HwEncoder::Nvenc | HwEncoder::Qsv | HwEncoder::MediaFoundation);
 		if is_gpu_ddagrab {
 			(false, false)
 		} else {
-			(self.hdr, self.yuv444)
+			(hdr, self.yuv444)
+		}
+	}
+
+	/// Does this plan's capture input deliver HDR (10-bit PQ / scRGB) pixels? None of the
+	/// ffmpeg inputs built here does (see [`Self::effective_hdr_yuv444`]).
+	pub fn capture_delivers_hdr(&self) -> bool {
+		match self.capture {
+			CaptureMethod::Ddagrab
+			| CaptureMethod::Gdigrab
+			| CaptureMethod::X11grab
+			| CaptureMethod::Kmsgrab
+			| CaptureMethod::AvFoundation => false,
 		}
 	}
 }
