@@ -22,14 +22,21 @@
 //! (the desktop's NVENC SDK encoder, which can invalidate reference frames); the pipeline then
 //! ends in NV12 frames for it instead of a gst encoder, and falls back to the gst encoder
 //! pipeline on the same portal session when that encoder cannot be built.
+//!
+//! X11 hosts without a portal ([`start_pipeline`], `live.rs`): the same in-process machinery
+//! runs a complete `ximagesrc ! … ! encoder ! udpsink` description (the RK3588 / Orange Pi
+//! MPP host, whose encoder exists only as a GStreamer element), so its bitrate steps,
+//! keyframe requests and short-GOP recovery are live too — no `gst-launch` restart per step.
 
 #![cfg(target_os = "linux")]
 
 mod frames;
+mod live;
 pub use frames::{FrameEncoder, FrameEncoderFactory, RawFrame};
+pub use live::{start_pipeline, EncodeMsFn};
 
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
@@ -54,10 +61,17 @@ pub const ENCODER_NAME: &str = "venc";
 /// A running Wayland capture: the GStreamer pipeline + the portal session that feeds it.
 /// Dropping it (or `stop()`) tears the pipeline down AND closes the portal session — the
 /// session lingers otherwise and PipeWire may re-link a stale source to a webcam.
+///
+/// Also the handle of a portal-less in-process pipeline ([`start_pipeline`], X11 hosts):
+/// no session, no PipeWire fd, same live controls.
 pub struct WaylandCapture {
 	backend: Backend,
 	session: Option<Session<Screencast>>,
-	_pw_fd: OwnedFd,
+	/// The PipeWire remote (Wayland); `None` on a portal-less X11 pipeline.
+	_pw_fd: Option<OwnedFd>,
+	/// Frames the encoder put out, counted by the encode meter of [`start_pipeline`]
+	/// (stays 0 on a portal capture, which has no meter).
+	encoded: Arc<AtomicU64>,
 	/// Set when the bus reported an error / EOS (the pipeline is dead).
 	dead: Arc<AtomicBool>,
 	/// Short-GOP recovery: a timer forces a key unit every 500 ms while set.
@@ -164,15 +178,7 @@ impl WaylandCapture {
 			return slot.with(|e| e.set_bitrate(kbps.max(1))).unwrap_or(false);
 		}
 		let Some(enc) = self.backend.venc() else { return false };
-		if enc.find_property("bitrate").is_some() {
-			enc.set_property_from_str("bitrate", &kbps.max(1).to_string());
-			true
-		} else if enc.find_property("bps").is_some() {
-			enc.set_property_from_str("bps", &kbps.max(1).saturating_mul(1000).to_string());
-			true
-		} else {
-			false
-		}
+		set_encoder_bitrate(enc, kbps)
 	}
 
 	/// Force the next frame to be a keyframe (a client keyframe request after an
@@ -182,10 +188,14 @@ impl WaylandCapture {
 			return slot.with(|e| e.request_keyframe()).is_some();
 		}
 		let Some(enc) = self.backend.venc() else { return false };
-		let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
-			.all_headers(true)
-			.build();
-		enc.send_event(ev)
+		force_key_unit(enc)
+	}
+
+	/// Frames the encoder has put out so far — counted only on a pipeline started with
+	/// [`start_pipeline`] (its encode meter); always 0 on a portal capture. The caller's
+	/// "no first frame" watchdog reads it.
+	pub fn frames_encoded(&self) -> u64 {
+		self.encoded.load(Ordering::Relaxed)
 	}
 
 	/// Loss-recovery mode: `true` = force a key unit every ~0.5 s (the client asked for the
@@ -395,7 +405,8 @@ pub async fn start_full(
 					WaylandCapture {
 						backend: Backend::Frames { pipeline, slot },
 						session: Some(session),
-						_pw_fd: pw_fd,
+						_pw_fd: Some(pw_fd),
+						encoded: Arc::new(AtomicU64::new(0)),
 						dead,
 						short_gop,
 						stopped,
@@ -438,7 +449,8 @@ pub async fn start_full(
 					WaylandCapture {
 						backend,
 						session: Some(session),
-						_pw_fd: pw_fd,
+						_pw_fd: Some(pw_fd),
+						encoded: Arc::new(AtomicU64::new(0)),
 						dead,
 						short_gop,
 						stopped,
@@ -812,6 +824,13 @@ mod tests {
 /// PLAYING and confirm it really got there (a PipeWire node that isn't ready fails the
 /// state change instead of streaming). Returns the pipeline + the encoder element.
 async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
+	let (pipeline, venc) = parse_pipeline(desc)?;
+	play_pipeline(&pipeline)?;
+	Ok((pipeline, venc))
+}
+
+/// Parse a `gst-launch` description into a pipeline (state NULL) + its `venc` encoder.
+fn parse_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::Element>)> {
 	let element = gst::parse::launch(desc)
 		.map_err(|e| anyhow::anyhow!("gst pipeline parse failed (gstreamer plugins kurulu mu?): {e}"))?;
 	let pipeline = element
@@ -819,8 +838,14 @@ async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::
 		.map_err(|_| anyhow::anyhow!("gst pipeline description did not build a pipeline"))?;
 	let venc = pipeline.by_name(ENCODER_NAME);
 	if venc.is_none() {
-		tracing::warn!("wayland pipeline has no `{ENCODER_NAME}` element — live bitrate/keyframe controls disabled");
+		tracing::warn!("gst pipeline has no `{ENCODER_NAME}` element — live bitrate/keyframe controls disabled");
 	}
+	Ok((pipeline, venc))
+}
+
+/// Set a parsed pipeline PLAYING and confirm it got there (bounded wait, 3 s); on failure the
+/// pipeline is back in NULL and the bus's error is in the message.
+fn play_pipeline(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
 	pipeline
 		.set_state(gst::State::Playing)
 		.map_err(|e| anyhow::anyhow!("gst pipeline could not start: {e}"))?;
@@ -840,7 +865,32 @@ async fn run_pipeline(desc: &str) -> anyhow::Result<(gst::Pipeline, Option<gst::
 			"gst pipeline failed to reach PLAYING (pipewire/portal node not ready?): {msg}"
 		));
 	}
-	Ok((pipeline, venc))
+	Ok(())
+}
+
+/// Change a gst encoder's target bitrate live. Handles the property vocabulary of the
+/// elements `pipeline::gst::encoder_fragment` can emit: `bitrate` in kbit/s on x264enc /
+/// vaapih26xenc / vah26xenc / nvh26xenc, `bps` in bit/s on the Rockchip mpp encoders (which
+/// apply a changed property on their next frame). `false` when the element has neither.
+fn set_encoder_bitrate(enc: &gst::Element, kbps: u32) -> bool {
+	if enc.find_property("bitrate").is_some() {
+		enc.set_property_from_str("bitrate", &kbps.max(1).to_string());
+		true
+	} else if enc.find_property("bps").is_some() {
+		enc.set_property_from_str("bps", &kbps.max(1).saturating_mul(1000).to_string());
+		true
+	} else {
+		false
+	}
+}
+
+/// Ask a gst encoder for a keyframe now: an upstream force-key-unit event (with headers),
+/// which `GstVideoEncoder` subclasses — mpph26xenc included — turn into an IDR.
+fn force_key_unit(enc: &gst::Element) -> bool {
+	let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+		.all_headers(true)
+		.build();
+	enc.send_event(ev)
 }
 
 /// The short-GOP timer of a raw-frame capture: a keyframe request to the app's encoder every
@@ -909,10 +959,7 @@ fn spawn_watchers(
 			while !stopped.load(Ordering::Relaxed) {
 				tick.tick().await;
 				if short_gop.load(Ordering::Relaxed) && !dead.load(Ordering::Relaxed) {
-					let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
-						.all_headers(true)
-						.build();
-					let _ = enc.send_event(ev);
+					let _ = force_key_unit(&enc);
 				}
 			}
 		});

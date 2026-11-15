@@ -159,6 +159,14 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   and `Va` (gst-plugins-bad `va`, `vah264enc`, what gst ≥1.26 distros ship).
   `start_with(.., Source::Window { max })` = a WINDOW cast (portal offers windows only, the
   host person picks; frames scaled into `max` via `gst::wayland_pipeline_sized`).
+  `start_pipeline(desc, on_encode_ms)` (`capture/live.rs`, 2026-11-15, untested on hardware):
+  the same in-process runner for a complete description WITHOUT a portal — the desktop's X11
+  `ximagesrc ! … ! mpph26Xenc` pipeline on RK3588 hosts — returning a `WaylandCapture` (no
+  session / PipeWire fd) with the same live controls, a std-thread bus/short-GOP watcher (no
+  tokio runtime needed) and an encode meter (pad probes on `venc`: `frames_encoded()` +
+  `pipeline::gst::EncodeTimer`, the real per-frame encode time). Errs on a missing element /
+  no PLAYING so the caller can run `gst-launch` instead. Not for `kmssrc` (needs the
+  CAP_SYS_ADMIN child binary).
 - `window_capture/` — host **per-window** capture off Windows (Windows = WGC in the desktop's
   `pulsar-capture`). `backend()` (X11 / Portal / ScreenCaptureKit / None), `list()`, `size()`,
   `find_for_launch(pid)` (largest window of the pid tree). X11 (`x11.rs`, pure-Rust `x11rb`,

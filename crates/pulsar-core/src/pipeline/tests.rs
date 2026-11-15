@@ -778,3 +778,45 @@ fn gst_wayland_window_cast_is_scaled_to_a_fixed_box() {
 	);
 	assert!(win.starts_with("pipewiresrc fd=7 path=42 "), "{win}");
 }
+
+#[test]
+fn gst_encode_timer_measures_time_inside_the_encoder() {
+	use std::time::{Duration, Instant};
+	let mut t = gst::EncodeTimer::default();
+	let t0 = Instant::now();
+	// 60 fps frames, each 4 ms inside the encoder: the meter reads ~4 ms (not the 16.7 ms
+	// frame gap), and reports about once a second.
+	let mut reports = Vec::new();
+	for i in 0..130u64 {
+		let at = t0 + Duration::from_micros(i * 16_667);
+		t.frame_in(i * 16_666_667, at);
+		if let Some(ms) = t.frame_out(i * 16_666_667, at + Duration::from_millis(4)) {
+			reports.push(ms);
+		}
+	}
+	assert_eq!(reports.len(), 2, "one report per second: {reports:?}");
+	assert!(reports.iter().all(|ms| (ms - 4.0).abs() < 0.2), "{reports:?}");
+	assert_eq!(t.inflight(), 0);
+}
+
+#[test]
+fn gst_encode_timer_forgets_dropped_frames_and_ignores_unknown_pts() {
+	use std::time::{Duration, Instant};
+	let mut t = gst::EncodeTimer::default();
+	let t0 = Instant::now();
+	t.frame_in(1, t0);
+	t.frame_in(2, t0 + Duration::from_millis(16));
+	t.frame_in(3, t0 + Duration::from_millis(33));
+	// A header buffer / re-stamped output: not a frame we saw going in.
+	assert!(t.frame_out(99, t0 + Duration::from_millis(40)).is_none());
+	assert_eq!(t.inflight(), 3);
+	// Frame 1 was dropped by the encoder; frame 2 comes out → frame 1 is forgotten too.
+	t.frame_out(2, t0 + Duration::from_millis(20));
+	assert_eq!(t.inflight(), 1);
+	assert!((t.ema_ms() - 4.0).abs() < 0.01);
+	// Bounded: a source whose PTS never come back can't grow the queue.
+	for i in 0..1000 {
+		t.frame_in(1000 + i, t0);
+	}
+	assert_eq!(t.inflight(), gst::EncodeTimer::MAX_INFLIGHT);
+}
