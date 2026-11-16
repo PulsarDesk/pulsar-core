@@ -317,7 +317,7 @@ impl HwEncoder {
 
 	pub fn label(self) -> &'static str {
 		match self {
-			Self::Auto => "Otomatik",
+			Self::Auto => "Auto",
 			Self::Nvenc => "NVIDIA NVENC",
 			Self::Amf => "AMD AMF",
 			Self::Vaapi => "VA-API",
@@ -326,7 +326,7 @@ impl HwEncoder {
 			Self::Vulkan => "Vulkan",
 			Self::MediaFoundation => "Media Foundation",
 			Self::Rkmpp => "Rockchip MPP",
-			Self::Software => "Yazılım (CPU)",
+			Self::Software => "Software (CPU)",
 		}
 	}
 }

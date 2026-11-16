@@ -100,7 +100,7 @@ impl JackSwitch {
 			}
 		}
 		let want = self.plugged && route == Route::Allowed && (self.routed || claimable);
-		// Kapalı = the feature is off and the client output plays as usual; shed by
+		// Off = the feature is off and the client output plays as usual; shed by
 		// auto-degrade = silent while the headphones are in (module docs).
 		let silenced = want || (self.plugged && route == Route::Shed);
 		if want != self.routed {
@@ -121,11 +121,11 @@ impl JackSwitch {
 /// What the settings and auto-degrade allow for the headset route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-	/// Otomatik / Açık and not shed.
+	/// Auto / On and not shed.
 	Allowed,
-	/// Otomatik, shed by auto-degrade: no headset audio, and the client stays silent.
+	/// Auto, shed by auto-degrade: no headset audio, and the client stays silent.
 	Shed,
-	/// Kapalı: the client output plays as without this feature.
+	/// Off: the client output plays as without this feature.
 	Off,
 }
 

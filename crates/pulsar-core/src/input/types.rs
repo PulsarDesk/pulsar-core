@@ -44,8 +44,8 @@ impl GamepadKind {
 			Self::Ds4 => "DualShock 4",
 			Self::Ds5 => "DualSense",
 			Self::Xbox => "Xbox",
-			Self::Standard => "Standart Gamepad",
-			Self::Unknown => "Bilinmeyen",
+			Self::Standard => "Standard gamepad",
+			Self::Unknown => "Unknown",
 		}
 	}
 }

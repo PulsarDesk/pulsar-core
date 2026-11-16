@@ -1,6 +1,6 @@
 //! Real-time video pipeline driven by the system **ffmpeg/ffplay**.
 //!
-//! This is the concrete encode/decode the design's "Donanımsal kodlama
+//! This is the concrete encode/decode the design's "Hardware encoding
 //! (NVENC / QuickSync / VideoToolbox)" refers to. It selects a hardware encoder
 //! — **NVENC** (NVIDIA), **VAAPI** for an iGPU/AMD,
 //! **QuickSync**, **VideoToolbox** on macOS, or a software fallback — captures

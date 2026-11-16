@@ -630,9 +630,9 @@ async fn run_child(desc: &str) -> anyhow::Result<std::process::Child> {
 			Ok(())
 		});
 	}
-	let mut child = cmd
-		.spawn()
-		.map_err(|e| anyhow::anyhow!("gst-launch-1.0 başlatılamadı (GStreamer kurulu mu?): {e}"))?;
+	let mut child = cmd.spawn().map_err(|e| {
+		anyhow::anyhow!("gst-launch-1.0 failed to start (is GStreamer installed?): {e}")
+	})?;
 	if let Some(stderr) = child.stderr.take() {
 		std::thread::spawn(move || {
 			for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -644,9 +644,9 @@ async fn run_child(desc: &str) -> anyhow::Result<std::process::Child> {
 	match child.try_wait() {
 		Ok(None) => Ok(child),
 		Ok(Some(status)) => Err(anyhow::anyhow!(
-			"gst-launch-1.0 kapandı ({status}) — pipewire/x264/rtp GStreamer eklentileri kurulu mu?"
+			"gst-launch-1.0 exited ({status}) — are the pipewire/x264/rtp GStreamer plugins installed?"
 		)),
-		Err(e) => Err(anyhow::anyhow!("gst-launch-1.0 durumu okunamadı: {e}")),
+		Err(e) => Err(anyhow::anyhow!("could not read gst-launch-1.0 status: {e}")),
 	}
 }
 

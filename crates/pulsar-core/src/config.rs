@@ -2,7 +2,7 @@
 //!
 //! The relay endpoint is **user-changeable** (the app can point at any relay,
 //! including a self-hosted or local one), and the network mode controls the
-//! P2P/relay strategy — matching the design's Ayarlar → Ağ section.
+//! P2P/relay strategy — matching the design's Settings → Network section.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::path::Path;
 /// the box. Written WITHOUT a port: [`crate::proto::DEFAULT_RELAY_PORT`] is implied and
 /// filled in when the address is resolved, so the common case shows a clean hostname.
 /// A port is only ever written when the operator actually runs on a different one
-/// (`my-relay.example.com:9000`). Users override it in Settings → Ağ to point at a
+/// (`my-relay.example.com:9000`). Users override it in Settings → Network to point at a
 /// self-hosted or local relay.
 pub const DEFAULT_RELAY: &str = "relay.pulsardesk.com";
 
@@ -54,21 +54,21 @@ pub struct Config {
 	#[serde(default)]
 	pub relay_keys: std::collections::HashMap<String, String>,
 	/// Run a relay INSIDE this app and register against it instead of a remote one
-	/// (Settings → Ağ toggle). While set, `relay` is ignored: the address is by definition
+	/// (Settings → Network toggle). While set, `relay` is ignored: the address is by definition
 	/// local, so there is nothing for the user to type. `#[serde(default)]` = off.
 	#[serde(default)]
 	pub use_local_relay: bool,
 	/// Connection strategy.
 	pub network_mode: NetworkMode,
 	/// Ask the local router to map Pulsar's UDP port (NAT-PMP, then UPnP) so peers' direct
-	/// (P2P) packets get through routers that otherwise drop them. Settings → Ağ; default on.
+	/// (P2P) packets get through routers that otherwise drop them. Settings → Network; default on.
 	#[serde(default = "default_true")]
 	pub port_mapping: bool,
 	/// Friendly name advertised to peers.
 	pub device_name: String,
 	/// UI language.
 	pub language: Language,
-	/// Allow unattended (gözetimsiz) access to this host.
+	/// Allow unattended access to this host.
 	pub unattended_access: bool,
 	/// Optional PERSISTENT connect password (empty = none). Accepted alongside the
 	/// rotating one-time password — a client presenting either is let in without
@@ -135,23 +135,23 @@ pub struct Config {
 	/// (Windows) Re-launch elevated (UAC) on startup so this machine can act as a full host:
 	/// injecting keyboard/mouse into ELEVATED app windows is blocked for a non-elevated process
 	/// (UIPI), so without admin the remote user can't control e.g. Task Manager / an installer /
-	/// any "Run as administrator" window. Default ON; turn it off in Settings → Güvenlik to launch
+	/// any "Run as administrator" window. Default ON; turn it off in Settings → Security to launch
 	/// without the prompt. Read once at process startup, so a change needs an app restart.
 	#[serde(default = "default_true")]
 	pub request_admin: bool,
 	/// Host: show a connected client's pointer on this screen with its name while it can't
 	/// control a remote-desktop session (view-only, or the host user is on their own mouse).
-	/// Settings → Güvenlik toggle; default on.
+	/// Settings → Security toggle; default on.
 	#[serde(default = "default_true")]
 	pub show_remote_cursor: bool,
 	/// Client: hold a new session on the "optimizing stream" screen until the adaptive bitrate
 	/// has found the path's stable rate (a few seconds), so the first picture is already at
-	/// it. Off = show the picture on the first frame and adapt in view. Settings → Ekran;
+	/// it. Off = show the picture on the first frame and adapt in view. Settings → Display;
 	/// default on.
 	#[serde(default = "default_true")]
 	pub pre_optimize_stream: bool,
 	/// Client: let the host show this device's pointer, labelled with its name, on its screen
-	/// while this device can't control it (the Pulsar menu → Yayın toggle during a session). Default on; the host can still
+	/// while this device can't control it (the Pulsar menu → Stream toggle during a session). Default on; the host can still
 	/// turn it off for everyone with [`Self::show_remote_cursor`].
 	#[serde(default = "default_true")]
 	pub share_cursor_label: bool,
@@ -367,7 +367,7 @@ fn default_device_name() -> String {
 	whoami::hostname()
 		.ok()
 		.filter(|h| !h.trim().is_empty())
-		.unwrap_or_else(|| "Pulsar Cihazı".to_string())
+		.unwrap_or_else(|| "Pulsar Device".to_string())
 }
 
 /// Whether a configured capture device string asks for the system mix (empty or a sentinel).

@@ -77,7 +77,7 @@ impl GstEncoder {
 			Self::Mpp => "Rockchip MPP",
 			Self::Vaapi | Self::Va => "VA-API",
 			Self::Nv => "NVIDIA NVENC",
-			Self::X264 => "Yazılım (CPU)",
+			Self::X264 => "Software (CPU)",
 		}
 	}
 }

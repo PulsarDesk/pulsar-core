@@ -512,7 +512,7 @@ pub fn probe_command(
 	// AV1: probe through the REAL RTP muxer, not just `-f null`. Current ffmpeg gates AV1
 	// packetization behind `-strict experimental` (header write fails outright), and the
 	// Software arms emit x264-style presets libsvtav1 rejects — so a null-mux probe passes
-	// for a stream `encode_command` then can't start ("ffmpeg başlamadı", dead video). With
+	// for a stream `encode_command` then can't start ("ffmpeg did not start", dead video). With
 	// the muxer in the probe, validation fails on such builds and `resolve_codec_validated`
 	// degrades AV1 to HEVC/H.264 instead; a future build where AV1-over-RTP works passes the
 	// probe and re-enables it with no code change. One frame to the loopback discard port.

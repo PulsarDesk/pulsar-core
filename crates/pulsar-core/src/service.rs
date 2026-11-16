@@ -1,8 +1,8 @@
 //! Application service protocol that runs **over an established [`Session`]**:
 //! a client lists and launches the host's games across the encrypted channel.
 //!
-//! This is the wire side of "Bağlan → oyun modu → girilen ID'nin host'undan
-//! oyunları getir". The host runs [`serve`] on each incoming session; the client
+//! This is the wire side of "Connect → game mode → fetch the games from the
+//! host with the entered ID". The host runs [`serve`] on each incoming session; the client
 //! calls [`request_games`] / [`request_launch`] on its session.
 
 use std::net::SocketAddr;

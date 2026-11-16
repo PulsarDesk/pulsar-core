@@ -3768,7 +3768,7 @@ mod tests {
 		assert!(c.ceiling() < 10_000, "{d:?}");
 	}
 
-	/// The automatic adjustment off ("Otomatik ayar", Moonlight-like): the controller keeps
+	/// The automatic adjustment off ("Auto adjust", Moonlight-like): the controller keeps
 	/// measuring but never moves the rate or the point; the recovery mode still flips; the fixed
 	/// rate for an automatic bitrate is what the path proved. Back on, it adapts again.
 	#[test]

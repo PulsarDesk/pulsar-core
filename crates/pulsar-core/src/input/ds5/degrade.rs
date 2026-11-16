@@ -1,5 +1,5 @@
 //! Client-side DualSense settings and the automatic feature shedding policy
-//! ("otomatik kısma").
+//! ("auto-degrade").
 //!
 //! A Bluetooth DualSense shares a narrow radio link (often with 2.4 GHz Wi-Fi on the same
 //! combo chip). When the link can't keep up, the client turns off the heaviest features
@@ -50,7 +50,7 @@ pub struct Ds5Prefs {
 	pub mic: Mode,
 	pub leds: Mode,
 	pub rumble: Mode,
-	/// "Kolun kulaklık girişi": the session's audio plays through headphones plugged into
+	/// "Controller headphone jack": the session's audio plays through headphones plugged into
 	/// the pad instead of the client output (`super::headset`). Shed last.
 	pub headset: Mode,
 	/// Shed `Auto` features while the Bluetooth link is weak.
@@ -504,7 +504,7 @@ mod tests {
 			d.on_window_with_headset(&good(), &p, all_live(), false);
 		}
 		assert_eq!(d.headset(&p), Route::Allowed, "last shed comes back first");
-		// Not flowing: never shed. Kapalı: Off.
+		// Not flowing: never shed. Off: Off.
 		let mut d = Degrader::new();
 		for _ in 0..10 {
 			d.on_window(&bad(), &p, all_live());
@@ -540,7 +540,7 @@ mod tests {
 		};
 		let mut d = Degrader::new();
 		d.on_window(&bad(), &p, live);
-		// Speaker is "Açık" and the mic is not in use: haptics is next.
+		// Speaker is "On" and the mic is not in use: haptics is next.
 		assert_eq!(
 			d.on_window(&bad(), &p, live).unwrap().feature,
 			Shed::Haptics
