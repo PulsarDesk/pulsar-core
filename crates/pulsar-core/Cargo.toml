@@ -16,6 +16,8 @@ socket2.workspace = true
 # a different NIC than its default route, so a single-interface join silently misses peers.
 if-addrs = "0.15"
 whoami.workspace = true
+# OS UI language for the default app language of a fresh config (Win/macOS/Linux/Android/iOS).
+sys-locale = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true

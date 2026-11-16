@@ -28,14 +28,42 @@ pub enum NetworkMode {
 	RelayOnly,
 }
 
-/// UI language. The app ships Turkish (default) and English; the core stays
-/// language-agnostic and just stores the choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// UI language. The app ships Turkish and English; the core stays language-agnostic and
+/// just stores the choice. A stored value (`"tr"` / `"en"`) is always kept as-is; only a
+/// fresh config takes the default, which follows the OS language ([`Language::system`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
-	#[default]
 	Tr,
 	En,
+}
+
+impl Language {
+	/// The OS UI language: Turkish when the system locale is Turkish, else English.
+	pub fn system() -> Self {
+		Self::from_locale(sys_locale::get_locale().as_deref())
+	}
+
+	/// Map a BCP 47 / POSIX locale tag (`tr-TR`, `tr_TR.UTF-8`, `en-US`) to a language.
+	/// Unknown or missing = English.
+	pub fn from_locale(locale: Option<&str>) -> Self {
+		let primary = locale
+			.unwrap_or("")
+			.split(['-', '_', '.', '@'])
+			.next()
+			.unwrap_or("");
+		if primary.eq_ignore_ascii_case("tr") {
+			Self::Tr
+		} else {
+			Self::En
+		}
+	}
+}
+
+impl Default for Language {
+	fn default() -> Self {
+		Self::system()
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,7 +202,7 @@ impl Default for Config {
 			network_mode: NetworkMode::Auto,
 			port_mapping: true,
 			device_name: default_device_name(),
-			language: Language::Tr,
+			language: Language::system(),
 			unattended_access: false,
 			connect_password: String::new(),
 			totp_secret: String::new(),
@@ -381,14 +409,38 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn defaults_are_auto_mode_and_turkish() {
+	fn defaults_are_auto_mode_and_system_language() {
 		let c = Config::default();
 		assert_eq!(c.network_mode, NetworkMode::Auto);
-		assert_eq!(c.language, Language::Tr);
+		assert_eq!(c.language, Language::system());
 		assert!(
 			c.relay_is_valid(),
 			"default relay should be valid host:port"
 		);
+	}
+
+	#[test]
+	fn language_follows_the_locale_tag() {
+		for tag in ["tr", "tr-TR", "tr_TR.UTF-8", "TR-tr", "tr@latin"] {
+			assert_eq!(Language::from_locale(Some(tag)), Language::Tr, "{tag}");
+		}
+		for tag in ["en-US", "de_DE.UTF-8", "C", "", "trk", "az-TR"] {
+			assert_eq!(Language::from_locale(Some(tag)), Language::En, "{tag}");
+		}
+		assert_eq!(Language::from_locale(None), Language::En);
+	}
+
+	#[test]
+	fn stored_language_is_kept() {
+		// A saved choice must survive a load whatever the OS language is.
+		for (lang, json) in [(Language::Tr, "\"tr\""), (Language::En, "\"en\"")] {
+			let mut c = Config::default();
+			c.language = lang;
+			let s = serde_json::to_string(&c).unwrap();
+			assert!(s.contains(&format!("\"language\":{json}")), "{s}");
+			let back: Config = serde_json::from_str(&s).unwrap();
+			assert_eq!(back.language, lang);
+		}
 	}
 
 	#[test]
