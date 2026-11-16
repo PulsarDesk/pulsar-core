@@ -161,8 +161,8 @@ per process) and at most every 30 s before a pad is created (`before_create()` i
   through SDL's generic path). **To verify in step 6.**
 - Foreign bridges: if ZerkSense5/DSX/DS5Dongle already present the pad as a wired
   DualSense, the client simply sees a USB DualSense and uses the USB path. If one of them
-  is running and holds the BT pad, local bridge mode refuses to start ("başka bir DualSense
-  aracı çalışıyor") instead of fighting it. Detection: known process names plus a DS5 whose
+  is running and holds the BT pad, local bridge mode refuses to start ("another DualSense
+  tool is running") instead of fighting it. Detection: known process names plus a DS5 whose
   0x09 MAC is locally administered.
 
 ### Wire (additive; JSON session messages + RTP)
@@ -210,11 +210,11 @@ per process) and at most every 30 s before a pad is created (`before_create()` i
   gaps). Under sustained trouble it sheds load in this order: speaker → mic → haptics
   (→ classic rumble emulation from haptics energy). Each step shows a toast. It recovers
   after a quiet period. The same spirit as `adapt`.
-- Settings (client, per feature): Adaptif tetik · HD titreşim · Kol hoparlörü · Kol
-  mikrofonu · Işık çubuğu/LED, each `Otomatik | Açık | Kapalı`. A global "DualSense
-  özelliklerini kullan" switch turns the whole passthrough off (today's DS4 path).
+- Settings (client, per feature): Adaptive triggers · HD haptics · Controller speaker ·
+  Controller mic · Light bar/LED, each `Auto | On | Off`. A global "Use DualSense
+  features" switch turns the whole passthrough off (today's DS4 path).
 
-### Headset jack ("Kolun kulaklık girişi", PS5 gibi)
+### Headset jack ("Controller headphone jack", like the PS5)
 
 Headphones in the client pad's 3.5 mm jack: the session's normal audio (what the client
 would play through `native_audio.rs`) plays through the pad's jack instead, mixed with the
@@ -246,7 +246,7 @@ game's own pad-speaker stream. Pulled out: back to the client output.
   client output is silent (Pulsar has no other UI sounds), nothing plays on the pad's
   built-in speaker. Auto-degrade sheds the route **last** (speaker → mic → haptics →
   headset); shed, the session audio goes silent, it does **not** fall back to the client
-  output while the headphones are in. `Kapalı` = the feature is off: the client output
+  output while the headphones are in. `Off` = the feature is off: the client output
   plays as before (the host's pad-speaker stream still goes to the jack, like a real pad).
 - **BT budget:** the route needs the 0x39 report (2 haptics + 2 Opus frames, 547 B per
   21.3 ms, about 25.6 KB/s) all the time, the same as a game using the pad speaker; it
@@ -260,8 +260,8 @@ game's own pad-speaker stream. Pulled out: back to the client output.
 ### Local bridge mode
 
 The same `VirtualDs5` + `ds5::Pad` pair, wired back-to-back in-process: input → virtual
-pad, virtual pad's output/haptics/speaker → physical pad. Toggle in Settings → Kontroller
-("Bluetooth DualSense'i kablolu gibi göster"). Started by the desktop app's tray process,
+pad, virtual pad's output/haptics/speaker → physical pad. Toggle in Settings → Controllers
+("Show Bluetooth DualSense as wired"). Started by the desktop app's tray process,
 so it keeps working while no session is up.
 
 ## Install

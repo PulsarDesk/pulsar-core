@@ -25,7 +25,8 @@ This file is the **index**. Read the topic file before working in its area:
   Docs and tests may be pushed.
 - Rust via `rustup run stable cargo …` (distro cargo is too old). **Linux builds need the
   GStreamer dev headers** (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
-- UI copy is Turkish; the maintainer writes Turkish. Commit messages in English.
+- English is the project language (code, labels, logs, host→client text, commits, docs).
+  Turkish is only an app UI locale in the desktop/mobile i18n catalogs.
 
 ## Test
 
