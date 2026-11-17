@@ -34,6 +34,7 @@
 //! the sink redirect, and the OS mute call live in the Tauri layer / behind
 //! [`sink::SinkRedirectGuard`] and `set_host_muted`.
 
+pub mod aec;
 mod command;
 // DualSense-aware host capture: source decision + endpoint-loopback PCM work (pure), and the
 // Windows default-endpoint volume/mute watch it reads.

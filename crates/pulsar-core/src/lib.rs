@@ -11,6 +11,7 @@ pub use pulsar_proto as proto;
 
 pub mod adapt;
 pub mod audio;
+pub mod call;
 #[cfg(target_os = "linux")]
 pub mod capture;
 pub mod config;

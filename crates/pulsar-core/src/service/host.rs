@@ -60,6 +60,9 @@ pub struct DataHandlers {
 	/// (it may ask the host user first) and answers `PairResult` through `outbound`. Default
 	/// no-op: a host without pairing never answers, the client times out ("unsupported").
 	pub on_pair: Box<dyn FnMut(DataMsg) + Send>,
+	/// Voice-call signalling from the client ([`DataMsg::Call`]). The handler answers through
+	/// `outbound`. Default no-op: a host without calls never answers a ring.
+	pub on_call: Box<dyn FnMut(CallSignal) + Send>,
 	/// Host-initiated re-stream injection. When the host detects its OWN display mode changed
 	/// mid-session (resolution / refresh rate), a watcher re-sends the last [`StreamReq`] here so
 	/// the capture restarts at the new geometry — the ffmpeg (x11grab/gdigrab/avfoundation) and
@@ -97,6 +100,7 @@ impl Default for DataHandlers {
 			on_ds5: Box::new(|_| {}),
 			on_ds5_media: Box::new(|_| {}),
 			on_pair: Box::new(|_| {}),
+			on_call: Box::new(|_| {}),
 		}
 	}
 }
@@ -340,6 +344,7 @@ pub async fn serve_with(
 				DataMsg::Ds5Output { .. } | DataMsg::Ds5Mic { .. } => {}
 				m @ (DataMsg::PairRequest { .. } | DataMsg::Unpair) => (data.on_pair)(m),
 				DataMsg::PairResult { .. } => {} // host→client only; ignore if echoed back
+				DataMsg::Call(c) => (data.on_call)(c),
 			},
 			_ => {}
 		}

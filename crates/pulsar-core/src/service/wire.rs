@@ -657,6 +657,7 @@ enum DataMsgWire {
 		#[serde(default)]
 		reason: String,
 	},
+	Call(CallSignal),
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -706,6 +707,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::PadUnavailable { slot, reason } => DataMsg::PadUnavailable { slot, reason },
 			DataMsgWire::HdrMeta { sdr_white_nits, peak_nits } => DataMsg::HdrMeta { sdr_white_nits, peak_nits },
 			DataMsgWire::InputUnavailable { reason } => DataMsg::InputUnavailable { reason },
+			DataMsgWire::Call(c) => DataMsg::Call(c),
 		}
 	}
 }
@@ -988,6 +990,35 @@ pub enum DataMsg {
 		#[serde(default)]
 		reason: String,
 	},
+	/// Either way: voice-call signalling for this session (see [`CallSignal`]). The call's
+	/// audio itself is the mic side channel ([`DataMsg::Audio`] / [`DataMsg::AudioEnd`]),
+	/// sent by BOTH peers while the call is up. Appended for additive wire compat: an old
+	/// peer ignores it, so a ring to it is never answered and the caller times out.
+	Call(CallSignal),
+}
+
+/// Voice-call signalling between the two peers of a session ([`DataMsg::Call`]). Either peer
+/// may ring. Flow: `Ring` → the callee rings → `Accept` (both start sending their mic) or
+/// `Decline`; the caller may `Cancel` while it rings; either side `End`s an accepted call.
+/// Both sides time a ring out on their own (the transport is lossy, so a lost `Cancel` or
+/// `Decline` must not leave a phone ringing). A `Ring` that crosses the peer's own `Ring`
+/// counts as an `Accept` (both wanted to talk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallSignal {
+	/// "I am calling you."
+	Ring,
+	/// The callee answered.
+	Accept,
+	/// The callee refused (or it rang out on the callee's side).
+	Decline,
+	/// The caller hung up before an answer.
+	Cancel,
+	/// An answered call ended (either side).
+	End,
+	/// "I can take voice calls": sent by both peers when the session comes up, so a UI offers
+	/// calling only to a peer that would answer (an older one never says it, and ignores a
+	/// ring). Answered once with `Hello` (in case ours were lost).
+	Hello,
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -1486,6 +1517,12 @@ mod tests {
 			DataMsg::HdrMeta { sdr_white_nits: 240, peak_nits: 1000 },
 			DataMsg::InputUnavailable { reason: "uinput_denied".into() },
 			DataMsg::InputUnavailable { reason: String::new() },
+			DataMsg::Call(CallSignal::Ring),
+			DataMsg::Call(CallSignal::Accept),
+			DataMsg::Call(CallSignal::Decline),
+			DataMsg::Call(CallSignal::Cancel),
+			DataMsg::Call(CallSignal::End),
+			DataMsg::Call(CallSignal::Hello),
 		];
 
 		for msg in cases {

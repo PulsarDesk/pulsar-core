@@ -266,6 +266,20 @@ Part of the pulsar-core agent docs — index: [`CLAUDE.md`](../../CLAUDE.md).
   `set_streamed_display` / `streamed_display` publish the display being streamed (process-wide)
   so `input/macos.rs` maps the absolute pointer onto it instead of always the main display;
   `avfoundation_screen_number` gives the ffmpeg fallback's `"Capture screen N"`.
+- `call.rs` — voice calls over a session, shared by both apps: the phone-style state machine
+  (`Call`: `action` / `signal` / `tick` / `gone` → `Step` = signal to send + phase change + why
+  it ended), the loss rules (caller repeats `Ring` every 2 s; repeated `Ring` re-answered or
+  re-declined; final signals sent 3×; both sides time a ring out) and the built-in ringtones
+  (`tone_pcm`: synthesized s16le 48 kHz mono, no audio assets). Wire: `DataMsg::Call(CallSignal)`
+  (appended; old peers ignore it → the call rings out); the voice is `DataMsg::Audio` both ways.
+  Host side: `DataHandlers::on_call`. `CallSignal::Hello` on session start (`HELLO_AT` schedule,
+  answered once) = "I take calls": apps offer calling only to such a peer (`Call::supported`).
+- `audio/aec.rs` — echo canceller for calls (pure Rust, own radix-2 FFT): partitioned-block
+  frequency-domain NLMS, 256-sample blocks × 40 partitions (~213 ms tail), two-path
+  (background adapts, foreground copied when clearly better / background reset when it
+  diverges = double-talk safe without a detector), residual suppression −12 dB while echo-only.
+  `AecStream` takes any chunk size (+1 block latency). Synthetic tests: room echo ~59 dB, digital
+  loopback ~61 dB, near talker kept during double-talk; ~1 % of a core in release, ~28 % debug.
 - `audio/` — WASAPI loopback (+ per-process), Opus/RTP command builders,
   mute policy (`AudioSettings::policy` — game mode transmits but never
   force-mutes the captured endpoint), endpoint redirect sinks. macOS: `sck_loopback.rs`

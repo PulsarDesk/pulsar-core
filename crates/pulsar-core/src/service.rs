@@ -34,7 +34,7 @@ pub use client::{
 pub use host::{serve, serve_with, DataHandlers};
 pub use pake::{norm_otp, Credential};
 pub use wire::{
-	ClientStats, DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, LossRecovery, QualityPref,
+	CallSignal, ClientStats, DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, LossRecovery, QualityPref,
 	StreamCaps, StreamReq, WindowInfo,
 };
 
