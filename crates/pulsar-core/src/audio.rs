@@ -53,6 +53,14 @@ mod loopback;
 // system mix (doubled/echoed). Win10 20H1+ only; the host falls back to `loopback` otherwise.
 #[cfg(windows)]
 mod process_loopback;
+// The apps with an audio session (Windows): what a per-app mute of the session audio picks from.
+#[cfg(windows)]
+mod app_sessions;
+// Several captures summed into one stream (the per-app mute's capture of every other app).
+mod mixer;
+pub use mixer::{Mixer, MIX_CHANNELS};
+#[cfg(windows)]
+pub use app_sessions::{audio_session_apps, descends_from, exe_name, parent_pids, AudioSessionApp};
 // macOS system mix via ScreenCaptureKit (macOS 13+): every app but Pulsar, no virtual device.
 #[cfg(target_os = "macos")]
 mod sck_loopback;

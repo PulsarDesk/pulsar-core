@@ -658,6 +658,8 @@ enum DataMsgWire {
 		reason: String,
 	},
 	Call(CallSignal),
+	AudioApps(Vec<AudioAppInfo>),
+	AudioAppMute { key: String, muted: bool },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -708,6 +710,8 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::HdrMeta { sdr_white_nits, peak_nits } => DataMsg::HdrMeta { sdr_white_nits, peak_nits },
 			DataMsgWire::InputUnavailable { reason } => DataMsg::InputUnavailable { reason },
 			DataMsgWire::Call(c) => DataMsg::Call(c),
+			DataMsgWire::AudioApps(a) => DataMsg::AudioApps(a),
+			DataMsgWire::AudioAppMute { key, muted } => DataMsg::AudioAppMute { key, muted },
 		}
 	}
 }
@@ -995,6 +999,30 @@ pub enum DataMsg {
 	/// sent by BOTH peers while the call is up. Appended for additive wire compat: an old
 	/// peer ignores it, so a ring to it is never answered and the caller times out.
 	Call(CallSignal),
+	/// Host → client: the applications playing sound on the host now (and any the client left
+	/// out), for the session menu's Audio → App sounds. Sent when the list changes. A host that
+	/// never sends it cannot leave apps out (the client offers nothing). Appended for additive
+	/// wire compat.
+	AudioApps(Vec<AudioAppInfo>),
+	/// Client → host: leave the app `key` ([`AudioAppInfo::key`]) out of this session's audio
+	/// (`muted`), or put it back. The host answers with a fresh [`DataMsg::AudioApps`].
+	AudioAppMute { key: String, muted: bool },
+}
+
+/// One application playing sound on the host ([`DataMsg::AudioApps`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioAppInfo {
+	/// What the host matches it by: the executable's file name (`Discord.exe`).
+	pub key: String,
+	/// What the menu shows.
+	#[serde(default)]
+	pub name: String,
+	/// Left out of this session's audio.
+	#[serde(default)]
+	pub muted: bool,
+	/// A voice-chat app (Discord, Teams, …): the menu lists it first with an echo note.
+	#[serde(default)]
+	pub voice: bool,
 }
 
 /// Voice-call signalling between the two peers of a session ([`DataMsg::Call`]). Either peer
@@ -1523,6 +1551,14 @@ mod tests {
 			DataMsg::Call(CallSignal::Cancel),
 			DataMsg::Call(CallSignal::End),
 			DataMsg::Call(CallSignal::Hello),
+			DataMsg::AudioApps(vec![AudioAppInfo {
+				key: "Discord.exe".into(),
+				name: "Discord".into(),
+				muted: true,
+				voice: true,
+			}]),
+			DataMsg::AudioApps(Vec::new()),
+			DataMsg::AudioAppMute { key: "Discord.exe".into(), muted: true },
 		];
 
 		for msg in cases {

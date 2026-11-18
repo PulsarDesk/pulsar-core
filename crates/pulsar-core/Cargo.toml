@@ -132,6 +132,8 @@ windows = { version = "0.62", features = [
 	# RtlGetVersion to gate it to Win10 20H1+ (build 19041) at runtime.
 	"Win32_System_Threading",
 	"Win32_System_SystemInformation",
+	# audio/app_sessions.rs: parent pids (an app's audio child under an included parent).
+	"Win32_System_Diagnostics_ToolHelp",
 	# CreateEventW's signature references SECURITY_ATTRIBUTES, so it is gated behind this.
 	"Win32_Security",
 	# RtlGetVersion (ntdll) — the UN-shimmed OS build query (GetVersionExW lies without a
