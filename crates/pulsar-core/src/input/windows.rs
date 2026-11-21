@@ -47,7 +47,8 @@ fn button_input(button: u8, down: bool) -> Option<(i32, u32)> {
 	})
 }
 
-fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
+/// Returns whether Windows took the event (`false`: e.g. the input desktop is the secure one).
+fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) -> bool {
 	let input = INPUT {
 		r#type: INPUT_MOUSE,
 		Anonymous: INPUT_0 {
@@ -61,10 +62,11 @@ fn send_mouse(dx: i32, dy: i32, data: i32, flags: u32) {
 			},
 		},
 	};
-	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) };
+	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) == 1 }
 }
 
-fn send_key(vk: u16, flags: u32) {
+/// Returns whether Windows took the event (`false`: e.g. the input desktop is the secure one).
+fn send_key(vk: u16, flags: u32) -> bool {
 	use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 		MapVirtualKeyW, KEYEVENTF_EXTENDEDKEY, MAPVK_VK_TO_VSC_EX,
 	};
@@ -94,7 +96,7 @@ fn send_key(vk: u16, flags: u32) {
 			},
 		},
 	};
-	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) };
+	unsafe { SendInput(1, &input, core::mem::size_of::<INPUT>() as i32) == 1 }
 }
 
 /// A client evdev keycode as a full Windows keystroke: `(virtual key, scan code, extended)` —
@@ -279,6 +281,13 @@ pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 pub struct DesktopInput {
 	held_buttons: std::collections::HashSet<u8>,
 	held_keys: std::collections::HashSet<u16>,
+	/// Key-ups / button-ups Windows refused (`SendInput` = 0): sent while the input desktop was
+	/// the secure one (Ctrl+Alt+Del, a UAC prompt, the lock screen — SendInput cannot reach it
+	/// without the SYSTEM helper). The key stayed DOWN on the default desktop: Ctrl+Alt held
+	/// after a Ctrl+Alt+Del locked every later input on the host (2026-11-21). Re-sent before
+	/// each later event until Windows takes them.
+	lost_up_keys: std::collections::HashSet<u16>,
+	lost_up_buttons: std::collections::HashSet<u8>,
 	/// Hi-res wheel conversion with the sub-unit carry (see [`super::wheel`]).
 	scroll: super::wheel::HiResScroll,
 	/// Inject whole `WHEEL_DELTA` notches instead of hi-res units (see
@@ -410,6 +419,8 @@ impl DesktopInput {
 		Ok(Self {
 			held_buttons: std::collections::HashSet::new(),
 			held_keys: std::collections::HashSet::new(),
+			lost_up_keys: std::collections::HashSet::new(),
+			lost_up_buttons: std::collections::HashSet::new(),
 			scroll: Default::default(),
 			whole_notches: false,
 			monitor: None,
@@ -473,7 +484,26 @@ impl DesktopInput {
 	/// remapped across the whole virtual desktop with `MOUSEEVENTF_VIRTUALDESK` — otherwise a
 	/// bare `MOUSEEVENTF_ABSOLUTE` move always lands on the PRIMARY display. With no rect set
 	/// (single-monitor / unknown) it falls back to the primary-only mapping.
+	/// Re-send the key-ups / button-ups Windows refused earlier (see `lost_up_keys`). Cheap when
+	/// there are none; runs before every injected event.
+	fn retry_lost_ups(&mut self) {
+		if self.lost_up_keys.is_empty() && self.lost_up_buttons.is_empty() {
+			return;
+		}
+		let before = self.lost_up_keys.len() + self.lost_up_buttons.len();
+		self.lost_up_keys.retain(|&vk| !send_key(vk, KEYEVENTF_KEYUP));
+		self.lost_up_buttons.retain(|&b| match button_input(b, false) {
+			Some((data, flag)) => !send_mouse(0, 0, data, flag),
+			None => false,
+		});
+		let left = self.lost_up_keys.len() + self.lost_up_buttons.len();
+		if left < before {
+			tracing::info!(released = before - left, left, "input: refused key/button releases delivered (secure desktop gone)");
+		}
+	}
+
 	pub fn pointer(&mut self, x: f64, y: f64) {
+		self.retry_lost_ups();
 		let x = x.clamp(0.0, 1.0);
 		let y = y.clamp(0.0, 1.0);
 		match self.monitor {
@@ -504,6 +534,7 @@ impl DesktopInput {
 	/// Move the pointer by a raw relative delta (native renderer / games). No
 	/// ABSOLUTE flag → SendInput treats dx/dy as a relative move.
 	pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
+		self.retry_lost_ups();
 		send_mouse(dx.round() as i32, dy.round() as i32, 0, MOUSEEVENTF_MOVE);
 		// Confine the cursor to the STREAMED monitor. A relative move spans the whole virtual
 		// desktop, so without this the pointer drifts off the captured screen onto another monitor
@@ -538,7 +569,13 @@ impl DesktopInput {
 		if super::mouse_button::drop_unpaired_release(button, down, was_held) {
 			return;
 		}
-		send_mouse(0, 0, data, flag);
+		self.retry_lost_ups();
+		if down {
+			self.lost_up_buttons.remove(&button);
+		}
+		if !send_mouse(0, 0, data, flag) && !down {
+			self.lost_up_buttons.insert(button);
+		}
 	}
 
 	/// Whole-notch wheel output (`true`) for a game session or while the client's pointer is
@@ -557,6 +594,7 @@ impl DesktopInput {
 	/// mode ([`set_whole_notch_wheel`](Self::set_whole_notch_wheel)) only the completed
 	/// notches go out, × `WHEEL_DELTA`.
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
+		self.retry_lost_ups();
 		let o = self.scroll.push(dx, dy);
 		let (v, h) = if self.whole_notches {
 			(o.v_notches.saturating_mul(WHEEL_DELTA), o.h_notches.saturating_mul(WHEEL_DELTA))
@@ -573,13 +611,17 @@ impl DesktopInput {
 
 	/// Press/release a key by evdev keycode.
 	pub fn key(&mut self, code: u32, down: bool) {
+		self.retry_lost_ups();
 		if let Some(vk) = evdev_to_vk(code) {
 			if down {
 				self.held_keys.insert(vk);
+				self.lost_up_keys.remove(&vk);
 			} else {
 				self.held_keys.remove(&vk);
 			}
-			send_key(vk, if down { 0 } else { KEYEVENTF_KEYUP });
+			if !send_key(vk, if down { 0 } else { KEYEVENTF_KEYUP }) && !down {
+				self.lost_up_keys.insert(vk);
+			}
 		}
 	}
 
@@ -621,13 +663,19 @@ impl DesktopInput {
 		if let Some(w) = &self.pen_touch {
 			w.release(); // lift the pen / every injected finger
 		}
-		for b in self.held_buttons.drain() {
+		let buttons: Vec<u8> = self.held_buttons.drain().collect();
+		for b in buttons {
 			if let Some((data, flag)) = button_input(b, false) {
-				send_mouse(0, 0, data, flag);
+				if !send_mouse(0, 0, data, flag) {
+					self.lost_up_buttons.insert(b);
+				}
 			}
 		}
-		for vk in self.held_keys.drain() {
-			send_key(vk, KEYEVENTF_KEYUP);
+		let keys: Vec<u16> = self.held_keys.drain().collect();
+		for vk in keys {
+			if !send_key(vk, KEYEVENTF_KEYUP) {
+				self.lost_up_keys.insert(vk);
+			}
 		}
 	}
 }
@@ -638,6 +686,25 @@ impl Drop for DesktopInput {
 	/// black drag-select rectangle) or a stuck Ctrl/Alt/Shift.
 	fn drop(&mut self) {
 		self.flush_held();
+		self.retry_lost_ups();
+		// The session ended while the secure desktop is up (Ctrl+Alt+Del, then the client left):
+		// keep offering the refused releases for a while, or Ctrl/Alt stay held once it closes.
+		if !self.lost_up_keys.is_empty() || !self.lost_up_buttons.is_empty() {
+			let mut keys = std::mem::take(&mut self.lost_up_keys);
+			let mut buttons = std::mem::take(&mut self.lost_up_buttons);
+			let _ = std::thread::Builder::new().name("input-release".into()).spawn(move || {
+				let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+				while (!keys.is_empty() || !buttons.is_empty()) && std::time::Instant::now() < until {
+					std::thread::sleep(std::time::Duration::from_millis(250));
+					keys.retain(|&vk| !send_key(vk, KEYEVENTF_KEYUP));
+					buttons.retain(|&b| match button_input(b, false) {
+						Some((data, flag)) => !send_mouse(0, 0, data, flag),
+						None => false,
+					});
+				}
+				tracing::info!(left = keys.len() + buttons.len(), "input: refused releases after the session ended — done retrying");
+			});
+		}
 	}
 }
 
